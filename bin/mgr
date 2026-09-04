@@ -909,7 +909,7 @@ main() {
   # these answer from the checkout alone, so they must not require gh/herdr/git
   case "$sub" in
     -h|--help|help) usage; exit 0;;
-    --version|version|paths)
+    --version|paths)
       command -v jq >/dev/null 2>&1 || die 1 "missing dependency: jq"
       if [ "$sub" = paths ]; then cmd_paths; else cmd_version; fi
       return;;
