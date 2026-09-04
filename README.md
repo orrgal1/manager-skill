@@ -16,8 +16,9 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   (`mgr:in-flight`, `mgr:awaiting-approval`) and the per-issue policy (`mgr:manual-approve`).
 - **One builder per issue**, in a [herdr](https://herdr.dev) tab named `#N <slug>`, on branch
   `issue-N-<slug>`, in worktree `<repo>-issue-N-<slug>`. The primary checkout stays clean.
-- **A concurrency cap** (default 3; `MGR_CAP` or `--cap N`). New requests are slotted: launched
-  now, queued behind the in-flight set, or blocked by `Blocked by: #a, #b` in the issue body.
+- **A concurrency cap** (default 3; `mgr config set cap N`, `MGR_CAP` or `--cap N`). New requests
+  are slotted: launched now, queued behind the in-flight set, or blocked by `Blocked by: #a, #b`
+  in the issue body.
 - **Self-review and auto-merge by default.** Per issue the operator can ask for manual approval;
   the builder then opens a PR and waits, and *"approve #N"* lands it.
 - **Adoption.** Opened after other tabs are already working? The manager adopts them: a tab whose
@@ -28,11 +29,14 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   the manager's own included.
 - **Issue hygiene** on every request: dedupe, union overlapping asks, split multi-deliverable
   requests, wire dependencies.
+- **Harness config per repo.** `mgr config` stores extra omp CLI args, environment variables for
+  builder tabs, an extra brief file and the cap in the repo's `.git/config` (`mgr.*`), so every
+  worktree and every `mgr` call sees them without relying on the manager's memory or process env.
 
 ## Requirements
 
 - [herdr](https://herdr.dev) as the terminal: the manager runs inside a herdr pane, and herdr
-  exports the pane identity `mgr` needs — `HERDR_WORKSPACE_ID` for `launch`/`adopt`,
+  exports the pane identity `mgr` needs — `HERDR_WORKSPACE_ID` for every command,
   `HERDR_PANE_ID` for `bind` and for the guard heartbeat
 - [`gh`](https://cli.github.com) authenticated; `git`; `jq` (1.6+)
 - `omp` as the builder agent: tabs are started with `herdr agent start --kind omp`, and the
@@ -74,13 +78,35 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | set the priority to 8 | `mgr priority 8` — this project outranks the others when quota is tight |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
+## Headless use
+
+External tooling can drive `mgr` outside a pane: export `HERDR_WORKSPACE_ID` and run from a cwd
+inside the repo. Every command except `bind` works that way — `HERDR_PANE_ID` only matters for
+`bind`, for `board.self` and for the guard heartbeat.
+
+```sh
+HERDR_WORKSPACE_ID=<ws> mgr board
+
+mgr config add omp-arg --extension
+mgr config add omp-arg /abs/ext.ts
+mgr config add env LINK=ws://127.0.0.1:1234/link
+mgr config set brief-extra /abs/directive.md
+mgr config list
+```
+
+Precedence: CLI flag > `MGR_*` env > git config (`mgr config`) > built-in default.
+
+`board.manager` is how you find the manager tab — the live agent whose tab label is `manager` —
+or `null` when there is none. `omp-arg` and `env` apply to newly launched builders only;
+`brief-extra` also reaches adopted sessions.
+
 ## Layout
 
 | File | Role |
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
-| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `priority` · `paths` · `--version` |
+| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `priority` · `config` · `paths` · `--version` |
 | `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` · `priority` — the quota daemon |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager` |
 | `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |
@@ -144,13 +170,18 @@ daemon exits by itself once no manager has been seen for 30 minutes.
 
 ## Configuration
 
-Everything is environment; there is no config file. The guard's integer knobs silently fall back to
-their default when the value is not a positive integer; `MGR_CAP` is stricter — a non-numeric cap is
-a usage error (exit `2`).
+The guard is all environment. The per-repo harness config — extra omp args, builder-tab env, an
+extra brief file, the cap — lives in the repo's `.git/config` under `mgr.*` (`mgr config`), and the
+`MGR_*` variables below override it. The guard's integer knobs silently fall back to their default
+when the value is not a positive integer; `MGR_CAP` is stricter — a non-numeric cap is a usage
+error (exit `2`).
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MGR_CAP` | `3` | concurrency cap when `--cap N` is not passed |
+| `MGR_CAP` | `3` | concurrency cap when `--cap N` is not passed; overrides `mgr.cap` |
+| `MGR_OMP_ARGS` | unset | whitespace-separated extra omp argv; replaces `mgr.omp-arg` |
+| `MGR_ENV` | unset | whitespace-separated `KEY=VALUE` for builder tabs; replaces `mgr.env` |
+| `MGR_BRIEF_EXTRA` | unset | path to a markdown file appended to every brief; overrides `mgr.brief-extra` |
 | `MGR_GUARD_BIN` | `mgr-guard` next to `bin/mgr` | the guard executable `mgr` shells out to |
 | `MGR_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/mgr-guard` | the guard's ledger directory |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks (`mgr-guard start --interval S` wins) |
@@ -161,7 +192,8 @@ a usage error (exit `2`).
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's herdr toasts |
 | `MGR_GUARD_NOW_MS` | unset | pins the guard's clock in ms since the epoch; for tests |
 
-`HERDR_WORKSPACE_ID`, `HERDR_PANE_ID` and `HERDR_TAB_ID` are exported by herdr, not by you.
+`HERDR_WORKSPACE_ID`, `HERDR_PANE_ID` and `HERDR_TAB_ID` are exported by herdr, not by you —
+except in headless use, where the caller sets `HERDR_WORKSPACE_ID` itself.
 
 ## Testing
 

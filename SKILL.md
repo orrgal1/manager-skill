@@ -45,6 +45,13 @@ $MGR guard start
 $MGR board
 ```
 
+The tab rename is mandatory and comes first: the tab label `manager` is the detection key external
+tooling uses to find the manager tab. `herdr agent rename` may fail when the agent name `manager`
+is already taken by another workspace's manager — then rename the agent to `manager-<suffix>`
+(e.g. `manager-$HERDR_WORKSPACE_ID` with `:` replaced by `-`) and move on. **Never skip or alter
+the tab rename.** `$MGR board` echoes `manager` — the manager tab it detected — so you can confirm
+you are the one being found.
+
 Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `blocked`,
 `orphans`, `adopting`, `unmanaged`, `cap` / `cap_effective` / `slots_free`, and `quota`
 (guard, provider, used, resets_at, allowed_total, allotment, stalled).
@@ -151,7 +158,8 @@ the operator states a priority.
 $MGR launch <N>
 ```
 
-Pass `--cap N` only if the operator set a cap this session — and remember it for every later call.
+The cap comes from `$MGR config get cap` (or `MGR_CAP`), so it survives the session and every
+worktree — nothing to remember. `--cap N` still overrides it for a single call.
 
 Exit 0 → go to **Waiting** for N. Exit 3 → the refusal message says which precondition failed
 (not open, already labelled, open blockers, no free slot, agent live, worktree exists); explain it
@@ -209,7 +217,9 @@ Trust the report, not the idle state.
 | approve #N | `$MGR prompt N "Approved. Land it now per the Landing section of builder.md."` then wait |
 | request changes on #N | `$MGR prompt N "Changes requested: <verbatim feedback>"` then wait |
 | cancel #N | `herdr agent send-keys issue-N ctrl+c`, then `$MGR retire N` — add `--close` only if the work is dropped, not deferred |
-| set the cap to N | remember N; pass `--cap N` to `board` and `launch` from now on. `cap_effective` can still be lower when the guard throttles — report that instead of raising the cap |
+| set the cap to N | `$MGR config set cap N` (persisted in the repo, shared by every worktree), then `$MGR board`. `cap_effective` can still be lower when the guard throttles — report that instead of raising the cap |
+| run builders with extra omp args / env / an extra brief directive | `$MGR config add omp-arg <arg>` (repeat; order kept) / `$MGR config add env KEY=VALUE` / `$MGR config set brief-extra /abs/file.md`. `omp-arg` and `env` reach newly launched builders only; `brief-extra` also reaches adopted ones |
+| show the harness config | `$MGR config list` |
 | set priority to N / this project is more important than … | `$MGR priority N`, then `$MGR board` and report the new `quota.priority` / `quota.allotment`. The number is machine-wide per repo (default 5, higher wins) and only bites when quota is constrained: the guard serves whole priority tiers top-down, so the lowest tiers lose their builders first |
 | pause this project | `$MGR priority 0` — the bottom tier gets nothing while quota is constrained, so the guard interrupts this project's builders and resumes them itself when the quota or the priority comes back. Tabs, worktrees and issues are untouched; this is not `cancel` |
 | status / what's on the board | `$MGR board`, reported as a short table |
@@ -220,7 +230,7 @@ Trust the report, not the idle state.
 
 ## 7. Rules
 
-- Cap is 3 unless the operator says otherwise. `awaiting_approval` does **not** count against it;
+- Cap is 3 unless `config`/`MGR_CAP`/`--cap` say otherwise. `awaiting_approval` does **not** count against it;
   `adopting` does. The cap gates `launch` only — **`adopt` never enforces it** and returns
   `over_cap: true` instead, because refusing to adopt would leave live work unmanaged.
 - One issue per builder, one builder per issue. Never two agents on the same issue.
@@ -264,6 +274,7 @@ Trust the report, not the idle state.
 | `$MGR guard stop` | stop it — read the Rules before you ever do |
 | `$MGR guard status` | the guard's whole verdict: providers, allowed_total, managers, allotments, stalled |
 | `$MGR priority [N\|--clear]` | this project's priority: no argument reads it, `N` sets it (integer ≥ 0, default 5, higher wins), `--clear` restores the default |
+| `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`. Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
 
 Exit codes: `0` ok · `1` unexpected · `2` usage · `3` refused / invalid state · `4` not found.
 Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
@@ -272,8 +283,11 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 
 | Field | Meaning |
 |---|---|
-| `cap` | the cap you set (default 3) |
+| `cap` | the effective cap: `--cap` > `MGR_CAP` > `$MGR config get cap` > `3` |
 | `cap_effective` | `min(cap, quota.allotment)` while the guard runs, otherwise `cap`; `slots_free` counts against it |
+| `config` | the effective harness config: `omp-arg`, `env`, `brief-extra`, `cap` |
+| `manager` | `{pane_id,tab_id,agent,cwd}` of the live agent whose tab is labelled `manager`, or `null` — the detection key external tooling uses to find the manager tab |
+| `self` | the calling pane (`HERDR_PANE_ID`), or `null` outside a herdr pane |
 | `quota.guard` | `running` \| `stale` \| `stopped` — nothing is throttled unless it is `running` |
 | `quota.provider` `status` `used` `resets_at` | the builders' provider, its limit status, used fraction, window reset (ms) |
 | `quota.burn_per_hour` `projected_at_reset` | measured burn rate and where usage lands by the reset |
@@ -311,9 +325,27 @@ by `-`, e.g. `adopt-w26-p3`.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `MGR_CAP` | `3` | concurrency cap; overrides git `mgr.cap` |
+| `MGR_OMP_ARGS` | unset | whitespace-separated extra omp argv; replaces git `mgr.omp-arg` |
+| `MGR_ENV` | unset | whitespace-separated `KEY=VALUE` for builder tabs; replaces git `mgr.env` |
+| `MGR_BRIEF_EXTRA` | unset | path to a markdown file appended to every brief; overrides git `mgr.brief-extra` |
 | `MGR_STATE_DIR` | `~/.local/state/mgr-guard` | the guard's ledger: pid, log, `state.json`, manager registrations |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the guard exits after this long with no live manager |
 | `MGR_GUARD_RESUME_COOLDOWN_S` | `300` | how long a paused builder waits before the guard may resume it |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's toasts |
+
+Precedence for `cap`, `omp-arg`, `env` and `brief-extra`: CLI flag > `MGR_*` env > git config
+(`$MGR config`) > built-in default.
+
+### Headless
+
+Every `mgr` command except `bind` works outside a herdr pane: put `HERDR_WORKSPACE_ID` in the
+environment, run from a cwd inside the repo, and keep `herdr` reachable on `PATH`.
+`HERDR_PANE_ID` is needed only by `bind`, by `board.self` and by the guard heartbeat — without it
+`self` is `null` and the heartbeat is skipped.
+
+```bash
+HERDR_WORKSPACE_ID=w3 mgr board
+```
