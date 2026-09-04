@@ -1,0 +1,705 @@
+#!/usr/bin/env bash
+# mgr — manager CLI: turn GitHub issues into herdr tabs running omp builders.
+# Deps: gh, jq, git, herdr.  All stdout is JSON; errors are JSON on stderr.
+set -euo pipefail
+
+# ---------------------------------------------------------------- primitives
+
+die() { # die <exit-code> <message>
+  local code="$1"; shift
+  jq -nc --argjson c "$code" --arg m "$*" '{error:{code:$c,message:$m}}' >&2
+  exit "$code"
+}
+warn() { printf 'mgr: warning: %s\n' "$*" >&2; }
+
+need_deps() {
+  local d
+  for d in gh jq git herdr; do
+    command -v "$d" >/dev/null 2>&1 || die 1 "missing dependency: $d"
+  done
+}
+
+repo() {
+  [ -n "${MGR_REPO_CACHE:-}" ] && { printf '%s' "$MGR_REPO_CACHE"; return; }
+  MGR_REPO_CACHE=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
+    || die 1 "cannot resolve repo (gh repo view failed; is cwd inside a GitHub repo?)"
+  [ -n "$MGR_REPO_CACHE" ] || die 1 "cannot resolve repo"
+  printf '%s' "$MGR_REPO_CACHE"
+}
+
+# primary = the main worktree = first entry of `git worktree list --porcelain`
+primary() {
+  [ -n "${MGR_PRIMARY_CACHE:-}" ] && { printf '%s' "$MGR_PRIMARY_CACHE"; return; }
+  MGR_PRIMARY_CACHE=$(git worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{sub(/^worktree /,""); print; exit}')
+  [ -n "$MGR_PRIMARY_CACHE" ] || die 1 "cannot resolve primary checkout (not inside a git repo?)"
+  printf '%s' "$MGR_PRIMARY_CACHE"
+}
+
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+    | cut -c1-40 | sed -E 's/-+$//'
+}
+
+sanitize_pane() { printf '%s' "$1" | tr ':' '-' | tr '[:upper:]' '[:lower:]'; }
+
+cap_of() { # cap_of <explicit-or-empty>
+  local c="${1:-}"
+  [ -n "$c" ] || c="${MGR_CAP:-}"
+  [ -n "$c" ] || c=3
+  case "$c" in ''|*[!0-9]*) die 2 "cap must be a non-negative integer: $c";; esac
+  printf '%s' "$c"
+}
+
+# ---------------------------------------------------------------- github
+
+ensure_labels() {
+  gh label create 'mgr:in-flight' --color 1d76db --force \
+    --description 'manager: builder live for this issue' >/dev/null 2>&1 \
+    || die 1 "gh label create mgr:in-flight failed"
+  gh label create 'mgr:awaiting-approval' --color fbca04 --force \
+    --description 'manager: PR open, waiting on operator approval' >/dev/null 2>&1 \
+    || die 1 "gh label create mgr:awaiting-approval failed"
+  gh label create 'mgr:manual-approve' --color d93f0b --force \
+    --description 'manager: builder must not self-merge; operator approves' >/dev/null 2>&1 \
+    || die 1 "gh label create mgr:manual-approve failed"
+}
+
+open_issues() { # cached json array of open issues
+  [ -n "${MGR_ISSUES_CACHE:-}" ] && { printf '%s' "$MGR_ISSUES_CACHE"; return; }
+  MGR_ISSUES_CACHE=$(gh issue list --state open --limit 200 \
+    --json number,title,labels,body) || die 1 "gh issue list failed"
+  printf '%s' "$MGR_ISSUES_CACHE"
+}
+
+issue_json() { # issue_json <N> -> {number,title,state,labels,body}
+  gh issue view "$1" --json number,title,state,labels,body 2>/dev/null \
+    || die 4 "issue #$1 not found"
+}
+
+policy_of() { # policy_of <issue-json>
+  jq -r 'if ([.labels[].name] | index("mgr:manual-approve")) then "manual-approve"
+         else "auto-merge" end' <<<"$1"
+}
+
+has_label() { # has_label <issue-json> <label>
+  [ "$(jq -r --arg l "$2" 'if ([.labels[].name]|index($l)) then "y" else "n" end' <<<"$1")" = y ]
+}
+
+JQ_BLOCKERS='def blockers:
+  ((.body // "") | [splits("\n")]
+   | map(select(test("^[[:space:]]*blocked[[:space:]]+by\\b"; "i")))
+   | join(" ")
+   | [scan("#([0-9]+)") | .[0] | tonumber] | unique);'
+
+open_blockers() { # open_blockers <issue-json> -> json array of open blocker numbers
+  local nums
+  nums=$(open_issues | jq -c '[.[].number]')
+  jq -c --argjson open "$nums" \
+    "$JQ_BLOCKERS"' [blockers[] | select(. as $n | $open | index($n))]' <<<"$1"
+}
+
+# ---------------------------------------------------------------- herdr
+
+agents_raw() {
+  [ -n "${MGR_AGENTS_CACHE:-}" ] && { printf '%s' "$MGR_AGENTS_CACHE"; return; }
+  MGR_AGENTS_CACHE=$(herdr agent list 2>/dev/null | jq -c '.result.agents // []') \
+    || die 1 "herdr agent list failed"
+  [ -n "$MGR_AGENTS_CACHE" ] || die 1 "herdr agent list returned no result"
+  printf '%s' "$MGR_AGENTS_CACHE"
+}
+
+agent_git() { # agent_git <cwd> -> "<worktree>\t<branch>"  (empty fields when n/a)
+  local cwd="$1" wt="" br=""
+  if [ -n "$cwd" ] && [ -d "$cwd" ]; then
+    wt=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+    br=$(git -C "$cwd" branch --show-current 2>/dev/null || true)
+  fi
+  printf '%s\t%s' "$wt" "$br"
+}
+
+# every live agent in this workspace, with worktree/branch resolved from its cwd
+ws_agents() {
+  [ -n "${MGR_WSAGENTS_CACHE:-}" ] && { printf '%s' "$MGR_WSAGENTS_CACHE"; return; }
+  local ws="${HERDR_WORKSPACE_ID:-}" a cwd wt br
+  local out=""
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    cwd=$(jq -r '.cwd // ""' <<<"$a")
+    IFS=$'\t' read -r wt br <<<"$(agent_git "$cwd")"
+    out+=$(jq -c --arg wt "$wt" --arg br "$br" \
+      '{name:(.name//null),pane_id,tab_id,cwd:(.cwd//null),agent_status:(.agent_status//null),
+        workspace_id,agent_kind:(.agent//null),
+        worktree:(if $wt=="" then null else $wt end),
+        branch:(if $br=="" then null else $br end)}' <<<"$a")
+    out+=$'\n'
+  done < <(agents_raw | jq -c --arg ws "$ws" '.[] | select(.workspace_id==$ws)')
+  MGR_WSAGENTS_CACHE=$(printf '%s' "$out" | jq -sc .)
+  printf '%s' "$MGR_WSAGENTS_CACHE"
+}
+
+live_agent() { # live_agent <name> -> enriched agent json or empty
+  ws_agents | jq -c --arg n "$1" 'map(select(.name==$n)) | .[0] // empty'
+}
+
+agent_by_target() { # agent_by_target <pane_id|tab_id> -> enriched agent json or empty
+  ws_agents | jq -c --arg t "$1" 'map(select(.pane_id==$t or .tab_id==$t)) | .[0] // empty'
+}
+
+# force the agent snapshot in THIS shell: live_agent/agent_by_target run inside
+# command substitutions, where `die` could only kill the subshell.
+require_agents() { ws_agents >/dev/null; }
+
+herdr_or_die() { # herdr_or_die <message> <cmd...>
+  local msg="$1"; shift
+  "$@" >/dev/null || die 1 "$msg"
+}
+
+# Issues that a live `issue-N` agent points at but which are NOT in the open
+# list (usually closed by a merged PR). Looked up one by one; an N that does not
+# exist at all is dropped and stays an `agent-without-label` orphan.
+tracked_missing_issues() { # tracked_missing_issues <open-issues-json> <agents-json>
+  local nums n j out=""
+  nums=$(jq -r --argjson open "$1" '
+    ([$open[].number]) as $on |
+    [ .[] | select(.name != null and (.name|test("^issue-[0-9]+$")))
+          | (.name|capture("^issue-(?<n>[0-9]+)$").n|tonumber) ]
+    | unique | map(. as $x | select(($on | index($x)) == null)) | .[]' <<<"$2")
+  for n in $nums; do
+    j=$(gh issue view "$n" --json number,title,labels,state 2>/dev/null) || continue
+    out+=$(jq -c . <<<"$j")
+    out+=$'\n'
+  done
+  printf '%s' "$out" | jq -sc .
+}
+
+# ---------------------------------------------------------------- board
+
+cmd_board() {
+  local cap=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cap) cap="${2:-}"; shift 2;;
+      *) die 2 "usage: mgr board [--cap N]";;
+    esac
+  done
+  cap=$(cap_of "$cap")
+
+  # resolved before the jq call: `die` inside a command substitution would only
+  # kill its own subshell, so each of these must be its own simple command.
+  local b_repo b_primary b_issues b_agents b_extra
+  b_repo=$(repo)
+  b_primary=$(primary)
+  b_issues=$(open_issues)
+  b_agents=$(ws_agents)
+  b_extra=$(tracked_missing_issues "$b_issues" "$b_agents")
+
+  jq -n \
+    --argjson issues "$b_issues" \
+    --argjson extra "$b_extra" \
+    --argjson ag "$b_agents" \
+    --argjson cap "$cap" \
+    --arg repo "$b_repo" \
+    --arg primary "$b_primary" \
+    --arg ws "${HERDR_WORKSPACE_ID:-}" \
+    --arg self "${HERDR_PANE_ID:-}" \
+    "$JQ_BLOCKERS"'
+    ($issues | map(.number)) as $open |
+    def pol: if ([.labels[].name]|index("mgr:manual-approve")) then "manual-approve" else "auto-merge" end;
+    def lbl($n): ([.labels[].name]|index($n)) != null;
+    ($issues | map(. + {state:"open", policy: pol,
+                        inflight: lbl("mgr:in-flight"),
+                        awaiting: lbl("mgr:awaiting-approval"),
+                        blocked_by: [blockers[] | select(. as $n | $open | index($n))]})) as $IO |
+    ($extra | map(. + {state:((.state // "CLOSED")|ascii_downcase), policy: pol,
+                       awaiting: lbl("mgr:awaiting-approval"),
+                       inflight: (lbl("mgr:in-flight") or (lbl("mgr:awaiting-approval")|not)),
+                       blocked_by: []})) as $IX |
+    ($IO + $IX) as $I |
+    def agent_for($n): ($ag | map(select(.name == ("issue-" + ($n|tostring)))) | .[0] // null);
+    def row: . as $i | agent_for($i.number) as $a |
+      {number:$i.number, title:$i.title, state:$i.state, policy:$i.policy,
+       agent:(if $a then $a.name else null end),
+       agent_status:(if $a then $a.agent_status else null end),
+       tab_id:(if $a then $a.tab_id else null end),
+       pane_id:(if $a then $a.pane_id else null end),
+       worktree:(if $a then $a.worktree else null end),
+       branch:(if $a then $a.branch else null end)};
+    ([$I[] | select(.inflight) | row] | sort_by(.number)) as $inflight |
+    ([$I[] | select(.awaiting and (.inflight|not)) | row] | sort_by(.number)) as $awaiting |
+    ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.blocked_by|length)==0)
+            | {number,title,policy,blocked_by}] | sort_by(.number)) as $ready |
+    ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.blocked_by|length)>0)
+            | {number,title,policy,blocked_by}] | sort_by(.number)) as $blocked |
+    ([$ag[] | select(.name != null and (.name|startswith("adopt-")))
+            | {pane_id,tab_id,agent:.name,agent_status,cwd}] | sort_by(.pane_id)) as $adopting |
+    ([$ag[] | select(.pane_id != $self)
+            | select((.name == null) or ((.name|startswith("issue-")|not)
+                                         and (.name|startswith("adopt-")|not)))
+            | {pane_id,tab_id,name,agent_kind,agent_status,cwd,branch,
+               issue_guess:(if (.branch // "") | test("^issue-[0-9]+-") then
+                              ((.branch|capture("^issue-(?<n>[0-9]+)-").n)|tonumber)
+                            else null end)}] | sort_by(.pane_id)) as $unmanaged |
+    ([ ($I[] | select(.inflight or .awaiting)
+             | select(agent_for(.number) == null)
+             | {number,title,reason:"label-without-agent"}),
+       ($ag[] | select(.name != null and (.name|test("^issue-[0-9]+$")))
+              | ((.name|capture("^issue-(?<n>[0-9]+)$").n)|tonumber) as $n
+              | select([$I[] | select(.number==$n and (.inflight or .awaiting))] | length == 0)
+              | {number:$n,
+                 title:([$I[] | select(.number==$n) | .title][0] // null),
+                 reason:"agent-without-label"})
+     ] | unique_by([.number,.reason]) | sort_by(.number)) as $orphans |
+    {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
+     cap:$cap,
+     slots_free:([0, ($cap - ($inflight|length) - ($adopting|length))] | max),
+     in_flight:$inflight, awaiting_approval:$awaiting,
+     ready:$ready, blocked:$blocked, orphans:$orphans,
+     adopting:$adopting, unmanaged:$unmanaged}'
+}
+
+slots_free_now() { # slots_free_now <cap>
+  cmd_board --cap "$1" | jq -r '.slots_free'
+}
+
+# ---------------------------------------------------------------- launch
+
+cmd_launch() {
+  local n="" cap=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cap) cap="${2:-}"; shift 2;;
+      *) [ -n "$n" ] && die 2 "usage: mgr launch <N> [--cap N]"; n="$1"; shift;;
+    esac
+  done
+  [ -n "$n" ] || die 2 "usage: mgr launch <N> [--cap N]"
+  case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
+  cap=$(cap_of "$cap")
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || die 3 "not running inside herdr (HERDR_WORKSPACE_ID unset)"
+  require_agents
+
+  local ij state title policy
+  ij=$(issue_json "$n")
+  state=$(jq -r '.state' <<<"$ij")
+  [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
+  has_label "$ij" 'mgr:in-flight' && die 3 "issue #$n is already labeled mgr:in-flight"
+  has_label "$ij" 'mgr:awaiting-approval' && die 3 "issue #$n is already labeled mgr:awaiting-approval"
+
+  local blk
+  blk=$(open_blockers "$ij")
+  [ "$(jq -r 'length' <<<"$blk")" -gt 0 ] && die 3 "issue #$n has open blockers: $(jq -rc . <<<"$blk")"
+
+  [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
+
+  local sf
+  sf=$(slots_free_now "$cap")
+  [ "$sf" -gt 0 ] || die 3 "no free slots (cap=$cap)"
+
+  title=$(jq -r '.title' <<<"$ij")
+  policy=$(policy_of "$ij")
+  local slug branch pri wt rp
+  slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
+  pri=$(primary)
+  rp=$(repo)
+  branch="issue-$n-$slug"
+  wt="$pri-issue-$n-$slug"
+  [ -e "$wt" ] && die 3 "worktree path already exists: $wt"
+
+  ensure_labels
+
+  git -C "$pri" worktree add -b "$branch" "$wt" main >/dev/null 2>&1 \
+    || die 1 "git worktree add -b $branch $wt main failed"
+
+  local tab_id="" pane_id="" created=""
+  teardown_launch() {
+    [ -n "$tab_id" ] && herdr tab close "$tab_id" >/dev/null 2>&1 || true
+    git -C "$pri" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    git -C "$pri" branch -D "$branch" >/dev/null 2>&1 || true
+  }
+
+  created=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$wt" \
+    --label "#$n $slug" --no-focus 2>/dev/null) || { teardown_launch; die 1 "herdr tab create failed"; }
+  tab_id=$(jq -r '.result.tab.tab_id // empty' <<<"$created")
+  pane_id=$(jq -r '.result.root_pane.pane_id // empty' <<<"$created")
+  if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
+    teardown_launch; die 1 "herdr tab create returned no tab_id/pane_id"
+  fi
+
+  # a freshly created pane needs a moment to reach its interactive shell prompt
+  local try started=false
+  for try in 1 2 3 4 5 6 7 8 9 10; do
+    if herdr agent start "issue-$n" --kind omp --pane "$pane_id" --timeout 120000 >/dev/null 2>&1; then
+      started=true; break
+    fi
+    sleep 1
+  done
+  $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
+
+  local brief
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Read ~/.claude/skills/manager/builder.md now and follow it exactly; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Begin with: gh issue view $n --comments"
+  herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
+    || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
+
+  gh issue edit "$n" --add-label 'mgr:in-flight' >/dev/null 2>&1 \
+    || { teardown_launch; die 1 "gh issue edit #$n --add-label mgr:in-flight failed"; }
+  gh issue comment "$n" --body "manager: launched · tab $tab_id · agent issue-$n · worktree $wt · branch $branch · policy $policy" >/dev/null 2>&1 \
+    || { teardown_launch; die 1 "gh issue comment #$n failed"; }
+
+  jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
+    --arg agent "issue-$n" --arg tab "$tab_id" --arg pane "$pane_id" \
+    --arg wt "$wt" --arg br "$branch" \
+    '{number:$number,title:$title,policy:$policy,agent:$agent,tab_id:$tab,pane_id:$pane,
+      worktree:$wt,branch:$br}'
+}
+
+# ---------------------------------------------------------------- adopt
+
+cmd_adopt() {
+  local target="" n="" cap=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cap) cap="${2:-}"; shift 2;;
+      *) if [ -z "$target" ]; then target="$1"; elif [ -z "$n" ]; then n="$1";
+         else die 2 "usage: mgr adopt <pane_id|tab_id> [N] [--cap N]"; fi; shift;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "usage: mgr adopt <pane_id|tab_id> [N] [--cap N]"
+  [ -n "$n" ] && { case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac; }
+  cap=$(cap_of "$cap")
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || die 3 "not running inside herdr (HERDR_WORKSPACE_ID unset)"
+  require_agents
+
+  local a
+  a=$(agent_by_target "$target")
+  [ -n "$a" ] || die 4 "no live agent for target $target in workspace $HERDR_WORKSPACE_ID"
+  local pane tab cwd br name
+  pane=$(jq -r '.pane_id' <<<"$a")
+  tab=$(jq -r '.tab_id' <<<"$a")
+  cwd=$(jq -r '.cwd // ""' <<<"$a")
+  br=$(jq -r '.branch // ""' <<<"$a")
+  name=$(jq -r '.name // ""' <<<"$a")
+  [ "$pane" = "${HERDR_PANE_ID:-}" ] && die 3 "refusing to adopt the manager's own pane $pane"
+  case "$name" in
+    issue-*) die 3 "agent $name on $pane is already managed";;
+    adopt-*) die 3 "agent $name on $pane is already adopted (self-registration pending)";;
+  esac
+
+  local counts over_cap
+  counts=$(cmd_board --cap "$cap" | jq -r '(.in_flight|length) + (.adopting|length)')
+  if [ "$counts" -ge "$cap" ]; then over_cap=true; else over_cap=false; fi
+
+  local pri rp; pri=$(primary); rp=$(repo)
+  local br_disp="(none)" br_cmt="none"
+  [ -n "$br" ] && { br_disp="$br"; br_cmt="$br"; }
+  local wt; wt=$(jq -r '.worktree // ""' <<<"$a")
+
+  ensure_labels
+
+  if [ -n "$n" ]; then
+    local ij state title policy
+    ij=$(issue_json "$n")
+    state=$(jq -r '.state' <<<"$ij")
+    [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
+    [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
+    title=$(jq -r '.title' <<<"$ij")
+    policy=$(policy_of "$ij")
+    local slug; slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
+
+    herdr_or_die "herdr agent rename $pane issue-$n failed" herdr agent rename "$pane" "issue-$n"
+    herdr tab rename "$tab" "#$n $slug" >/dev/null 2>&1 || warn "herdr tab rename $tab failed"
+    gh issue edit "$n" --add-label 'mgr:in-flight' >/dev/null \
+      || die 1 "gh issue edit #$n --add-label mgr:in-flight failed"
+    if has_label "$ij" 'mgr:awaiting-approval'; then
+      gh issue edit "$n" --remove-label 'mgr:awaiting-approval' >/dev/null \
+        || warn "could not remove mgr:awaiting-approval from #$n"
+    fi
+    gh issue comment "$n" --body "manager: adopted · tab $tab · agent issue-$n · cwd $cwd · branch $br_cmt · policy $policy" >/dev/null \
+      || warn "gh issue comment #$n failed"
+
+    local brief
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Read ~/.claude/skills/manager/builder.md now and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
+
+    jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
+      --arg agent "issue-$n" --arg tab "$tab" --arg pane "$pane" \
+      --arg wt "$wt" --arg br "$br" --argjson over "$over_cap" \
+      '{number:$number,title:$title,policy:$policy,agent:$agent,tab_id:$tab,pane_id:$pane,
+        worktree:(if $wt=="" then null else $wt end),
+        branch:(if $br=="" then null else $br end),
+        over_cap:$over}'
+  else
+    local newname
+    newname="adopt-$(sanitize_pane "$pane")"
+    herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
+    local brief
+    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"), then run ~/.claude/skills/manager/bin/mgr bind <new issue number> from this session, then read ~/.claude/skills/manager/builder.md and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Resume your work only after bind succeeds."
+    herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
+
+    jq -nc --arg agent "$newname" --arg tab "$tab" --arg pane "$pane" \
+      --arg wt "$wt" --arg br "$br" --argjson over "$over_cap" \
+      '{number:null,agent:$agent,tab_id:$tab,pane_id:$pane,
+        worktree:(if $wt=="" then null else $wt end),
+        branch:(if $br=="" then null else $br end),
+        over_cap:$over}'
+  fi
+}
+
+# ---------------------------------------------------------------- bind
+
+cmd_bind() {
+  local n="${1:-}"
+  [ -n "$n" ] || die 2 "usage: mgr bind <N>"
+  case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
+  local pane="${HERDR_PANE_ID:-}" tab="${HERDR_TAB_ID:-}"
+  [ -n "$pane" ] || die 3 "mgr bind must run inside the builder's own pane (HERDR_PANE_ID unset)"
+  require_agents
+
+  local ij state title policy
+  ij=$(issue_json "$n")
+  state=$(jq -r '.state' <<<"$ij")
+  [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
+
+  local existing
+  existing=$(live_agent "issue-$n")
+  if [ -n "$existing" ] && [ "$(jq -r '.pane_id' <<<"$existing")" != "$pane" ]; then
+    die 3 "agent issue-$n is already live on $(jq -r '.pane_id' <<<"$existing")"
+  fi
+
+  local self
+  self=$(agent_by_target "$pane")
+  [ -n "$self" ] || die 3 "pane $pane hosts no agent"
+  [ -n "$tab" ] || tab=$(jq -r '.tab_id' <<<"$self")
+
+  local cwd br br_cmt
+  cwd=$(jq -r '.cwd // ""' <<<"$self")
+  br=$(jq -r '.branch // ""' <<<"$self")
+  br_cmt="none"; [ -n "$br" ] && br_cmt="$br"
+  local wt; wt=$(jq -r '.worktree // ""' <<<"$self")
+
+  title=$(jq -r '.title' <<<"$ij")
+  policy=$(policy_of "$ij")
+  local slug; slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
+
+  ensure_labels
+  herdr_or_die "herdr agent rename $pane issue-$n failed" herdr agent rename "$pane" "issue-$n"
+  herdr tab rename "$tab" "#$n $slug" >/dev/null 2>&1 || warn "herdr tab rename $tab failed"
+  gh issue edit "$n" --add-label 'mgr:in-flight' >/dev/null \
+    || die 1 "gh issue edit #$n --add-label mgr:in-flight failed"
+  gh issue comment "$n" --body "manager: bound · tab $tab · agent issue-$n · cwd $cwd · branch $br_cmt · policy $policy" >/dev/null \
+    || warn "gh issue comment #$n failed"
+
+  jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
+    --arg agent "issue-$n" --arg tab "$tab" --arg pane "$pane" \
+    --arg wt "$wt" --arg br "$br" \
+    '{number:$number,title:$title,policy:$policy,agent:$agent,tab_id:$tab,pane_id:$pane,
+      worktree:(if $wt=="" then null else $wt end),
+      branch:(if $br=="" then null else $br end)}'
+}
+
+# ---------------------------------------------------------------- report
+
+parse_report() { # parse_report <N> -> report object or null
+  local body
+  body=$(gh issue view "$1" --json comments \
+    -q '[.comments[].body | select(startswith("manager-report:"))] | last // ""' 2>/dev/null) \
+    || die 4 "issue #$1 not found"
+  [ -n "$body" ] || { printf 'null'; return; }
+  jq -nc --arg b "$body" '
+    [ $b | scan("([A-Za-z_][A-Za-z0-9_-]*)=(\"[^\"]*\"|[^[:space:]]+)")
+      | {key: .[0], value: (.[1] | if startswith("\"") then .[1:-1] else . end)} ]
+    | from_entries'
+}
+
+cmd_parse_report() {
+  local n="${1:-}"
+  [ -n "$n" ] || die 2 "usage: mgr _parse-report <N>"
+  case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
+  parse_report "$n"
+}
+
+# ---------------------------------------------------------------- wait
+
+cmd_wait() {
+  local arg="${1:-}"
+  [ -n "$arg" ] || die 2 "usage: mgr wait <N|pane_id>"
+  local target n=""
+  case "$arg" in
+    ''|*[!0-9]*) target="$arg";;
+    *) n="$arg"; target="issue-$arg";;
+  esac
+  herdr agent get "$target" >/dev/null 2>&1 || die 4 "agent target $target is not live"
+
+  herdr agent wait "$target" >/dev/null 2>&1 || true
+
+  local got status name pane
+  got=$(herdr agent get "$target" 2>/dev/null) || die 4 "agent target $target is not live"
+  status=$(jq -r '.result.agent.agent_status // "unknown"' <<<"$got")
+  name=$(jq -r '.result.agent.name // ""' <<<"$got")
+  pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
+  if [ -z "$n" ]; then
+    case "$name" in issue-*) n="${name#issue-}";; esac
+    case "$n" in ''|*[!0-9]*) n="";; esac
+  fi
+
+  local report='null'
+  if [ -n "$n" ]; then
+    report=$(parse_report "$n")
+    if [ "$(jq -r '.status // ""' <<<"$report")" = "awaiting-approval" ]; then
+      ensure_labels
+      gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
+        || warn "could not swap labels on #$n"
+    fi
+  fi
+
+  jq -nc --arg n "$n" --arg pane "$pane" --arg st "$status" --argjson report "$report" \
+    '{number:(if $n=="" then null else ($n|tonumber) end), pane_id:$pane,
+      agent_status:$st, report:$report}'
+}
+
+# ---------------------------------------------------------------- prompt
+
+cmd_prompt() {
+  local n="${1:-}"; shift || true
+  [ -n "$n" ] || die 2 "usage: mgr prompt <N> <text...>"
+  case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
+  [ $# -gt 0 ] || die 2 "usage: mgr prompt <N> <text...>"
+  local text="$*"
+  require_agents
+  [ -n "$(live_agent "issue-$n")" ] || die 4 "agent issue-$n is not live"
+
+  herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$text"
+
+  local ij; ij=$(issue_json "$n")
+  if has_label "$ij" 'mgr:awaiting-approval'; then
+    ensure_labels
+    gh issue edit "$n" --remove-label 'mgr:awaiting-approval' --add-label 'mgr:in-flight' >/dev/null 2>&1 \
+      || warn "could not swap labels on #$n"
+  fi
+
+  jq -nc --argjson number "$n" --arg agent "issue-$n" \
+    '{number:$number,agent:$agent,submitted:true}'
+}
+
+# ---------------------------------------------------------------- retire
+
+cmd_retire() {
+  local n="" close=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --close) close=true; shift;;
+      *) [ -n "$n" ] && die 2 "usage: mgr retire <N> [--close]"; n="$1"; shift;;
+    esac
+  done
+  [ -n "$n" ] || die 2 "usage: mgr retire <N> [--close]"
+  case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
+  require_agents
+
+  local a tab_closed=false wt_removed=0 br_deleted=false closed=false
+  a=$(live_agent "issue-$n")
+  local pri; pri=$(primary)
+  local wt="" br=""
+  if [ -n "$a" ]; then
+    wt=$(jq -r '.worktree // ""' <<<"$a")
+    br=$(jq -r '.branch // ""' <<<"$a")
+    local tab; tab=$(jq -r '.tab_id' <<<"$a")
+    if herdr tab close "$tab" >/dev/null 2>&1; then tab_closed=true
+    else warn "herdr tab close $tab failed"; fi
+  else
+    warn "no live agent issue-$n; skipping tab teardown"
+  fi
+
+  # every registered worktree of the primary that belongs to this issue: the
+  # retiring agent's own worktree plus any left on an issue-<N>-* branch.
+  local wtlist p b
+  wtlist=$(git -C "$pri" worktree list --porcelain \
+    | awk '/^worktree /{if(p!="")print p"\t"br; sub(/^worktree /,""); p=$0; br=""}
+           /^branch /{sub(/^branch refs\/heads\//,""); br=$0}
+           END{if(p!="")print p"\t"br}')
+  while IFS=$'\t' read -r p b; do
+    [ -n "$p" ] || continue
+    [ "$p" = "$pri" ] && continue
+    case "$b" in
+      issue-"$n"-*) ;;
+      *) [ -n "$wt" ] && [ "$p" = "$wt" ] || continue;;
+    esac
+    if git -C "$pri" worktree remove --force "$p" >/dev/null 2>&1; then
+      wt_removed=$((wt_removed + 1))
+    else
+      warn "git worktree remove --force $p failed"
+      continue
+    fi
+    if [ -n "$b" ]; then
+      if git -C "$pri" branch -d "$b" >/dev/null 2>&1; then br_deleted=true
+      else warn "git branch -d $b failed (unmerged? delete manually)"; fi
+    fi
+  done <<<"$wtlist"
+
+  gh issue edit "$n" --remove-label 'mgr:in-flight' --remove-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
+    || warn "could not remove mgr labels from #$n"
+
+  if $close; then
+    local state
+    state=$(gh issue view "$n" --json state -q .state 2>/dev/null || printf '')
+    if [ "$state" = CLOSED ]; then
+      closed=true
+    elif gh issue close "$n" --comment "manager: done" >/dev/null 2>&1; then
+      closed=true
+    else
+      warn "gh issue close #$n failed"
+    fi
+  fi
+
+  jq -nc --argjson number "$n" --argjson t "$tab_closed" --argjson w "$wt_removed" \
+    --argjson b "$br_deleted" --argjson c "$closed" \
+    '{number:$number,tab_closed:$t,worktree_removed:$w,branch_deleted:$b,closed:$c}'
+}
+
+# ---------------------------------------------------------------- labels
+
+cmd_labels() {
+  ensure_labels
+  jq -nc '{labels:["mgr:in-flight","mgr:awaiting-approval","mgr:manual-approve"]}'
+}
+
+# ---------------------------------------------------------------- usage
+
+usage() {
+  cat <<'EOF'
+mgr — manager CLI for herdr-hosted omp builders
+
+  mgr labels                          ensure the mgr:* labels exist
+  mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
+                                      blocked / orphans / adopting / unmanaged
+  mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N
+  mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
+                                      without N it self-registers via `mgr bind`)
+  mgr bind <N>                        run BY a builder in its own pane to bind to issue N
+  mgr wait <N|pane_id>                block until the builder settles; report its status
+  mgr prompt <N> <text...>            send text to builder issue-N
+  mgr retire <N> [--close]            close tab, remove worktree/branch, clear labels
+EOF
+}
+
+# ---------------------------------------------------------------- dispatch
+
+main() {
+  [ $# -gt 0 ] || { usage; exit 0; }
+  need_deps
+  local sub="$1"; shift
+  case "$sub" in
+    labels)        cmd_labels "$@";;
+    board)         cmd_board "$@";;
+    launch)        cmd_launch "$@";;
+    adopt)         cmd_adopt "$@";;
+    bind)          cmd_bind "$@";;
+    wait)          cmd_wait "$@";;
+    prompt)        cmd_prompt "$@";;
+    retire)        cmd_retire "$@";;
+    _parse-report) cmd_parse_report "$@";;
+    -h|--help|help) usage; exit 0;;
+    *) die 2 "unknown subcommand: $sub (try: mgr --help)";;
+  esac
+}
+
+main "$@"
