@@ -53,6 +53,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | I want to approve that one myself | adds `mgr:manual-approve` before launching |
 | what's on the board | `mgr board` as a table |
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
+| set the priority to 8 | `mgr priority 8` — this project outranks the others when quota is tight |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Layout
@@ -61,8 +62,8 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
-| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` — JSON out, exit codes `0/1/2/3/4` |
-| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` — the quota daemon, same JSON and exit codes |
+| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `priority` — JSON out, exit codes `0/1/2/3/4` |
+| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` · `priority` — the quota daemon, same JSON and exit codes |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager` |
 
 ## Protocol in one screen
@@ -94,6 +95,10 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
   by demand into a per-manager `allotment`, and `mgr board` reports
   `cap_effective = min(cap, allotment)`. `launch` and `adopt` obey it; `slots_free` counts against
   it. Guard down or stale → no throttle at all.
+- **Priorities.** Each project (repo) has a priority — `mgr priority N`, default 5, higher wins,
+  machine-wide. While quota is constrained the guard serves whole tiers top-down instead of
+  sharing evenly, so a bottom tier can drop to `allotment: 0`: its builders are interrupted with
+  `esc` and resumed by the guard itself once the share is back. `mgr priority 0` pauses a project.
 - **Stall detection.** For every `issue-*`, `adopt-*` and `manager*` agent that is not working, the
   guard reads the tail of the omp session JSONL: a last assistant message that stopped on an error
   with a 429 / rate-limit / quota-exhausted body is a stall.

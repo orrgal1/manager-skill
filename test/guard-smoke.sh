@@ -74,8 +74,15 @@ case "${1:-}/${2:-}" in
   agent/prompt)
     printf '%s\t%s\n' "${3:-}" "${4:-}" >>"${FAKE_PROMPTS:-/dev/null}"
     printf '{}\n';;
+  agent/send-keys)
+    printf '%s %s\n' "${3:-}" "${4:-}" >>"${FAKE_KEYS:-/dev/null}"
+    printf '{}\n';;
   notification/show)
-    printf '%s\n' "${3:-}" >>"${FAKE_TOASTS:-/dev/null}"
+    body=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --body) body="${2:-}"; shift 2;; *) shift;; esac
+    done
+    printf '%s\n' "$body" >>"${FAKE_TOASTS:-/dev/null}"
     printf '{}\n';;
   *) printf 'fake herdr: unsupported: %s\n' "$*" >&2; exit 1;;
 esac
@@ -151,19 +158,30 @@ SESS_CLEAN="$TMP/clean.jsonl"
               stopReason:"endTurn", content:"all done"}}'
 } >"$SESS_CLEAN"
 
-reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <adopting> <ready> <demand>
-  local sd="$1" now="$2"
+reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <adopting> <ready> <demand> [repo]
+  local sd="$1" now="$2" repo="${11:-acme/widgets}"
   MGR_STATE_DIR="$sd" MGR_GUARD_NOW_MS="$now" "$GUARD" register "$(jq -nc \
-    --arg id "$3" --arg ws "$4" --arg pane "$5" \
+    --arg id "$3" --arg ws "$4" --arg pane "$5" --arg repo "$repo" \
     --argjson cap "$6" --argjson inf "$7" --argjson ad "$8" --argjson rd "$9" --argjson dm "${10}" '
-    {manager_id:$id, workspace_id:$ws, pane_id:$pane, repo:"acme/widgets",
+    {manager_id:$id, workspace_id:$ws, pane_id:$pane, repo:$repo,
      primary:"/Users/x/code/widgets", cap:$cap, in_flight:$inf, adopting:$ad,
      ready:$rd, demand:$dm}')"
 }
 
+arm() { # arm <state-dir> <now-ms> <used-prev> <used-now>: seed one prior sample + the usage fixture
+  local sd="$1" now="$2" prev="$3" cur="$4" reset
+  reset=$(( now + 7200000 ))
+  mkdir -p "$sd"
+  jq -nc --argjson t "$(( now - 1800000 ))" --argjson u "$prev" --argjson r "$reset" \
+    '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:$u, resets_at:$r, status:"ok"}' \
+    >"$sd/samples.jsonl"
+  mk_usage "$TMP/usage-armed-$(basename "$sd").json" ok "$cur" "$reset"
+  export FAKE_USAGE="$TMP/usage-armed-$(basename "$sd").json"
+}
+
 printf '== help / usage ==\n'
 HELP="$("$GUARD" --help)"
-for c in start stop status tick run register stall; do
+for c in start stop status tick run register stall priority; do
   case "$HELP" in *"mgr-guard $c"*) pass "--help lists $c";; *) fail "--help is missing $c";; esac
 done
 "$GUARD" nonsense >/dev/null 2>&1; assert_eq "unknown subcommand exit code" 2 "$?"
@@ -223,15 +241,18 @@ agents_file "$TMP/agents-b.json" \
   "$(mk_agent issue-3 w1:p2 w1 working '')" \
   "$(mk_agent adopt-w1-p3 w1:p3 w1 idle '')"
 export FAKE_AGENTS="$TMP/agents-b.json"
+export FAKE_KEYS="$TMP/keys-b.log"; : >"$FAKE_KEYS"
 reg "$SD_B" "$T0" ws-w3 w3 w3:p1 3 2 0 2 3 >/dev/null
 reg "$SD_B" "$T0" ws-w1 w1 w1:p1 3 2 0 2 3 >/dev/null
 i=0
+ST_B2=""
 for step in "0 0.50" "600000 0.65" "1200000 0.80"; do
   set -- $step
   mk_usage "$TMP/usage-b.json" ok "$2" "$RESET_B"
   export FAKE_USAGE="$TMP/usage-b.json"
   ST_B="$(MGR_STATE_DIR="$SD_B" MGR_GUARD_NOW_MS=$(( T0 + $1 )) "$GUARD" tick)"
   i=$((i + 1))
+  [ "$i" = 2 ] && ST_B2="$ST_B"
   printf '     tick %d: allowed=%s burn=%s proj=%s\n' "$i" \
     "$(jq -r '.allowed_total' <<<"$ST_B")" \
     "$(jq -r '.providers.anthropic.limits[0].burn_per_hour' <<<"$ST_B")" \
@@ -239,7 +260,18 @@ for step in "0 0.50" "600000 0.65" "1200000 0.80"; do
 done
 assert_jq "(b) burn_per_hour 0.9"       "$ST_B" '.providers.anthropic.limits[0].burn_per_hour == 0.9'
 assert_jq "(b) projected 2.3, no fit"   "$ST_B" '.providers.anthropic.limits[0].projected_at_reset == 2.3 and (.providers.anthropic.limits[0].fits | not)'
-assert_jq "(b) active_builders 4"       "$ST_B" '.providers.anthropic.active_builders == 4'
+assert_jq "(b) active_builders 4 on the throttling tick" "$ST_B2" '.providers.anthropic.active_builders == 4'
+assert_jq "(b) throttle is constrained"  "$ST_B2" '.constrained == true and .demand_total == 6'
+assert_jq "(b) over-allotment builders paused, one per manager" "$ST_B2" \
+  '.managers["ws-w1"].allotment == 0 and .managers["ws-w3"].allotment == 1
+   and ([.stalled[] | select(.cause == "paused") | .pane_id] | sort) == ["w1:p2","w3:p3"]
+   and .managers["ws-w1"].paused == true and .managers["ws-w3"].paused == true'
+assert_eq "(b) esc order: highest issue number first per manager" "w1:p2 esc
+w3:p3 esc" "$(sed -n '1,2p' "$FAKE_KEYS")"
+assert_jq "(b) paused builders leave active_builders" "$ST_B" '.providers.anthropic.active_builders == 2'
+assert_jq "(b) esc re-sent while they keep working" "$ST_B" \
+  '[.stalled[] | select(.cause == "paused") | .esc_sent] == [2,2]'
+assert_eq "(b) four esc lines in total" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 assert_jq "(b) allowed_total 1"         "$ST_B" '.allowed_total == 1'
 assert_jq "(b) reason starts projected" "$ST_B" '.providers.anthropic.reason | startswith("projected")'
 assert_jq "(b) binding limit"           "$ST_B" '.providers.anthropic.binding_limit == "anthropic:5h"'
@@ -303,6 +335,255 @@ assert_jq "(f) manager_dropped event" "$ST_F" '[.events[] | select(.kind == "man
 assert_jq "(f) only live manager kept" "$ST_F" '(.managers | keys) == ["ws-w3"]'
 if [ -f "$SD_F/managers/ws-w7.json" ]; then fail "(f) ws-w7.json still on disk"; else pass "(f) ws-w7.json deleted"; fi
 if [ -f "$SD_F/managers/ws-w3.json" ]; then pass "(f) ws-w3.json kept"; else fail "(f) ws-w3.json deleted"; fi
+
+printf '\n== (g) priority CLI round-trip ==\n'
+SD_G="$TMP/s-g"
+PG0="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority)"
+assert_jq "(g) empty map, default 5" "$PG0" '.priorities == {} and .default == 5'
+PG1="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority acme/app)"
+assert_jq "(g) unknown repo -> 5, not explicit" "$PG1" '.repo == "acme/app" and .priority == 5 and .explicit == false'
+PG2="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority acme/app 8)"
+assert_jq "(g) set 8" "$PG2" '.repo == "acme/app" and .priority == 8 and .explicit == true'
+PG3="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority acme/site 0)"
+assert_jq "(g) set 0 (pause a project)" "$PG3" '.priority == 0 and .explicit == true'
+PG4="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority)"
+assert_jq "(g) map has both repos" "$PG4" '.priorities == {"acme/app":8,"acme/site":0}'
+assert_jq "(g) priorities.json on disk" "$(cat "$SD_G/priorities.json")" '.["acme/app"] == 8'
+PG5="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority acme/app --clear)"
+assert_jq "(g) --clear -> back to 5" "$PG5" '.repo == "acme/app" and .priority == 5 and .explicit == false'
+PG6="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority --clear acme/site)"
+assert_jq "(g) --clear before the repo works" "$PG6" '.priority == 5 and .explicit == false'
+PG7="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority)"
+assert_jq "(g) map empty again" "$PG7" '.priorities == {}'
+BADP="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority acme/app -1 2>&1)"
+assert_eq "(g) N=-1 exit code" 2 "$?"
+assert_jq "(g) N=-1 error shape" "$BADP" '.error.code == 2'
+BADP2="$(MGR_STATE_DIR="$SD_G" "$GUARD" priority acme/app abc 2>&1)"
+assert_eq "(g) N=abc exit code" 2 "$?"
+assert_jq "(g) N=abc error shape" "$BADP2" '.error.code == 2 and (.error.message | test("integer"))'
+MGR_STATE_DIR="$SD_G" "$GUARD" priority "" 3 >/dev/null 2>&1
+assert_eq "(g) empty repo exit code" 2 "$?"
+
+# ---- shared fixture for (h)-(j): three projects, priorities 8 / 5 / 2
+prios() { # prios <state-dir>
+  MGR_STATE_DIR="$1" "$GUARD" priority acme/a 8 >/dev/null
+  MGR_STATE_DIR="$1" "$GUARD" priority acme/c 2 >/dev/null
+}
+regs3() { # regs3 <state-dir> <now> <demand-a> <demand-b> <demand-c>
+  reg "$1" "$2" ws-wA wA wA:p1 3 0 0 "$3" "$3" acme/a >/dev/null
+  reg "$1" "$2" ws-wB wB wB:p1 3 0 0 "$4" "$4" acme/b >/dev/null
+  reg "$1" "$2" ws-wC wC wC:p1 3 0 0 "$5" "$5" acme/c >/dev/null
+}
+agents3() { # agents3 <file> <status-of-wC-builders>
+  agents_file "$1" \
+    "$(mk_agent manager   wA:p1 wA idle '')" \
+    "$(mk_agent manager-b wB:p1 wB idle '')" \
+    "$(mk_agent manager-c wC:p1 wC idle '')" \
+    "$(mk_agent issue-1 wA:p2 wA idle '')" \
+    "$(mk_agent issue-2 wA:p3 wA idle '')" \
+    "$(mk_agent issue-3 wA:p4 wA idle '')" \
+    "$(mk_agent issue-4 wB:p2 wB idle '')" \
+    "$(mk_agent issue-5 wB:p3 wB idle '')" \
+    "$(mk_agent issue-6 wB:p4 wB idle '')" \
+    "$(mk_agent issue-7 wC:p7 wC "$2" '')" \
+    "$(mk_agent issue-9 wC:p9 wC "$2" '')"
+}
+
+printf '\n== (h) tiered allotment: strict priority order when constrained ==\n'
+SD_H="$TMP/s-h"
+agents3 "$TMP/agents-h.json" idle
+export FAKE_AGENTS="$TMP/agents-h.json"
+export FAKE_PROMPTS="$TMP/prompts-h.log" FAKE_TOASTS="$TMP/toasts-h.log" FAKE_KEYS="$TMP/keys-h.log"
+: >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"; : >"$FAKE_KEYS"
+regs3 "$SD_H" "$T0" 3 2 2
+prios "$SD_H"
+arm "$SD_H" "$T0" 0.25 0.25          # no burn -> allowed_total = ceiling 9
+ST_H0="$(MGR_STATE_DIR="$SD_H" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(h) unconstrained allowed_total 9" "$ST_H0" '.allowed_total == 9'
+assert_jq "(h) demand_total 7"                "$ST_H0" '.demand_total == 7'
+assert_jq "(h) constrained false"             "$ST_H0" '.constrained == false'
+assert_jq "(h) unconstrained: everyone gets demand" "$ST_H0" \
+  '.managers["ws-wA"].allotment == 3 and .managers["ws-wB"].allotment == 2 and .managers["ws-wC"].allotment == 2'
+assert_jq "(h) priorities in state"           "$ST_H0" '.priorities == {"acme/a":8,"acme/c":2}'
+assert_jq "(h) manager priorities annotated"  "$ST_H0" \
+  '.managers["ws-wA"].priority == 8 and .managers["ws-wB"].priority == 5 and .managers["ws-wC"].priority == 2'
+assert_jq "(h) nobody paused"                 "$ST_H0" '[.managers[] | select(.paused)] | length == 0'
+assert_jq "(h) no internal fields leak into state" "$ST_H0" \
+  '[.managers[] | select(has("builders"))] | length == 0'
+assert_jq "(h) priority_changed events"       "$ST_H0" \
+  '[.events[] | select(.kind == "priority_changed") | .detail] as $d
+   | ($d | length) == 2 and ($d | index("acme/a: 5 -> 8") != null) and ($d | index("acme/c: 5 -> 2") != null)'
+if grep -q 'priority_changed: acme/a: 5 -> 8' "$FAKE_TOASTS"; then pass "(h) priority_changed toast"; else fail "(h) no priority_changed toast"; fi
+assert_eq "(h) no esc sent" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+arm "$SD_H" $(( T0 + 1800000 )) 0.25 0.50     # burn 0.5/h, 2h to reset -> allowed_total 4
+ST_H1="$(MGR_STATE_DIR="$SD_H" MGR_GUARD_NOW_MS=$(( T0 + 1800000 )) "$GUARD" tick)"
+assert_jq "(h) active_builders 8"     "$ST_H1" '.providers.anthropic.active_builders == 8'
+assert_jq "(h) allowed_total 4"       "$ST_H1" '.allowed_total == 4'
+assert_jq "(h) constrained true"      "$ST_H1" '.constrained == true'
+assert_jq "(h) tier 8 gets demand 3"  "$ST_H1" '.managers["ws-wA"].allotment == 3'
+assert_jq "(h) tier 5 gets leftover 1" "$ST_H1" '.managers["ws-wB"].allotment == 1'
+assert_jq "(h) tier 2 gets nothing"   "$ST_H1" '.managers["ws-wC"].allotment == 0'
+assert_jq "(h) no new priority_changed" "$ST_H1" '[.events[] | select(.kind == "priority_changed" and .at == '"$(( T0 + 1800000 ))"')] | length == 0'
+
+printf '\n== (i) hard pause of the lowest tier ==\n'
+SD_I="$TMP/s-i"
+agents3 "$TMP/agents-i-working.json" working
+agents3 "$TMP/agents-i-idle.json" idle
+export FAKE_AGENTS="$TMP/agents-i-working.json"
+export FAKE_PROMPTS="$TMP/prompts-i.log" FAKE_TOASTS="$TMP/toasts-i.log" FAKE_KEYS="$TMP/keys-i.log"
+: >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"; : >"$FAKE_KEYS"
+regs3 "$SD_I" "$T0" 3 2 2
+prios "$SD_I"
+arm "$SD_I" "$T0" 0.25 0.50
+ST_I1="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(i) constrained, ws-wC allotment 0" "$ST_I1" '.constrained == true and .managers["ws-wC"].allotment == 0'
+assert_jq "(i) ws-wC active_builders 2"        "$ST_I1" '.managers["ws-wC"].active_builders == 2'
+assert_eq "(i) exactly two esc lines" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_eq "(i) both esc, panes in order" "wC:p9 esc
+wC:p7 esc" "$(cat "$FAKE_KEYS")"
+assert_jq "(i) two paused entries" "$ST_I1" \
+  '[.stalled[] | select(.cause == "paused")] | length == 2'
+assert_jq "(i) paused entry shape" "$ST_I1" \
+  '[.stalled[] | select(.pane_id == "wC:p9")] | first
+   | .cause == "paused" and .name == "issue-9" and .workspace_id == "wC" and .manager_id == "ws-wC"
+     and .esc_sent == 1 and .paused_at == '"$T0"' and .since == '"$T0"'
+     and .provider == "anthropic" and .model == null and .error == null
+     and .attempts == 0 and .next_reignite_at == null'
+assert_jq "(i) ws-wC marked paused"   "$ST_I1" '.managers["ws-wC"].paused == true and .managers["ws-wA"].paused == false'
+assert_jq "(i) paused events"         "$ST_I1" \
+  '[.events[] | select(.kind == "paused")] | length == 2 and (.[0].detail | test("wC:p9 issue-9 \\(ws-wC priority 2, allotment 0\\)"))'
+if grep -q 'paused: wC:p9' "$FAKE_TOASTS"; then pass "(i) paused toast"; else fail "(i) no paused toast"; fi
+assert_eq "(i) no prompts on a pause" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+# still working on the next tick -> esc again (2/3)
+arm "$SD_I" $(( T0 + 600000 )) 0.25 0.50
+ST_I2="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS=$(( T0 + 600000 )) "$GUARD" tick)"
+assert_eq "(i) esc re-sent" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(i) esc_sent 2"        "$ST_I2" '[.stalled[] | select(.cause == "paused") | .esc_sent] == [2,2]'
+assert_jq "(i) paused_at unchanged" "$ST_I2" '[.stalled[] | select(.pane_id == "wC:p9")] | first | .paused_at == '"$T0"
+assert_jq "(i) paused builders leave provider active_builders" "$ST_I2" '.providers.anthropic.active_builders == 6'
+assert_jq "(i) no second paused event" "$ST_I2" '[.events[] | select(.kind == "paused" and .at == '"$(( T0 + 600000 ))"')] | length == 0'
+# idle now -> nothing to send
+export FAKE_AGENTS="$TMP/agents-i-idle.json"
+arm "$SD_I" $(( T0 + 900000 )) 0.25 0.50
+ST_I3="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS=$(( T0 + 900000 )) "$GUARD" tick)"
+assert_eq "(i) no esc for an idle paused builder" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(i) esc_sent stays 2" "$ST_I3" '[.stalled[] | select(.cause == "paused") | .esc_sent] == [2,2]'
+assert_jq "(i) entries survive"  "$ST_I3" '[.stalled[] | select(.cause == "paused")] | length == 2'
+assert_eq "(i) still no prompts" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+
+printf '\n== (j) resume when the allotment comes back ==\n'
+NOW_J=$(( T0 + 1200000 ))
+arm "$SD_I" "$NOW_J" 0.10 0.10        # no burn -> allowed_total = ceiling 9, unconstrained
+ST_J="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS="$NOW_J" "$GUARD" tick)"
+assert_jq "(j) unconstrained again" "$ST_J" '.allowed_total == 9 and .constrained == false and .managers["ws-wC"].allotment == 2'
+assert_eq "(j) two resume prompts" 2 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_eq "(j) lowest issue number first" "wC:p7
+wC:p9" "$(cut -f1 <"$FAKE_PROMPTS")"
+if grep -q "mgr-guard: this project's quota allotment is back (priority 2, allotment 2)." "$FAKE_PROMPTS"; then
+  pass "(j) resume text"
+else
+  fail "(j) resume text: $(cut -f2 <"$FAKE_PROMPTS" | head -1)"
+fi
+if grep -q 'The quota guard interrupted your previous turn' "$FAKE_PROMPTS"; then
+  pass "(j) resume text explains the interruption"
+else
+  fail "(j) resume text is missing the explanation"
+fi
+assert_jq "(j) entries removed"   "$ST_J" '(.stalled | length) == 0'
+assert_jq "(j) resumed events"    "$ST_J" \
+  '[.events[] | select(.kind == "resumed")] | length == 2 and (.[0].detail | test("wC:p7 issue-7 \\(ws-wC allotment 2\\)"))'
+assert_jq "(j) manager no longer paused" "$ST_J" '.managers["ws-wC"].paused == false'
+assert_eq "(j) no further esc" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+if grep -q 'resumed: wC:p7' "$FAKE_TOASTS"; then pass "(j) resumed toast"; else fail "(j) no resumed toast"; fi
+# the cooldown really is enforced
+SD_J2="$TMP/s-j2"
+export FAKE_AGENTS="$TMP/agents-i-working.json" FAKE_KEYS="$TMP/keys-j2.log" FAKE_PROMPTS="$TMP/prompts-j2.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+regs3 "$SD_J2" "$T0" 3 2 2
+prios "$SD_J2"
+arm "$SD_J2" "$T0" 0.25 0.50
+MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick >/dev/null
+export FAKE_AGENTS="$TMP/agents-i-idle.json"
+arm "$SD_J2" $(( T0 + 60000 )) 0.10 0.10
+ST_J2="$(MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+assert_jq "(j) room but inside the cooldown -> still paused" "$ST_J2" \
+  '.constrained == false and ([.stalled[] | select(.cause == "paused")] | length) == 2'
+assert_eq "(j) no prompt inside the cooldown" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+arm "$SD_J2" $(( T0 + 60000 )) 0.10 0.10
+ST_J3="$(MGR_GUARD_RESUME_COOLDOWN_S=0 MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+assert_eq "(j) cooldown 0 resumes both" 2 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_jq "(j) cooldown 0 clears the entries" "$ST_J3" '(.stalled | length) == 0'
+
+printf '\n== (k) a 429 entry is only reignited when its manager has room ==\n'
+SD_K="$TMP/s-k"
+agents_file "$TMP/agents-k.json" \
+  "$(mk_agent manager wK:p1 wK idle '')" \
+  "$(mk_agent issue-1 wK:p2 wK working '')" \
+  "$(mk_agent issue-9 wK:p9 wK blocked "$SESS_ANTHROPIC")"
+export FAKE_AGENTS="$TMP/agents-k.json" FAKE_USAGE="$TMP/usage-ok.json"
+export FAKE_PROMPTS="$TMP/prompts-k.log" FAKE_TOASTS="$TMP/toasts-k.log" FAKE_KEYS="$TMP/keys-k.log"
+: >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"; : >"$FAKE_KEYS"
+NOW_K=$(( T0 + 900001 ))
+mk_usage "$TMP/usage-k.json" ok 0.20 $(( NOW_K + 7200000 ))
+export FAKE_USAGE="$TMP/usage-k.json"
+reg "$SD_K" "$NOW_K" ws-wK wK wK:p1 3 1 0 0 1 acme/k >/dev/null
+ST_K1="$(MGR_STATE_DIR="$SD_K" MGR_GUARD_NOW_MS="$NOW_K" "$GUARD" tick)"
+assert_jq "(k) allotment 1, active 1 -> no room" "$ST_K1" \
+  '.managers["ws-wK"].allotment == 1 and .managers["ws-wK"].active_builders == 1'
+assert_jq "(k) the 429 entry is there, due"      "$ST_K1" \
+  '(.stalled | length) == 1 and .stalled[0].cause == "429" and .stalled[0].attempts == 0
+   and .stalled[0].next_reignite_at == '"$(( T0 + 900000 ))"
+assert_eq "(k) no reignite without room" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_eq "(k) and no esc (not constrained)" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+reg "$SD_K" $(( NOW_K + 1000 )) ws-wK wK wK:p1 3 2 0 0 2 acme/k >/dev/null
+ST_K2="$(MGR_STATE_DIR="$SD_K" MGR_GUARD_NOW_MS=$(( NOW_K + 1000 )) "$GUARD" tick)"
+assert_jq "(k) allotment 2 -> room" "$ST_K2" '.managers["ws-wK"].allotment == 2'
+assert_eq "(k) reignited once room appears" 1 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_eq "(k) reignite targets the stalled pane" "wK:p9" "$(cut -f1 <"$FAKE_PROMPTS")"
+assert_jq "(k) attempts 1"          "$ST_K2" '.stalled[0].attempts == 1'
+assert_jq "(k) reignite event"      "$ST_K2" '[.events[] | select(.kind == "reignite")] | length == 1'
+
+printf '\n== (l) esc gives up after three tries ==\n'
+SD_L="$TMP/s-l"
+export FAKE_AGENTS="$TMP/agents-i-working.json"
+export FAKE_KEYS="$TMP/keys-l.log" FAKE_PROMPTS="$TMP/prompts-l.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+regs3 "$SD_L" "$T0" 3 2 2
+prios "$SD_L"
+ST_L=""
+for off in 0 60000 120000 180000; do
+  arm "$SD_L" $(( T0 + off )) 0.25 0.50
+  ST_L="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + off )) "$GUARD" tick)"
+done
+assert_eq "(l) at most three esc per builder" 6 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(l) esc_sent capped at 3" "$ST_L" '[.stalled[] | select(.cause == "paused") | .esc_sent] == [3,3]'
+assert_jq "(l) entries stay paused"  "$ST_L" '[.stalled[] | select(.cause == "paused")] | length == 2'
+if grep -q 'error pause wC:p9 did not take' "$SD_L/guard.log"; then
+  pass "(l) gives up loudly in the log"
+else
+  fail "(l) no 'did not take' error in guard.log"
+fi
+if grep -q 'paused=2 resumed=0 constrained=true' "$SD_L/guard.log"; then
+  pass "(l) tick log line carries paused/resumed/constrained"
+else
+  fail "(l) tick log line: $(sed -n '$p' "$SD_L/guard.log")"
+fi
+
+printf '\n== (m) stall --pane: a paused entry wins over the file ==\n'
+SP1="$(MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane wC:p9 "$SESS_CLEAN")"
+assert_jq "(m) paused entry printed as-is" "$SP1" \
+  '.cause == "paused" and .pane_id == "wC:p9" and .name == "issue-9" and .manager_id == "ws-wC" and .esc_sent == 3'
+SP2="$(MGR_STATE_DIR="$SD_L" "$GUARD" stall "$SESS_CLEAN" --pane wC:p9)"
+assert_eq "(m) --pane after the file arg" "$SP1" "$SP2"
+SP3="$(MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane wA:p2 "$SESS_CLEAN")"
+assert_eq "(m) unpaused pane falls back to the file rule" "null" "$SP3"
+SP4="$(MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane wA:p2 "$SESS_ANTHROPIC")"
+assert_jq "(m) unpaused pane still reports a 429 stall" "$SP4" \
+  '.provider == "anthropic" and .retry_after_ms == 976000 and (has("cause") | not)'
+MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane wA:p2 "$TMP/nope.jsonl" >/dev/null 2>&1
+assert_eq "(m) unpaused pane + missing file -> exit 4" 4 "$?"
+MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane >/dev/null 2>&1
+assert_eq "(m) --pane without a file -> exit 2" 2 "$?"
 
 printf '\n== daemon lifecycle (start/status/stop, fake PATH) ==\n'
 DAEMON_STATE="$TMP/s-daemon"

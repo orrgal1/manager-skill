@@ -193,11 +193,18 @@ guard_state() {
   printf '%s' "$MGR_GUARD_CACHE"
 }
 
-guard_stall() { # guard_stall <session.jsonl> -> stall object, or nothing
-  local path="${1:-}" out=""
+# `--pane` lets the guard answer from its own ledger: a builder it paused on
+# purpose has no rate-limit error in its session file, only a `cause:"paused"`
+# entry in state.json, and that entry wins over the file check.
+guard_stall() { # guard_stall <pane_id> <session.jsonl> -> stall object, or nothing
+  local pane="${1:-}" path="${2:-}" out=""
   [ -n "$path" ] || return 0
   [ -x "$guard_bin" ] || return 0
-  out=$("$guard_bin" stall "$path" 2>/dev/null) || return 0
+  if [ -n "$pane" ]; then
+    out=$("$guard_bin" stall --pane "$pane" "$path" 2>/dev/null) || return 0
+  else
+    out=$("$guard_bin" stall "$path" 2>/dev/null) || return 0
+  fi
   jq -e 'type == "object"' >/dev/null 2>&1 <<<"$out" || return 0
   jq -c . <<<"$out"
 }
@@ -220,7 +227,9 @@ guard_heartbeat() { # guard_heartbeat <board-json>
   "$guard_bin" register "$reg" >/dev/null 2>&1 || warn "mgr-guard register failed"
 }
 
-# the `mgr wait` answer for a builder that is dead on a provider rate limit
+# the `mgr wait` answer for a builder the quota guard is holding: dead on a
+# provider rate limit (`cause:"429"`) or paused to keep quota for a
+# higher-priority project (`cause:"paused"`). No cause = a plain 429.
 quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
   local gst
   gst=$(guard_state)
@@ -228,9 +237,10 @@ quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
     ($stall.provider // null) as $p |
     (if $p == null then null else ($g.providers[$p] // null) end) as $pv |
     (($pv.recovers_at // ([($pv.limits // [])[] | .resets_at] | .[0])) // null) as $resets |
+    ($stall.cause // "429") as $cause |
     {number:(if $n == "" then null else ($n|tonumber) end), pane_id:$pane,
-     agent_status:"quota-stalled",
-     stall:($stall + {resets_at:$resets, guard:($g.guard // "stopped")}),
+     agent_status:(if $cause == "paused" then "quota-paused" else "quota-stalled" end),
+     stall:($stall + {cause:$cause, resets_at:$resets, guard:($g.guard // "stopped")}),
      report:null}'
 }
 
@@ -242,6 +252,22 @@ cmd_guard() {
   esac
   [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
   exec "$guard_bin" "$@"
+}
+
+# `mgr priority` is a thin front for the machine-wide, per-repo priority map:
+# this repo is the key and the guard owns the file.
+cmd_priority() {
+  [ $# -le 1 ] || die 2 "usage: mgr priority [N|--clear]"
+  local arg="${1:-}"
+  case "$arg" in
+    ''|--clear) ;;
+    *[!0-9]*) die 2 "priority must be a non-negative integer: $arg";;
+  esac
+  [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
+  local rp
+  rp=$(repo)
+  [ -n "$arg" ] || exec "$guard_bin" priority "$rp"
+  exec "$guard_bin" priority "$rp" "$arg"
 }
 
 # ---------------------------------------------------------------- board
@@ -330,17 +356,25 @@ cmd_board() {
     ((if ($pv.binding_limit // null) == null then null
       else ([$lims[] | select(.id == $pv.binding_limit)] | .[0]) end)
      // ($lims | sort_by(.used // 0) | last)) as $bl |
-    ($guard.managers[("ws-" + $ws)].allotment // null) as $allot |
+    ($guard.managers[("ws-" + $ws)] // null) as $me |
+    ($me.allotment // null) as $allot |
     # no allotment yet (registered after the last tick): the global verdict is the ceiling
     (if $gs == "running" then ([$cap, ($allot // $guard.allowed_total // $cap)] | min) else $cap end) as $capeff |
+    # guard-held builders of this workspace, split by why the guard holds them:
+    # a 429 comes from the provider, "paused" is the guard keeping quota for a
+    # higher-priority project. An entry without a cause predates the split.
     ([$guard.stalled[]? | select(.workspace_id == $ws)
             | select((.name // "") | test("^issue-[0-9]+$"))
-            | ((.name | capture("^issue-(?<n>[0-9]+)$").n) | tonumber)] | unique) as $qstalled |
+            | {n:((.name | capture("^issue-(?<n>[0-9]+)$").n) | tonumber),
+               cause:(.cause // "429")}]) as $held |
+    ([$held[] | select(.cause == "429") | .n] | unique) as $qstalled |
+    ([$held[] | select(.cause == "paused") | .n] | unique) as $qpaused |
     {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
      cap:$cap, cap_effective:$capeff,
      slots_free:([0, ($capeff - ($inflight|length) - ($adopting|length))] | max),
      in_flight:[$inflight[] | .number as $rn
-                | . + {quota_stalled: (($qstalled | index($rn)) != null)}],
+                | . + {quota_stalled: (($qstalled | index($rn)) != null),
+                       quota_paused: (($qpaused | index($rn)) != null)}],
      awaiting_approval:$awaiting,
      ready:$ready, blocked:$blocked, orphans:$orphans,
      adopting:$adopting, unmanaged:$unmanaged,
@@ -350,12 +384,16 @@ cmd_board() {
             projected_at_reset:($bl.projected_at_reset // null),
             allowed_total:($pv.allowed_total // $guard.allowed_total // null),
             allotment:$allot, reason:($pv.reason // null),
+            priority:($guard.priorities[$repo] // 5),
+            constrained:($guard.constrained // false),
+            paused:($me.paused // false),
             managers:([($guard.managers // {}) | to_entries[]
                        | {manager_id:(.value.manager_id // .key), repo:(.value.repo // null),
                           cap:(.value.cap // null), in_flight:(.value.in_flight // null),
-                          allotment:(.value.allotment // null), live:(.value.live // false)}]
+                          allotment:(.value.allotment // null), live:(.value.live // false),
+                          priority:(.value.priority // null), paused:(.value.paused // false)}]
                       | sort_by(.manager_id)),
-            stalled:$qstalled}}')
+            stalled:$qstalled, paused_builders:$qpaused}}')
 
   # the board JSON is the only thing on stdout; the heartbeat is silent
   printf '%s\n' "$board"
@@ -640,22 +678,23 @@ cmd_wait() {
   local got status name pane sess stall
   got=$(herdr agent get "$target" 2>/dev/null) || die 4 "agent target $target is not live"
 
-  # (a) a builder already dead on a rate limit never settles on its own: with the
-  # guard running, wait for its reignition first; without a guard, say so and stop.
+  # (a) a builder the guard is already holding never settles on its own — a 429
+  # is dead until the quota returns, a paused one until the guard resumes it.
+  # With the guard running, park on its revival first; without a guard, say so.
   status=$(jq -r '.result.agent.agent_status // "unknown"' <<<"$got")
+  pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
+  name=$(jq -r '.result.agent.name // ""' <<<"$got")
   sess=$(jq -r '.result.agent.agent_session.value // empty' <<<"$got")
+  if [ -z "$n" ]; then
+    case "$name" in issue-*) n="${name#issue-}";; esac
+    case "$n" in ''|*[!0-9]*) n="";; esac
+  fi
   stall=""
-  if [ "$status" != working ]; then stall=$(guard_stall "$sess" || true); fi
+  if [ "$status" != working ]; then stall=$(guard_stall "$pane" "$sess" || true); fi
   if [ -n "$stall" ]; then
     if [ "$(guard_state | jq -r '.guard')" = running ]; then
       herdr agent wait "$target" --until working >/dev/null 2>&1 || true
     else
-      pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
-      name=$(jq -r '.result.agent.name // ""' <<<"$got")
-      if [ -z "$n" ]; then
-        case "$name" in issue-*) n="${name#issue-}";; esac
-        case "$n" in ''|*[!0-9]*) n="";; esac
-      fi
       quota_stalled_json "$n" "$pane" "$stall"
       return 0
     fi
@@ -683,9 +722,9 @@ cmd_wait() {
     fi
   fi
 
-  # (b) it settled with no fresh report because it died on a rate limit again
+  # (b) it settled with no fresh report because the guard is holding it again
   if [ "$report" = null ] && [ "$status" != working ]; then
-    stall=$(guard_stall "$sess" || true)
+    stall=$(guard_stall "$pane" "$sess" || true)
     if [ -n "$stall" ]; then
       quota_stalled_json "$n" "$pane" "$stall"
       return 0
@@ -820,10 +859,13 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr retire <N> [--close]            close tab, remove worktree/branch, clear labels
   mgr guard <start|stop|status>       the deterministic quota-guard daemon: start is
                                       idempotent, status is cheap (files + kill -0)
+  mgr priority [N|--clear]            show/set this repo's quota priority (machine-wide,
+                                      default 5, higher wins; 0 pauses the project)
 
 env: MGR_CAP        default concurrency cap
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
+     MGR_GUARD_RESUME_COOLDOWN_S  seconds before a paused builder may resume (300)
 EOF
 }
 
@@ -843,6 +885,7 @@ main() {
     prompt)        cmd_prompt "$@";;
     retire)        cmd_retire "$@";;
     guard)         cmd_guard "$@";;
+    priority)      cmd_priority "$@";;
     _parse-report) cmd_parse_report "$@";;
     -h|--help|help) usage; exit 0;;
     *) die 2 "unknown subcommand: $sub (try: mgr --help)";;

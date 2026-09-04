@@ -217,13 +217,19 @@ Push your branch first so nothing is lost, then report and stop:
 
 Never leave the issue silent. A builder that stops without a report looks like a hang.
 
-### Rate-limit stalls
+### Quota guard interruptions
 
-A prompt that starts with `mgr-guard:` is not from the manager or the operator. Your previous turn
-died on a provider rate limit (429) and a daemon re-prompted you because the quota is back. Nobody
-is asking you anything and nothing about your issue changed: resume exactly where you stopped,
-under this contract. A rate-limit stall is not a failure — do not restart your work from the top
-and do not post a `manager-report` for it.
+A prompt that starts with `mgr-guard:` is not from the manager or the operator — it is a plain
+daemon, and it comes in two flavours. *"provider quota … is available again"*: your previous turn
+died on a provider rate limit (429) and the quota is back. *"this project's quota allotment is
+back"*: the guard interrupted your turn with `esc` to keep quota for a higher-priority project,
+and your project's share has now returned. Either way nobody is asking you anything and nothing
+about your issue changed: resume exactly where you stopped, under this contract.
+
+An interruption can land mid-command, so before you continue check `git status` and the last step
+you took — the command may have half-run, and you want neither to redo it nor to build on half of
+it. Neither kind of stop is a failure: do not restart your work from the top and do not post a
+`manager-report` for it.
 
 ## 13. Report protocol
 

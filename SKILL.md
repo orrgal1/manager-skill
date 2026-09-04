@@ -1,6 +1,6 @@
 ---
 name: manager
-description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs', 'quota status'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows ~/.claude/skills/manager/builder.md instead."
+description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs', 'quota status', 'set the priority to N'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows ~/.claude/skills/manager/builder.md instead."
 ---
 
 # Manager
@@ -171,6 +171,7 @@ rate limit. Read `agent_status` before `report`:
 | `agent_status` | Do |
 |---|---|
 | `quota-stalled` | Relay `stall` to the operator: `provider`, `error`, and when the window resets (`resets_at`). Do **not** prompt it, do **not** retire it — the work is intact. If `stall.guard` is `stopped`, run `$MGR guard start`. Then `$MGR wait N` again in the background: the guard re-prompts the builder once the quota is back, and that wait returns the real report. |
+| `quota-paused` | The provider is fine — the guard interrupted this builder to keep quota for a higher-priority project, because this project's `allotment` no longer covers it. Relay that: `stall.cause` is `paused`, plus the board's `quota.priority` and `quota.allotment`. Do **not** prompt it, do **not** retire it — the work is intact and the tab stays. Then `$MGR wait N` again in the background: the guard resumes it by itself once the share is back, and that wait returns the real report. Only the operator may change the ranking (`$MGR priority`). |
 
 **`number` is null** — an adoptee idled before binding. Read what it said, answer, wait again:
 
@@ -188,9 +189,10 @@ Otherwise branch on `report.status`:
 | `awaiting-approval` | Give the operator the PR URL and the builder's own summary (its last non-report issue comment). Do **not** retire — the tab stays alive for the fixes. The slot frees itself. |
 | `blocked` / `failed` | Relay `reason` verbatim, keep the tab, ask the operator how to proceed: `$MGR prompt N "<answer>"` + wait again, or `$MGR retire N`. Never guess the answer for them. |
 
-`report` is `null` — check `agent_status` first: `quota-stalled` is not a question, it is the row
-above, and prompting it only buys another 429. Otherwise the builder stopped without reporting,
-which almost always means it asked a question. Same as the unbound case, addressed by issue:
+`report` is `null` — check `agent_status` first: `quota-stalled` and `quota-paused` are not
+questions, they are the rows above, and prompting one only buys another 429 or takes quota back
+from a higher-priority project. Otherwise the builder stopped without reporting, which almost
+always means it asked a question. Same as the unbound case, addressed by issue:
 `herdr agent read issue-N --source recent-unwrapped --lines 60`, relay it, answer with
 `$MGR prompt N "…"`, wait again. `agent_status: blocked` gets the same treatment.
 
@@ -204,8 +206,10 @@ Trust the report, not the idle state.
 | request changes on #N | `$MGR prompt N "Changes requested: <verbatim feedback>"` then wait |
 | cancel #N | `herdr agent send-keys issue-N ctrl+c`, then `$MGR retire N` — add `--close` only if the work is dropped, not deferred |
 | set the cap to N | remember N; pass `--cap N` to `board` and `launch` from now on. `cap_effective` can still be lower when the guard throttles — report that instead of raising the cap |
+| set priority to N / this project is more important than … | `$MGR priority N`, then `$MGR board` and report the new `quota.priority` / `quota.allotment`. The number is machine-wide per repo (default 5, higher wins) and only bites when quota is constrained: the guard serves whole priority tiers top-down, so the lowest tiers lose their builders first |
+| pause this project | `$MGR priority 0` — the bottom tier gets nothing while quota is constrained, so the guard interrupts this project's builders and resumes them itself when the quota or the priority comes back. Tabs, worktrees and issues are untouched; this is not `cancel` |
 | status / what's on the board | `$MGR board`, reported as a short table |
-| quota status | `$MGR guard status`, reported as a short table: providers, managers, allotments, stalled |
+| quota status | `$MGR guard status`, reported as a short table: providers, managers with their priorities and allotments, stalled and paused builders |
 | dedupe the issues | Intake (a) over the whole open list |
 | adopt the other tabs | **Adoption** |
 | launch the next one | `$MGR board`, then `$MGR launch` the lowest `ready` number |
@@ -233,6 +237,9 @@ Trust the report, not the idle state.
 - Never re-prompt a quota-stalled builder yourself. The guard reignites it, with backoff. Your own
   session runs on the same quota and can stall too; the guard reignites you as well, so a
   `mgr-guard:` prompt in your pane means resume where you stopped.
+- Priority is the operator's dial. Set it only when they ask, and **never bump your own project to
+  unpause a builder** — a `quota-paused` builder is the guard keeping quota for a project the
+  operator ranked higher. Relay it and let the guard resume it.
 - When you have nothing to launch and nothing to answer, say so and stop. Do not invent work.
 
 ## 8. Reference
@@ -252,6 +259,7 @@ Trust the report, not the idle state.
 | `$MGR guard start [--interval S]` | start the quota-guard daemon; idempotent, shared by all managers |
 | `$MGR guard stop` | stop it — read the Rules before you ever do |
 | `$MGR guard status` | the guard's whole verdict: providers, allowed_total, managers, allotments, stalled |
+| `$MGR priority [N\|--clear]` | this project's priority: no argument reads it, `N` sets it (integer ≥ 0, default 5, higher wins), `--clear` restores the default |
 
 Exit codes: `0` ok · `1` unexpected · `2` usage · `3` refused / invalid state · `4` not found.
 Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
@@ -267,9 +275,13 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `quota.burn_per_hour` `projected_at_reset` | measured burn rate and where usage lands by the reset |
 | `quota.allowed_total` `allotment` | builders the guard allows machine-wide · this manager's share |
 | `quota.reason` | why, in words — quote it to the operator |
-| `quota.managers` | every live manager: `manager_id`, `repo`, `cap`, `in_flight`, `allotment`, `live` |
+| `quota.managers` | every live manager: `manager_id`, `repo`, `cap`, `in_flight`, `priority`, `allotment`, `paused`, `live` |
+| `quota.priority` | this repo's priority — default 5, higher wins, machine-wide |
+| `quota.constrained` | `true` when `allowed_total` is below the total demand, so tiers start losing builders |
+| `quota.paused` `quota.paused_builders` | `true` when the guard paused builders of this project · the issue numbers it paused |
 | `quota.stalled` | issue numbers stalled on a rate limit in this workspace |
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
+| `in_flight[].quota_paused` | the guard interrupted that builder to keep quota for a higher-priority project |
 
 ### Labels
 
@@ -299,4 +311,5 @@ by `-`, e.g. `adopt-w26-p3`.
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the guard exits after this long with no live manager |
+| `MGR_GUARD_RESUME_COOLDOWN_S` | `300` | how long a paused builder waits before the guard may resume it |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's toasts |

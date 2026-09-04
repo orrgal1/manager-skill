@@ -27,12 +27,14 @@ STATEFILE="$STATE_DIR/state.json"
 MGRDIR="$STATE_DIR/managers"
 SAMPLES="$STATE_DIR/samples.jsonl"
 LOCKDIR="$STATE_DIR/guard.lock"
+PRIOFILE="$STATE_DIR/priorities.json"
 
 INTERVAL_S="${MGR_GUARD_INTERVAL:-60}"
 SLOPE_WINDOW_S="${MGR_GUARD_SLOPE_WINDOW_S:-1800}"
 MIN_SLOPE_SPAN_S="${MGR_GUARD_MIN_SLOPE_SPAN_S:-300}"
 IDLE_EXIT_S="${MGR_GUARD_IDLE_EXIT_S:-1800}"
 NOTIFY="${MGR_GUARD_NOTIFY:-1}"
+RESUME_COOLDOWN_S="${MGR_GUARD_RESUME_COOLDOWN_S:-300}"
 
 int_or() { # int_or <value> <fallback>
   case "${1:-}" in
@@ -44,6 +46,7 @@ INTERVAL_S=$(int_or "$INTERVAL_S" 60)
 SLOPE_WINDOW_S=$(int_or "$SLOPE_WINDOW_S" 1800)
 MIN_SLOPE_SPAN_S=$(int_or "$MIN_SLOPE_SPAN_S" 300)
 case "${IDLE_EXIT_S:-}" in ''|*[!0-9]*) IDLE_EXIT_S=1800;; esac
+case "${RESUME_COOLDOWN_S:-}" in ''|*[!0-9]*) RESUME_COOLDOWN_S=300;; esac
 
 ensure_state_dir() { mkdir -p "$MGRDIR" 2>/dev/null || die 1 "cannot create state dir: $STATE_DIR"; }
 
@@ -126,26 +129,37 @@ def slope($s):
       end
     end;
 
-# ---- managers: live vs dead registrations
-($managers | map(. + {live: (((.pane_id // "") | IN($panes[])) and ((.seen_at // 0) >= ($now - 3600000)))})) as $mgrs
-| ($mgrs | map(select(.live))) as $live
+def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) // null);
+
+# ---- managers: live vs dead registrations, project priority
+($managers | map(. + {live: (((.pane_id // "") | IN($panes[])) and ((.seen_at // 0) >= ($now - 3600000))),
+                      priority: (($priorities[(.repo // "")] // 5))})) as $mgrs
+| ($mgrs | map(select(.live))) as $live0
 | ($mgrs | map(select(.live | not))) as $dead
-| (if ($live | length) == 0 then 1 else ([$live[] | (.cap // 0)] | add) end) as $ceiling
+| (if ($live0 | length) == 0 then 1 else ([$live0[] | (.cap // 0)] | add) end) as $ceiling
+| ($live0 | map({key: (.workspace_id // ""), value: .manager_id}) | from_entries) as $ws2mgr
+| ($agents | map({key: .pane_id, value: .}) | from_entries) as $byp
+
+# ---- paused entries survive from the previous tick until resumed or their agent is gone
+| ([ ($prev.stalled // [])[] | select(.cause == "paused") | select((.pane_id // "") | IN($panes[])) ]) as $paused_prev
+| ($paused_prev | map(.pane_id)) as $ppanes
 
 # ---- stalled sessions (upsert against the previous tick)
-| ([ $agents[] | select((.stall != null) and (.agent_status != "working")) ] | map(
+| ([ $agents[] | select((.stall != null) and (.agent_status != "working"))
+                | select((.pane_id | IN($ppanes[])) | not) ] | map(
     . as $a | $a.stall as $s
     | (($s.retry_after_ms // 60000)) as $ra
     | ($s.since + ([$ra, 900000] | min)) as $first
     | ((($prev.stalled // []) | map(select(.pane_id == $a.pane_id)) | first) // null) as $p
     | {pane_id: $a.pane_id, name: $a.name, workspace_id: $a.workspace_id, session: $a.session,
        provider: $s.provider, model: $s.model, error: $s.error, since: $s.since,
-       retry_after_ms: $s.retry_after_ms}
+       retry_after_ms: $s.retry_after_ms, cause: "429"}
       + (if ($p != null) and ($p.since == $s.since)
          then {attempts: ($p.attempts // 0), last_reignite_at: ($p.last_reignite_at // null),
                next_reignite_at: ($p.next_reignite_at // $first)}
          else {attempts: 0, last_reignite_at: null, next_reignite_at: $first} end)
-  )) as $stalled
+  )) as $stalled429
+| (($stalled429 + $paused_prev)) as $stalled
 | ($stalled | map(.pane_id)) as $spanes
 
 # ---- per-provider trajectory + verdict
@@ -212,20 +226,36 @@ def slope($s):
 | ((($providers[$bp] // null) | if . == null then null else .allowed_total end)
    // ([$providers[] | .allowed_total] | min) // $ceiling) as $allowed_total
 
-# ---- water-filling allotments over live managers
-| ($live | sort_by([(.demand // 0), .manager_id])) as $sorted
-| (reduce range(0; ($sorted | length)) as $i ({rem: $allowed_total, out: []};
-     ((($sorted | length) - $i)) as $left
-     | ((.rem / $left) | floor) as $share
-     | ([($sorted[$i].demand // 0), $share] | min) as $allot
-     | {rem: (.rem - $allot), out: (.out + [$sorted[$i] + {allotment: $allot}])})) as $wf
-| (reduce range(0; ($wf.rem + 1)) as $_ ({rem: $wf.rem, out: ($wf.out | sort_by(.manager_id))};
-     if .rem <= 0 then .
-     else ([.out | to_entries[] | select(.value.allotment < (.value.demand // 0))] | first) as $c
-       | if $c == null then . else {rem: (.rem - 1), out: (.out | (.[$c.key].allotment) += 1)} end
-     end)) as $fill
+# ---- per-manager active builders: working issue-*/adopt-* of that workspace, not stalled/paused
+| ($live0 | map(. as $m
+    | ([ $agents[]
+         | select(((.name // "") | test("^(issue-|adopt-)")))
+         | select((.workspace_id // "") == ($m.workspace_id // ""))
+         | select(.agent_status == "working")
+         | select((.pane_id | IN($spanes[])) | not) ]) as $ab
+    | $m + {active_builders: ($ab | length), builders: $ab})) as $live
+| ((([$live[] | (.demand // 0)] | add) // 0)) as $demand_total
+| ($allowed_total < $demand_total) as $constrained
 
-# ---- events for this tick (reignite events are appended after the prompts run)
+# ---- allotments: strict priority tiers, water-filling inside each tier
+| ([$live[] | .priority] | unique | sort | reverse) as $tiers
+| (reduce $tiers[] as $tp ({rem: $allowed_total, out: []};
+     . as $acc
+     | ([$live[] | select(.priority == $tp)] | sort_by([(.demand // 0), .manager_id])) as $tier
+     | (reduce range(0; ($tier | length)) as $i ({rem: $acc.rem, out: []};
+          ((($tier | length) - $i)) as $left
+          | ((.rem / $left) | floor) as $share
+          | ([($tier[$i].demand // 0), $share] | min) as $allot
+          | {rem: (.rem - $allot), out: (.out + [$tier[$i] + {allotment: $allot}])})) as $wf
+     | (reduce range(0; ($wf.rem + 1)) as $_ ({rem: $wf.rem, out: ($wf.out | sort_by(.manager_id))};
+          if .rem <= 0 then .
+          else ([.out | to_entries[] | select(.value.allotment < (.value.demand // 0))] | first) as $c
+            | if $c == null then . else {rem: (.rem - 1), out: (.out | (.[$c.key].allotment) += 1)} end
+          end)) as $fill
+     | {rem: $fill.rem, out: (.out + $fill.out)})) as $alloc
+| ($alloc.out) as $mgrsout
+
+# ---- events for this tick (reignite/paused/resumed events are appended after the I/O runs)
 | ([ ($dead[] | {at: $now, kind: "manager_dropped",
                  detail: (.manager_id + ": "
                    + (if (((.pane_id // "") | IN($panes[])) | not)
@@ -242,15 +272,72 @@ def slope($s):
       then {at: $now, kind: "allowed_changed",
             detail: ((($prev.allowed_total // "n/a") | tostring) + " -> " + ($allowed_total | tostring)
                      + " (" + ((($providers[$bp] // null) | if . == null then "n/a" else .reason end)) + ")")}
-      else empty end) ]) as $events
+      else empty end),
+     ((($prev.priorities // {})) as $pp
+      | ((($pp | keys) + ($priorities | keys)) | unique)[] as $k
+      | (($pp[$k] // 5)) as $a0 | (($priorities[$k] // 5)) as $b0
+      | if $a0 == $b0 then empty
+        else {at: $now, kind: "priority_changed",
+              detail: ($k + ": " + ($a0 | tostring) + " -> " + ($b0 | tostring))} end) ]) as $events
 
-# ---- reignition candidates
-| ([ $stalled[] | . as $st
+# ---- pause candidates: the over-allotment builders, highest issue number first, adoptees last
+| ([ $mgrsout[] | . as $m
+     | (if $constrained then (($m.active_builders // 0) - ($m.allotment // 0)) else 0 end) as $need
+     | select($need > 0)
+     | (($m.builders
+         | sort_by([(if ((.name // "") | test("^adopt-")) then 1 else 0 end),
+                    (0 - ((.name | issue_no) // 0)),
+                    (.pane_id // "")]))[0:$need][])
+     | {pane_id: .pane_id, name: (.name // null), workspace_id: (.workspace_id // null),
+        session: (.session // null), provider: (.provider // $bp),
+        manager_id: $m.manager_id, priority: $m.priority, allotment: $m.allotment,
+        paused_at: $now, esc_sent: 1, fresh: true} ]) as $pause_new
+
+# ---- resume candidates: paused builders whose manager has room again, lowest issue number first
+| ([ $mgrsout[] | . as $m
+     | ((($m.allotment // 0) - ($m.active_builders // 0))) as $room
+     | select($room > 0)
+     | ([ $stalled[] | select(.cause == "paused")
+          | select((.manager_id // "") == $m.manager_id)
+          | select($now >= ((.paused_at // 0) + ($cooldown * 1000)))
+          | select(((($providers[(.provider // "")] // null)
+                     | if . == null then "unknown" else .status end) // "unknown") != "exhausted") ]
+        | sort_by([((.name | issue_no) // 2147483647), (.pane_id // "")]))[0:$room][]
+     | {pane_id: .pane_id, name: (.name // null), manager_id: $m.manager_id,
+        priority: $m.priority, allotment: $m.allotment,
+        text: ("mgr-guard: this project\u0027s quota allotment is back (priority "
+               + ($m.priority | tostring) + ", allotment " + ($m.allotment | tostring) + ")."
+               + " The quota guard interrupted your previous turn to keep quota for"
+               + " higher-priority projects. Nobody needs to answer anything — resume exactly"
+               + " where you stopped and continue under your existing instructions.")} ]) as $resume
+| ($resume | map(.pane_id)) as $rpanes
+
+# ---- esc re-sends for paused builders that are still working (3 tries, then give up)
+| ([ $stalled[] | select(.cause == "paused")
+     | select((.pane_id | IN($rpanes[])) | not)
+     | select(((($byp[.pane_id] // {}).agent_status) // "") == "working")
+     | select((.esc_sent // 0) < 3)
+     | {pane_id: .pane_id, name: (.name // null), workspace_id: (.workspace_id // null),
+        session: (.session // null), provider: (.provider // $bp),
+        manager_id: (.manager_id // null), priority: (.priority // null), allotment: null,
+        paused_at: (.paused_at // $now), esc_sent: ((.esc_sent // 0) + 1), fresh: false} ]) as $pause_again
+| ([ $stalled[] | select(.cause == "paused")
+     | select((.pane_id | IN($rpanes[])) | not)
+     | select(((($byp[.pane_id] // {}).agent_status) // "") == "working")
+     | select((.esc_sent // 0) >= 3) | .pane_id ]) as $pause_stuck
+
+# ---- reignition candidates (429 entries only; the manager must have room when it is known)
+| ([ $stalled[] | select((.cause // "429") == "429") | . as $st
      | (($st.provider // "")) as $pk
      | (($providers[$pk] // null)) as $pv
      | ((($pv | if . == null then null else .status end)) // "unknown") as $pst
      | select($pst != "exhausted")
      | select($now >= ($st.next_reignite_at // 0))
+     | (if (($st.name // "") | test("^manager")) then null
+        else ($ws2mgr[($st.workspace_id // "")] // null) end) as $mid
+     | (if $mid == null then null
+        else ($mgrsout | map(select(.manager_id == $mid)) | first) end) as $mm
+     | select(($mm == null) or (($mm.allotment // 0) > ($mm.active_builders // 0)))
      | (((($pv | if . == null then null else .binding_limit end))
          // ((($pv | if . == null then [] else (.limits // []) end) | first | if . == null then null else .id end))
          // "quota")) as $lid
@@ -266,13 +353,16 @@ def slope($s):
                + " and continue under your existing instructions.")} ]) as $reignite
 
 | {now: $now, builder_provider: $bp, ceiling: $ceiling, providers: $providers,
-   allowed_total: $allowed_total, managers: $fill.out, dead: ($dead | map(.manager_id)),
-   stalled: $stalled, events: $events, reignite: $reignite}'
+   allowed_total: $allowed_total, demand_total: $demand_total, constrained: $constrained,
+   priorities: $priorities, managers: $mgrsout, dead: ($dead | map(.manager_id)),
+   stalled: $stalled, events: $events, reignite: $reignite,
+   pause: ($pause_new + $pause_again), pause_stuck: $pause_stuck, resume: $resume}'
 
 # policy output + prompt results -> {state, toasts, log}
 JQ_FINALIZE='
 def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
 ($policy.now) as $now
+# ---- reignition bookkeeping (429 entries only)
 | ($policy.stalled | map(
     . as $s
     | (($results | map(select(.pane_id == $s.pane_id)) | first) // null) as $r
@@ -281,18 +371,47 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
         | $s + {attempts: $n, last_reignite_at: $now, next_reignite_at: ($now + backoff($n))}
       else (($s.attempts // 0) + 1) as $n
         | $s + {next_reignite_at: ($now + backoff($n))}
-      end)) as $stalled
+      end)) as $st1
+# ---- a resumed builder loses its entry entirely
+| ([ $rresults[] | select(.ok) | .pane_id ]) as $rdone
+| ($st1 | map(select((.pane_id | IN($rdone[])) | not))) as $st2
+# ---- pauses: bump esc_sent on a re-send, add an entry for a fresh pause
+| ([ $presults[] | select(.ok) ]) as $pok
+| ($st2 | map(. as $s
+    | (($pok | map(select((.pane_id == $s.pane_id) and (.fresh | not))) | first) // null) as $p
+    | if $p == null then $s else $s + {esc_sent: $p.esc_sent} end)) as $st3
+| ($st3 + [ $pok[] | select(.fresh)
+            | {pane_id: .pane_id, name: .name, workspace_id: .workspace_id, session: .session,
+               provider: .provider, model: null, error: null, since: .paused_at,
+               retry_after_ms: null, attempts: 0, last_reignite_at: null, next_reignite_at: null,
+               cause: "paused", paused_at: .paused_at, esc_sent: .esc_sent,
+               manager_id: .manager_id} ]) as $stalled
 | ([ $results[] | select(.ok) | {at: $now, kind: "reignite",
-      detail: (.pane_id + " (" + .provider + ", " + .limit + ")")} ]) as $rev
+      detail: (.pane_id + " (" + .provider + ", " + .limit + ")")} ]
+   + [ $pok[] | select(.fresh) | {at: $now, kind: "paused",
+      detail: (.pane_id + " " + (.name // "?") + " (" + (.manager_id // "?")
+               + " priority " + ((.priority // 5) | tostring)
+               + ", allotment " + ((.allotment // 0) | tostring) + ")")} ]
+   + [ $rresults[] | select(.ok) | {at: $now, kind: "resumed",
+      detail: (.pane_id + " " + (.name // "?") + " (" + (.manager_id // "?")
+               + " allotment " + ((.allotment // 0) | tostring) + ")")} ]) as $rev
 | (($policy.events) + $rev) as $new
 | {state: {version: 1, pid: $pid, tick_at: $now, interval_s: $interval,
            builder_provider: $policy.builder_provider,
            providers: $policy.providers,
            allowed_total: $policy.allowed_total,
-           managers: ($policy.managers | map({key: .manager_id, value: .}) | from_entries),
+           demand_total: $policy.demand_total,
+           constrained: $policy.constrained,
+           priorities: $policy.priorities,
+           managers: ($policy.managers | map(del(.builders) | . as $m
+             | {key: .manager_id,
+                value: ($m + {paused: (([ $stalled[]
+                    | select((.cause == "paused") and ((.manager_id // "") == $m.manager_id)) ]
+                  | length) > 0)})}) | from_entries),
            stalled: $stalled,
            events: ((($prev.events // []) + $new) | .[-50:])},
-   toasts: [ $new[] | select(.kind | IN("exhausted", "recovered", "allowed_changed", "reignite"))
+   toasts: [ $new[] | select(.kind | IN("exhausted", "recovered", "allowed_changed", "reignite",
+                                        "paused", "resumed", "priority_changed"))
              | (.kind + ": " + .detail) ],
    log: ("tick provider=" + $policy.builder_provider
          + " status=" + ((($policy.providers[$policy.builder_provider] // null)
@@ -303,7 +422,10 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
                            | if . == null then 0 else .active_builders end)) | tostring)
          + " managers=" + (($policy.managers | length) | tostring)
          + " stalled=" + (($stalled | length) | tostring)
-         + " reignited=" + (($rev | length) | tostring)
+         + " reignited=" + (($rev | map(select(.kind == "reignite")) | length) | tostring)
+         + " paused=" + (($pok | length) | tostring)
+         + " resumed=" + ((([ $rresults[] | select(.ok) ] | length)) | tostring)
+         + " constrained=" + ($policy.constrained | tostring)
          + " reason=" + ((($policy.providers[$policy.builder_provider] // null)
                           | if . == null then "n/a" else .reason end)))}'
 
@@ -311,6 +433,13 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
 
 read_state() {
   if [ -f "$STATEFILE" ]; then jq -c . "$STATEFILE" 2>/dev/null || printf '{}'
+  else printf '{}'; fi
+}
+
+read_priorities() { # the machine-wide {"owner/name":N} map, {} when absent or unreadable
+  if [ -f "$PRIOFILE" ]; then
+    jq -c 'if type == "object" then with_entries(select((.value | type) == "number")) else {} end' \
+      "$PRIOFILE" 2>/dev/null || printf '{}'
   else printf '{}'; fi
 }
 
@@ -421,10 +550,77 @@ notify() { # notify <body>
 # ---------------------------------------------------------------- stall
 
 cmd_stall() {
-  local f="${1:-}"
-  [ -n "$f" ] || die 2 "usage: mgr-guard stall <session.jsonl>"
+  local f="" pane="" entry
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pane) pane="${2:-}"; shift; [ $# -eq 0 ] || shift;;
+      --pane=*) pane="${1#--pane=}"; shift;;
+      --) shift;;
+      -*) die 2 "usage: mgr-guard stall [--pane <pane_id>] <session.jsonl>";;
+      *) f="$1"; shift;;
+    esac
+  done
+  [ -n "$f" ] || die 2 "usage: mgr-guard stall [--pane <pane_id>] <session.jsonl>"
+  if [ -n "$pane" ]; then
+    entry=$(read_state | jq -c --arg p "$pane" \
+      '[(.stalled // [])[] | select((.pane_id == $p) and (.cause == "paused"))] | first // empty')
+    if [ -n "$entry" ]; then printf '%s\n' "$entry"; return 0; fi
+  fi
   [ -e "$f" ] || die 4 "session file not found: $f"
   session_facts "$f" "$(now_ms)" | jq -c '.stall'
+}
+
+# ---------------------------------------------------------------- priority
+
+cmd_priority() {
+  local repo="" val="" clear=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --clear) clear=1; shift;;
+      --) shift;;
+      -*) die 2 "usage: mgr-guard priority [<repo> [<N>|--clear]]";;
+      *) [ -n "$1" ] || die 2 "priority: <repo> must not be empty"
+         if [ -z "$repo" ]; then repo="$1"; else
+           [ -z "$val" ] || die 2 "usage: mgr-guard priority [<repo> [<N>|--clear]]"
+           val="$1"
+         fi
+         shift;;
+    esac
+  done
+
+  local map
+  map=$(read_priorities)
+
+  if [ -z "$repo" ]; then
+    [ "$clear" = 0 ] || die 2 "priority: --clear needs a <repo>"
+    jq -nc --argjson m "$map" '{priorities:$m, default:5}'
+    return 0
+  fi
+
+  if [ "$clear" = 1 ]; then
+    [ -z "$val" ] || die 2 "priority: <N> and --clear are mutually exclusive"
+  elif [ -z "$val" ]; then
+    jq -nc --argjson m "$map" --arg r "$repo" \
+      '{repo:$r, priority:($m[$r] // 5), explicit:(($m | has($r)))}'
+    return 0
+  else
+    case "$val" in
+      ''|*[!0-9]*) die 2 "priority: N must be an integer >= 0: $val";;
+      *) val=$(( 10#$val ));;
+    esac
+  fi
+
+  ensure_state_dir
+  local out
+  if [ "$clear" = 1 ]; then
+    out=$(jq -c --arg r "$repo" 'del(.[$r])' <<<"$map")
+  else
+    out=$(jq -c --arg r "$repo" --argjson n "$val" '.[$r] = $n' <<<"$map")
+  fi
+  printf '%s\n' "$out" | atomic_write "$PRIOFILE" || die 1 "cannot write $PRIOFILE"
+  log info "priority $repo = $(if [ "$clear" = 1 ]; then printf 'default (5)'; else printf '%s' "$val"; fi)"
+  jq -nc --argjson m "$out" --arg r "$repo" \
+    '{repo:$r, priority:($m[$r] // 5), explicit:(($m | has($r)))}'
 }
 
 # ---------------------------------------------------------------- register
@@ -457,7 +653,7 @@ cmd_register() {
 
 cmd_tick() {
   ensure_state_dir
-  local now prev bp agents panes facts providers p rep reports='[]' samples managers
+  local now prev bp agents panes facts providers p rep reports='[]' samples managers priorities
   now=$(now_ms)
   prev=$(read_state)
   bp=$(builder_provider)
@@ -465,6 +661,7 @@ cmd_tick() {
   panes=$(jq -c '[.[] | .pane_id // empty]' <<<"$agents")
   facts=$(scan_agents "$agents" "$now")
   managers=$(managers_json)
+  priorities=$(read_priorities)
 
   providers=$(jq -r --arg bp "$bp" \
     '([$bp] + [.[] | select(.stall != null) | (.stall.provider // empty)]) | unique | .[]' <<<"$facts")
@@ -491,6 +688,7 @@ cmd_tick() {
     --argjson managers "$managers" --argjson prev "$prev" \
     --argjson reports "$reports" --argjson samples "$samples" \
     --argjson slope_window "$SLOPE_WINDOW_S" --argjson min_span "$MIN_SLOPE_SPAN_S" \
+    --argjson priorities "$priorities" --argjson cooldown "$RESUME_COOLDOWN_S" \
     "$JQ_POLICY") || die 1 "policy evaluation failed"
 
   # dead registrations go away
@@ -518,9 +716,45 @@ cmd_tick() {
     results=$(jq -c --argjson c "$c" --argjson ok "$ok" '. + [$c + {ok:$ok}]' <<<"$results")
   done < <(jq -c '.reignite[]? // empty' <<<"$policy")
 
+  # hard pausing: esc into the over-allotment builders (and re-esc while they keep working)
+  local presults='[]'
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    pane=$(jq -r '.pane_id' <<<"$c")
+    ok=false
+    if command -v herdr >/dev/null 2>&1 && herdr agent send-keys "$pane" esc >/dev/null 2>&1; then
+      ok=true
+      log info "pause $pane esc sent ($(jq -r '.esc_sent' <<<"$c")/3)"
+    else
+      log error "pause $pane failed (herdr agent send-keys)"
+    fi
+    presults=$(jq -c --argjson c "$c" --argjson ok "$ok" '. + [$c + {ok:$ok}]' <<<"$presults")
+  done < <(jq -c '.pause[]? // empty' <<<"$policy")
+  while IFS= read -r pane; do
+    [ -n "$pane" ] || continue
+    log error "pause $pane did not take"
+  done < <(jq -r '.pause_stuck[]? // empty' <<<"$policy")
+
+  # resumes: the quota allotment is back for these paused builders
+  local rresults='[]'
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    pane=$(jq -r '.pane_id' <<<"$c")
+    text=$(jq -r '.text' <<<"$c")
+    ok=false
+    if command -v herdr >/dev/null 2>&1 && herdr agent prompt "$pane" "$text" >/dev/null 2>&1; then
+      ok=true
+      log info "resume $pane ok"
+    else
+      log error "resume $pane failed (herdr agent prompt)"
+    fi
+    rresults=$(jq -c --argjson c "$c" --argjson ok "$ok" '. + [$c + {ok:$ok}]' <<<"$rresults")
+  done < <(jq -c '.resume[]? // empty' <<<"$policy")
+
   local final pid
   pid=$(live_pid); [ -n "$pid" ] || pid=null
   final=$(jq -nc --argjson policy "$policy" --argjson results "$results" \
+    --argjson presults "$presults" --argjson rresults "$rresults" \
     --argjson prev "$prev" --argjson interval "$INTERVAL_S" --argjson pid "$pid" \
     "$JQ_FINALIZE") || die 1 "state assembly failed"
 
@@ -680,10 +914,17 @@ mgr-guard — deterministic quota guard for herdr-hosted omp builders
   mgr-guard tick                      run one tick in the foreground, print state
   mgr-guard run                       foreground tick loop (what start daemonizes)
   mgr-guard register '<json>'         upsert managers/<manager_id>.json with seen_at
-  mgr-guard stall <session.jsonl>     stall object for one omp session, or null
+  mgr-guard stall [--pane <pane_id>] <session.jsonl>
+                                      stall object for one omp session, or null
+                                      (--pane: a paused entry for that pane wins)
+  mgr-guard priority                  print the project priority map
+  mgr-guard priority <repo>           priority of one repo (default 5)
+  mgr-guard priority <repo> <N>       set it (integer >= 0, higher wins)
+  mgr-guard priority <repo> --clear   drop the entry (back to the default)
 
 Env: MGR_STATE_DIR MGR_GUARD_INTERVAL MGR_GUARD_SLOPE_WINDOW_S
      MGR_GUARD_MIN_SLOPE_SPAN_S MGR_GUARD_IDLE_EXIT_S MGR_GUARD_NOTIFY
+     MGR_GUARD_RESUME_COOLDOWN_S
 EOF
 }
 
@@ -700,6 +941,7 @@ main() {
     run)            cmd_run "$@";;
     register)       cmd_register "$@";;
     stall)          cmd_stall "$@";;
+    priority)       cmd_priority "$@";;
     -h|--help|help) usage; exit 0;;
     *) die 2 "unknown subcommand: $sub (try: mgr-guard --help)";;
   esac
