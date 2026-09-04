@@ -90,6 +90,8 @@ FAKE
 
 chmod +x "$BIN/omp" "$BIN/herdr"
 PATH="$BIN:$PATH"; export PATH
+# most scenarios pin a single-tick projection; (o) overrides this in line
+MGR_GUARD_CONFIRM_TICKS=1; export MGR_GUARD_CONFIRM_TICKS
 
 # ------------------------------------------------------------------ fixtures
 
@@ -174,15 +176,15 @@ reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <a
      ready:$rd, demand:$dm}')"
 }
 
-arm() { # arm <state-dir> <now-ms> <used-prev> <used-now>: seed one prior sample + the usage fixture
-  local sd="$1" now="$2" prev="$3" cur="$4" reset usage
+arm() { # arm <state-dir> <now-ms> <used-prev> <used-now> [status]: seed one prior sample + the usage fixture
+  local sd="$1" now="$2" prev="$3" cur="$4" status="${5:-ok}" reset usage
   reset=$(( now + 7200000 ))
   mkdir -p "$sd"
   jq -nc --argjson t "$(( now - 1800000 ))" --argjson u "$prev" --argjson r "$reset" \
     '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:$u, resets_at:$r, status:"ok"}' \
     >"$sd/samples.jsonl"
   usage="$TMP/usage-armed-$(basename "$sd").json"
-  mk_usage "$usage" ok "$cur" "$reset"
+  mk_usage "$usage" "$status" "$cur" "$reset"
   export FAKE_USAGE="$usage"
 }
 
@@ -255,7 +257,7 @@ i=0
 ST_B2=""
 for step in "0 0.50" "600000 0.65" "1200000 0.80"; do
   set -- $step
-  mk_usage "$TMP/usage-b.json" ok "$2" "$RESET_B"
+  mk_usage "$TMP/usage-b.json" warning "$2" "$RESET_B"
   export FAKE_USAGE="$TMP/usage-b.json"
   ST_B="$(MGR_STATE_DIR="$SD_B" MGR_GUARD_NOW_MS=$(( T0 + $1 )) "$GUARD" tick)"
   i=$((i + 1))
@@ -269,15 +271,16 @@ assert_jq "(b) burn_per_hour 0.9"       "$ST_B" '.providers.anthropic.limits[0].
 assert_jq "(b) projected 2.3, no fit"   "$ST_B" '.providers.anthropic.limits[0].projected_at_reset == 2.3 and (.providers.anthropic.limits[0].fits | not)'
 assert_jq "(b) active_builders 4 on the throttling tick" "$ST_B2" '.providers.anthropic.active_builders == 4'
 assert_jq "(b) throttle is constrained"  "$ST_B2" '.constrained == true and .demand_total == 6'
-assert_jq "(b) over-allotment builders paused, one per manager" "$ST_B2" \
+assert_jq "(b) over-allotment builders paused, the idle adoptee only held" "$ST_B2" \
   '.managers["ws-w1"].allotment == 0 and .managers["ws-w3"].allotment == 1
-   and ([.stalled[] | select(.cause == "paused") | .pane_id] | sort) == ["w1:p2","w3:p3"]
+   and ([.stalled[] | select(.cause == "paused") | .pane_id] | sort) == ["w1:p2","w1:p3","w3:p3"]
+   and ([.stalled[] | select(.pane_id == "w1:p3")] | first | .esc_sent) == 0
    and .managers["ws-w1"].paused == true and .managers["ws-w3"].paused == true'
 assert_eq "(b) esc order: highest issue number first per manager" "w1:p2 esc
 w3:p3 esc" "$(sed -n '1,2p' "$FAKE_KEYS")"
-assert_jq "(b) paused builders leave active_builders" "$ST_B" '.providers.anthropic.active_builders == 2'
-assert_jq "(b) esc re-sent while they keep working" "$ST_B" \
-  '[.stalled[] | select(.cause == "paused") | .esc_sent] == [2,2]'
+assert_jq "(b) paused builders leave active_builders" "$ST_B" '.providers.anthropic.active_builders == 1'
+assert_jq "(b) esc re-sent while they keep working, the held adoptee is left alone" "$ST_B" \
+  '([.stalled[] | select(.cause == "paused") | .esc_sent] | sort) == [0,2,2]'
 assert_eq "(b) four esc lines in total" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 assert_jq "(b) allowed_total 1"         "$ST_B" '.allowed_total == 1'
 assert_jq "(b) reason starts projected" "$ST_B" '.providers.anthropic.reason | startswith("projected")'
@@ -416,7 +419,9 @@ assert_jq "(h) manager priorities annotated"  "$ST_H0" \
   '.managers["ws-wA"].priority == 8 and .managers["ws-wB"].priority == 5 and .managers["ws-wC"].priority == 2'
 assert_jq "(h) nobody paused"                 "$ST_H0" '[.managers[] | select(.paused)] | length == 0'
 assert_jq "(h) no internal fields leak into state" "$ST_H0" \
-  '[.managers[] | select(has("builders"))] | length == 0'
+  '([.managers[] | select(has("builders") or has("all_builders"))] | length) == 0
+   and ([.providers.anthropic.limits[] | select(has("samples") or has("hours_to_reset"))] | length) == 0
+   and .managers["ws-wA"].no_room_at != null'
 assert_jq "(h) priority_changed events"       "$ST_H0" \
   '[.events[] | select(.kind == "priority_changed") | .detail] as $d
    | ($d | length) == 2 and ($d | index("acme/a: 5 -> 8") != null) and ($d | index("acme/c: 5 -> 2") != null)'
@@ -441,15 +446,18 @@ export FAKE_PROMPTS="$TMP/prompts-i.log" FAKE_TOASTS="$TMP/toasts-i.log" FAKE_KE
 : >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"; : >"$FAKE_KEYS"
 regs3 "$SD_I" "$T0" 3 2 2
 prios "$SD_I"
-arm "$SD_I" "$T0" 0.25 0.50
+arm "$SD_I" "$T0" 0.25 0.50 warning
 ST_I1="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
 assert_jq "(i) constrained, ws-wC allotment 0" "$ST_I1" '.constrained == true and .managers["ws-wC"].allotment == 0'
 assert_jq "(i) ws-wC active_builders 2"        "$ST_I1" '.managers["ws-wC"].active_builders == 2'
 assert_eq "(i) exactly two esc lines" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 assert_eq "(i) both esc, panes in order" "wC:p9 esc
 wC:p7 esc" "$(cat "$FAKE_KEYS")"
-assert_jq "(i) two paused entries" "$ST_I1" \
-  '[.stalled[] | select(.cause == "paused")] | length == 2'
+assert_jq "(i) two esc'd entries in wC, two idle wB builders held instead" "$ST_I1" \
+  '([.stalled[] | select(.cause == "paused") | .pane_id] | sort) == ["wB:p3","wB:p4","wC:p7","wC:p9"]
+   and ([.stalled[] | select(.workspace_id == "wB") | .esc_sent] | unique) == [0]
+   and ([.stalled[] | select(.workspace_id == "wC") | .esc_sent] | unique) == [1]
+   and .providers.anthropic.hard == true'
 assert_jq "(i) paused entry shape" "$ST_I1" \
   '[.stalled[] | select(.pane_id == "wC:p9")] | first
    | .cause == "paused" and .name == "issue-9" and .workspace_id == "wC" and .manager_id == "ws-wC"
@@ -458,24 +466,32 @@ assert_jq "(i) paused entry shape" "$ST_I1" \
      and .attempts == 0 and .next_reignite_at == null'
 assert_jq "(i) ws-wC marked paused"   "$ST_I1" '.managers["ws-wC"].paused == true and .managers["ws-wA"].paused == false'
 assert_jq "(i) paused events"         "$ST_I1" \
-  '[.events[] | select(.kind == "paused")] | length == 2 and (.[0].detail | test("wC:p9 issue-9 \\(ws-wC priority 2, allotment 0\\)"))'
+  '[.events[] | select(.kind == "paused") | .detail] as $d
+   | ($d | length) == 4
+     and ([$d[] | select(test("wC:p9 issue-9 \\(ws-wC priority 2, allotment 0\\)"))] | length) == 1'
 if grep -q 'paused: wC:p9' "$FAKE_TOASTS"; then pass "(i) paused toast"; else fail "(i) no paused toast"; fi
 assert_eq "(i) no prompts on a pause" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
 # still working on the next tick -> esc again (2/3)
-arm "$SD_I" $(( T0 + 600000 )) 0.25 0.50
+arm "$SD_I" $(( T0 + 600000 )) 0.25 0.50 warning
 ST_I2="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS=$(( T0 + 600000 )) "$GUARD" tick)"
+assert_jq "(i) ws-wB held builders stay at esc_sent 0" "$ST_I2" \
+  '([.stalled[] | select(.workspace_id == "wB") | .esc_sent] | unique) == [0]'
 assert_eq "(i) esc re-sent" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
-assert_jq "(i) esc_sent 2"        "$ST_I2" '[.stalled[] | select(.cause == "paused") | .esc_sent] == [2,2]'
+assert_jq "(i) esc_sent 2"        "$ST_I2" \
+  '[.stalled[] | select(.workspace_id == "wC") | .esc_sent] == [2,2]'
 assert_jq "(i) paused_at unchanged" "$ST_I2" '[.stalled[] | select(.pane_id == "wC:p9")] | first | .paused_at == '"$T0"
-assert_jq "(i) paused builders leave provider active_builders" "$ST_I2" '.providers.anthropic.active_builders == 6'
-assert_jq "(i) no second paused event" "$ST_I2" '[.events[] | select(.kind == "paused" and .at == '"$(( T0 + 600000 ))"')] | length == 0'
+assert_jq "(i) paused builders leave provider active_builders" "$ST_I2" '.providers.anthropic.active_builders == 4'
+assert_jq "(i) no second paused event for a builder already held" "$ST_I2" \
+  '[.events[] | select(.kind == "paused" and .at == '"$(( T0 + 600000 ))"') | .detail]
+   | ([.[] | select(test("wC:"))] | length) == 0'
 # idle now -> nothing to send
 export FAKE_AGENTS="$TMP/agents-i-idle.json"
-arm "$SD_I" $(( T0 + 900000 )) 0.25 0.50
+arm "$SD_I" $(( T0 + 900000 )) 0.25 0.50 warning
 ST_I3="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS=$(( T0 + 900000 )) "$GUARD" tick)"
 assert_eq "(i) no esc for an idle paused builder" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
-assert_jq "(i) esc_sent stays 2" "$ST_I3" '[.stalled[] | select(.cause == "paused") | .esc_sent] == [2,2]'
-assert_jq "(i) entries survive"  "$ST_I3" '[.stalled[] | select(.cause == "paused")] | length == 2'
+assert_jq "(i) esc_sent stays 2" "$ST_I3" '[.stalled[] | select(.workspace_id == "wC") | .esc_sent] == [2,2]'
+assert_jq "(i) entries survive"  "$ST_I3" \
+  '([.stalled[] | select(.cause == "paused") | .pane_id] | sort) == ["wA:p3","wA:p4","wB:p2","wB:p3","wB:p4","wC:p7","wC:p9"]'
 assert_eq "(i) still no prompts" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
 
 printf '\n== (j) resume when the allotment comes back ==\n'
@@ -483,9 +499,13 @@ NOW_J=$(( T0 + 1200000 ))
 arm "$SD_I" "$NOW_J" 0.10 0.10        # no burn -> allowed_total = ceiling 9, unconstrained
 ST_J="$(MGR_STATE_DIR="$SD_I" MGR_GUARD_NOW_MS="$NOW_J" "$GUARD" tick)"
 assert_jq "(j) unconstrained again" "$ST_J" '.allowed_total == 9 and .constrained == false and .managers["ws-wC"].allotment == 2'
-assert_eq "(j) two resume prompts" 2 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
-assert_eq "(j) lowest issue number first" "wC:p7
-wC:p9" "$(cut -f1 <"$FAKE_PROMPTS")"
+assert_eq "(j) every held builder its manager has room for is resumed" 6 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_eq "(j) lowest issue number first, per manager" "wA:p3
+wA:p4
+wB:p2
+wB:p3
+wC:p7
+wC:p9" "$(cut -f1 <"$FAKE_PROMPTS" | sort)"
 if grep -q "mgr-guard: this project's quota allotment is back (priority 2, allotment 2)." "$FAKE_PROMPTS"; then
   pass "(j) resume text"
 else
@@ -496,9 +516,12 @@ if grep -q 'The quota guard interrupted your previous turn' "$FAKE_PROMPTS"; the
 else
   fail "(j) resume text is missing the explanation"
 fi
-assert_jq "(j) entries removed"   "$ST_J" '(.stalled | length) == 0'
+assert_jq "(j) esc'd entries removed, only the still over-allotment hold stays" "$ST_J" \
+  '[.stalled[] | .pane_id] == ["wB:p4"]'
 assert_jq "(j) resumed events"    "$ST_J" \
-  '[.events[] | select(.kind == "resumed")] | length == 2 and (.[0].detail | test("wC:p7 issue-7 \\(ws-wC allotment 2\\)"))'
+  '[.events[] | select(.kind == "resumed") | .detail] as $d
+   | ($d | length) == 6
+     and ([$d[] | select(test("wC:p7 issue-7 \\(ws-wC allotment 2\\)"))] | length) == 1'
 assert_jq "(j) manager no longer paused" "$ST_J" '.managers["ws-wC"].paused == false'
 assert_eq "(j) no further esc" 4 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 if grep -q 'resumed: wC:p7' "$FAKE_TOASTS"; then pass "(j) resumed toast"; else fail "(j) no resumed toast"; fi
@@ -508,18 +531,42 @@ export FAKE_AGENTS="$TMP/agents-i-working.json" FAKE_KEYS="$TMP/keys-j2.log" FAK
 : >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
 regs3 "$SD_J2" "$T0" 3 2 2
 prios "$SD_J2"
-arm "$SD_J2" "$T0" 0.25 0.50
+arm "$SD_J2" "$T0" 0.25 0.50 warning
 MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick >/dev/null
+assert_eq "(j) the constrained tick escs wC" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+# 30 s after the no-room tick the cooldown (60 s) has not elapsed yet
 export FAKE_AGENTS="$TMP/agents-i-idle.json"
-arm "$SD_J2" $(( T0 + 60000 )) 0.10 0.10
-ST_J2="$(MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+arm "$SD_J2" $(( T0 + 30000 )) 0.10 0.10
+ST_J2="$(MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS=$(( T0 + 30000 )) "$GUARD" tick)"
 assert_jq "(j) room but inside the cooldown -> still paused" "$ST_J2" \
-  '.constrained == false and ([.stalled[] | select(.cause == "paused")] | length) == 2'
+  '.constrained == false and ([.stalled[] | select(.cause == "paused")] | length) == 4
+   and .managers["ws-wC"].no_room_at == '"$T0"
 assert_eq "(j) no prompt inside the cooldown" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
-arm "$SD_J2" $(( T0 + 60000 )) 0.10 0.10
-ST_J3="$(MGR_GUARD_RESUME_COOLDOWN_S=0 MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
-assert_eq "(j) cooldown 0 resumes both" 2 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
-assert_jq "(j) cooldown 0 clears the entries" "$ST_J3" '(.stalled | length) == 0'
+# 61 s after the last tick with no room, the resume fires
+arm "$SD_J2" $(( T0 + 61000 )) 0.10 0.10
+ST_J3="$(MGR_STATE_DIR="$SD_J2" MGR_GUARD_NOW_MS=$(( T0 + 61000 )) "$GUARD" tick)"
+assert_eq "(j) the cooldown elapsed -> wC resumes, wB up to its room" 3 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_jq "(j) the two esc'd builders are back" "$ST_J3" \
+  '[.stalled[] | select(.pane_id | startswith("wC:"))] | length == 0'
+# the knob itself: cooldown 0 resumes on the very next tick, held builders included
+SD_J3="$TMP/s-j3"
+export FAKE_AGENTS="$TMP/agents-i-working.json" FAKE_KEYS="$TMP/keys-j3.log" FAKE_PROMPTS="$TMP/prompts-j3.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+regs3 "$SD_J3" "$T0" 3 2 2
+prios "$SD_J3"
+arm "$SD_J3" "$T0" 0.25 0.50 warning
+MGR_STATE_DIR="$SD_J3" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick >/dev/null
+export FAKE_AGENTS="$TMP/agents-i-idle.json"
+arm "$SD_J3" $(( T0 + 1000 )) 0.10 0.10
+ST_J4="$(MGR_GUARD_RESUME_COOLDOWN_S=0 MGR_STATE_DIR="$SD_J3" MGR_GUARD_NOW_MS=$(( T0 + 1000 )) "$GUARD" tick)"
+assert_eq "(j) cooldown 0 resumes on the next tick" 3 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_jq "(j) cooldown 0 clears the esc'd entries" "$ST_J4" \
+  '[.stalled[] | select(.pane_id | startswith("wC:"))] | length == 0'
+if grep -q 'The quota guard held this session at the end of its previous turn' "$FAKE_PROMPTS"; then
+  pass "(j) a held builder gets the turn-boundary resume text"
+else
+  fail "(j) held builder resume text: $(cut -f2 <"$FAKE_PROMPTS" | sed -n '1p')"
+fi
 
 printf '\n== (k) a 429 entry is only reignited when its manager has room ==\n'
 SD_K="$TMP/s-k"
@@ -559,18 +606,19 @@ regs3 "$SD_L" "$T0" 3 2 2
 prios "$SD_L"
 ST_L=""
 for off in 0 60000 120000 180000; do
-  arm "$SD_L" $(( T0 + off )) 0.25 0.50
+  arm "$SD_L" $(( T0 + off )) 0.25 0.50 warning
   ST_L="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + off )) "$GUARD" tick)"
 done
 assert_eq "(l) at most three esc per builder" 6 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
-assert_jq "(l) esc_sent capped at 3" "$ST_L" '[.stalled[] | select(.cause == "paused") | .esc_sent] == [3,3]'
-assert_jq "(l) entries stay paused"  "$ST_L" '[.stalled[] | select(.cause == "paused")] | length == 2'
+assert_jq "(l) esc_sent capped at 3" "$ST_L" '[.stalled[] | select(.workspace_id == "wC") | .esc_sent] == [3,3]'
+assert_jq "(l) entries stay paused"  "$ST_L" \
+  '[.stalled[] | select(.cause == "paused") | select(.workspace_id == "wC")] | length == 2'
 if grep -q 'error pause wC:p9 did not take' "$SD_L/guard.log"; then
   pass "(l) gives up loudly in the log"
 else
   fail "(l) no 'did not take' error in guard.log"
 fi
-if grep -q 'paused=2 resumed=0 constrained=true' "$SD_L/guard.log"; then
+if grep -q 'paused=4 resumed=0 constrained=true hard=true' "$SD_L/guard.log"; then
   pass "(l) tick log line carries paused/resumed/constrained"
 else
   fail "(l) tick log line: $(sed -n '$p' "$SD_L/guard.log")"
@@ -591,6 +639,199 @@ MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane wA:p2 "$TMP/nope.jsonl" >/dev/null 2
 assert_eq "(m) unpaused pane + missing file -> exit 4" 4 "$?"
 MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane >/dev/null 2>&1
 assert_eq "(m) --pane without a file -> exit 2" 2 "$?"
+
+printf '\n== (n) jittered resets_at: every in-window sample is fitted ==\n'
+# fit_window <samples.jsonl> <limit> <resets-at> <tolerance-ms> -> "<count> <slope>",
+# the guard's least-squares fit recomputed from the fixture it was handed
+fit_window() {
+  jq -Rnr --arg l "$2" --argjson r "$3" --argjson tol "$4" '
+    ([inputs | (fromjson? // empty)
+      | select((.limit == $l) and (((.resets_at - $r) | fabs) <= $tol))] | sort_by(.t)) as $s
+    | ($s | length) as $n
+    | ([$s[] | .t / 3600000]) as $xs | ([$s[] | .used]) as $ys
+    | (($xs | add) / $n) as $mx | (($ys | add) / $n) as $my
+    | ([range(0; $n) | ($xs[.] - $mx) * ($ys[.] - $my)] | add) as $sxy
+    | ([$xs[] | (. - $mx) * (. - $mx)] | add) as $sxx
+    | (($n | tostring) + " " + (((($sxy / $sxx) * 100) | round) / 100 | tostring))' "$1"
+}
+SD_N="$TMP/s-n"
+mkdir -p "$SD_N"
+RESET_N=$(( T0 + 585000000 ))          # ~162.5 h out, the incident's weekly window
+CUR_N=$(( RESET_N + 402 ))             # this tick's jittered stamp, colliding with two samples
+mk_usage "$TMP/usage-n.json" ok 0.24 "$CUR_N"
+agents_file "$TMP/agents-n.json" \
+  "$(mk_agent manager wN:p1 wN idle '')" \
+  "$(mk_agent issue-1 wN:p2 wN working '')"
+export FAKE_USAGE="$TMP/usage-n.json" FAKE_AGENTS="$TMP/agents-n.json"
+export FAKE_KEYS="$TMP/keys-n.log" FAKE_PROMPTS="$TMP/prompts-n.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+reg "$SD_N" "$T0" ws-wN wN wN:p1 3 1 0 0 1 acme/n >/dev/null
+# the incident's rows: usage creeps 0.22 -> 0.24 over 1065 s while resets_at jitters by ms
+: >"$SD_N/samples.jsonl"
+for row in "1065000 0.22 402" "1024000 0.23 -376" "963000 0.23 338" \
+           "589000 0.23 43" "521000 0.24 402" "20000 0.24 282"; do
+  set -- $row
+  jq -nc --argjson t $(( T0 - $1 )) --argjson u "$2" --argjson r $(( RESET_N + $3 )) \
+    '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:$u, resets_at:$r, status:"ok"}' \
+    >>"$SD_N/samples.jsonl"
+done
+# and one sample from a different window: five minutes off, it must not be fitted
+jq -nc --argjson t $(( T0 - 300000 )) --argjson r $(( RESET_N + 300000 )) \
+  '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:0.3, resets_at:$r, status:"ok"}' \
+  >>"$SD_N/samples.jsonl"
+ST_N="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_N" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+set -- $(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 120000)
+WIN_N="$1"; SLOPE_N="$2"
+set -- $(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 0)
+COLL_N="$1"; COLLSLOPE_N="$2"
+assert_eq "(n) the window holds seven samples (six seeded plus this tick)" 7 "$WIN_N"
+assert_jq "(n) sample_count is the whole window" "$ST_N" \
+  '.providers.anthropic.limits[0].sample_count == 7'
+assert_jq "(n) burn_per_hour is the least-squares slope over all seven" "$ST_N" \
+  '.providers.anthropic.limits[0].burn_per_hour == '"$SLOPE_N"
+assert_eq "(n) ms-equality would only have seen the colliding samples" 3 "$COLL_N"
+if [ "$SLOPE_N" = "$COLLSLOPE_N" ]; then
+  fail "(n) the fixture does not distinguish window matching from ms equality ($SLOPE_N)"
+else
+  pass "(n) ms-equality slope $COLLSLOPE_N differs from the window slope $SLOPE_N"
+fi
+assert_jq "(n) the five-minutes-off sample is not fitted" "$ST_N" \
+  '.providers.anthropic.limits[0].used == 0.24 and .providers.anthropic.limits[0].burn_per_hour > 0'
+assert_jq "(n) one tick over 1 only watches, it does not constrain" "$ST_N" \
+  '.constrained == false and .providers.anthropic.limits[0].over_ticks == 1
+   and (.providers.anthropic.limits[0].fits | not)
+   and (.providers.anthropic.reason | startswith("ok (watching: anthropic:5h projected "))
+   and (.providers.anthropic.reason | endswith("tick 1/3)"))'
+assert_eq "(n) nothing is interrupted" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+
+printf '\n== (o) a projection constrains only after CONFIRM_TICKS ticks ==\n'
+SD_O="$TMP/s-o"
+agents_file "$TMP/agents-o.json" \
+  "$(mk_agent manager wO:p1 wO idle '')" \
+  "$(mk_agent issue-1 wO:p2 wO working '')" \
+  "$(mk_agent issue-2 wO:p3 wO working '')" \
+  "$(mk_agent issue-3 wO:p4 wO working '')"
+export FAKE_AGENTS="$TMP/agents-o.json" FAKE_KEYS="$TMP/keys-o.log" FAKE_PROMPTS="$TMP/prompts-o.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+reg "$SD_O" "$T0" ws-wO wO wO:p1 3 3 0 0 3 acme/o >/dev/null
+arm "$SD_O" "$T0" 0.25 0.50
+ST_O1="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(o) tick 1: ceiling kept, watching 1/3" "$ST_O1" \
+  '.allowed_total == 3 and .constrained == false
+   and .providers.anthropic.limits[0].over_ticks == 1
+   and (.providers.anthropic.reason | startswith("ok (watching:"))
+   and (.providers.anthropic.reason | endswith("tick 1/3)"))'
+arm "$SD_O" $(( T0 + 60000 )) 0.25 0.50
+ST_O2="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+assert_jq "(o) tick 2: ceiling kept, watching 2/3" "$ST_O2" \
+  '.allowed_total == 3 and .constrained == false
+   and .providers.anthropic.limits[0].over_ticks == 2
+   and (.providers.anthropic.reason | endswith("tick 2/3)"))'
+arm "$SD_O" $(( T0 + 120000 )) 0.25 0.50
+ST_O3="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS=$(( T0 + 120000 )) "$GUARD" tick)"
+assert_jq "(o) tick 3: the projection is confirmed and constrains" "$ST_O3" \
+  '.allowed_total == 1 and .constrained == true
+   and .providers.anthropic.limits[0].over_ticks == 3
+   and (.providers.anthropic.reason | startswith("projected"))'
+assert_jq "(o) the allowed_changed event carries the fit" "$ST_O3" \
+  '[.events[] | select(.kind == "allowed_changed" and .at == '"$(( T0 + 120000 ))"')] | first
+   | .fit.limit == "anthropic:5h"
+     and .fit.slope == 0.5
+     and (.fit.samples | length) >= 2
+     and (([.fit.samples[] | select(has("t") and has("used"))] | length) == (.fit.samples | length))'
+assert_jq "(o) the fit slope is the reported burn" "$ST_O3" \
+  '([.events[] | select(.kind == "allowed_changed" and .at == '"$(( T0 + 120000 ))"')] | first | .fit.slope)
+   == .providers.anthropic.limits[0].burn_per_hour'
+arm "$SD_O" $(( T0 + 180000 )) 0.10 0.10
+ST_O4="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS=$(( T0 + 180000 )) "$GUARD" tick)"
+assert_jq "(o) tick 4: a fitting limit lifts the cap at once" "$ST_O4" \
+  '.allowed_total == 3 and .constrained == false
+   and .providers.anthropic.limits[0].over_ticks == 0
+   and .providers.anthropic.reason == "ok"'
+assert_eq "(o) a projection never sends keys" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+
+printf '\n== (p) level 1 holds at the turn boundary, level 2 interrupts ==\n'
+SD_P="$TMP/s-p"
+agents_file "$TMP/agents-p-working.json" \
+  "$(mk_agent manager wP:p1 wP idle '')" \
+  "$(mk_agent issue-1 wP:p2 wP working '')" \
+  "$(mk_agent issue-2 wP:p3 wP working '')" \
+  "$(mk_agent issue-3 wP:p4 wP working '')"
+agents_file "$TMP/agents-p-idle3.json" \
+  "$(mk_agent manager wP:p1 wP idle '')" \
+  "$(mk_agent issue-1 wP:p2 wP working '')" \
+  "$(mk_agent issue-2 wP:p3 wP working '')" \
+  "$(mk_agent issue-3 wP:p4 wP idle '')"
+export FAKE_AGENTS="$TMP/agents-p-working.json"
+export FAKE_KEYS="$TMP/keys-p.log" FAKE_PROMPTS="$TMP/prompts-p.log" FAKE_TOASTS="$TMP/toasts-p.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"
+reg "$SD_P" "$T0" ws-wP wP wP:p1 3 3 0 0 3 acme/p >/dev/null
+arm "$SD_P" "$T0" 0.25 0.50
+ST_P1="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(p) constrained by the projection alone, provider not hard" "$ST_P1" \
+  '.constrained == true and .allowed_total == 1 and .managers["ws-wP"].allotment == 1
+   and .providers.anthropic.hard == false'
+assert_eq "(p) working builders are left alone" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(p) nothing is paused while they work" "$ST_P1" \
+  '(.stalled | length) == 0 and .managers["ws-wP"].paused == false'
+# the over-allotment builder finishes its turn -> held at the boundary, still no keys
+export FAKE_AGENTS="$TMP/agents-p-idle3.json"
+arm "$SD_P" $(( T0 + 60000 )) 0.25 0.50
+ST_P2="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+assert_jq "(p) the idle over-allotment builder is held" "$ST_P2" \
+  '[.stalled[] | select(.cause == "paused")] as $p
+   | ($p | length) == 1 and $p[0].pane_id == "wP:p4" and $p[0].esc_sent == 0
+     and $p[0].name == "issue-3" and $p[0].paused_at == '"$(( T0 + 60000 ))"'
+     and .providers.anthropic.hard == false'
+assert_eq "(p) a hold sends no keys" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(p) the hold is an event" "$ST_P2" \
+  '[.events[] | select(.kind == "paused") | .detail]
+   | length == 1 and (.[0] | test("wP:p4 issue-3 \\(ws-wP priority 5, allotment 1\\)"))'
+if grep -q 'paused: wP:p4' "$FAKE_TOASTS"; then pass "(p) hold toast"; else fail "(p) no hold toast"; fi
+# the provider itself goes to warning -> level 2, the working one is interrupted
+arm "$SD_P" $(( T0 + 120000 )) 0.25 0.50 warning
+ST_P3="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS=$(( T0 + 120000 )) "$GUARD" tick)"
+assert_jq "(p) warning makes the provider hard" "$ST_P3" '.providers.anthropic.hard == true'
+assert_eq "(p) the working over-allotment builder is esc'd" "wP:p3 esc" "$(cat "$FAKE_KEYS")"
+assert_jq "(p) and it gets an esc'd entry" "$ST_P3" \
+  '[.stalled[] | select(.pane_id == "wP:p3")] | first | .esc_sent == 1'
+assert_jq "(p) the kept builder is untouched" "$ST_P3" \
+  '[.stalled[] | select(.pane_id == "wP:p2")] | length == 0'
+
+printf '\n== (q) room again cancels the pending esc re-send ==\n'
+SD_Q="$TMP/s-q"
+agents_file "$TMP/agents-q.json" \
+  "$(mk_agent manager wQ:p1 wQ idle '')" \
+  "$(mk_agent issue-1 wQ:p2 wQ working '')" \
+  "$(mk_agent issue-2 wQ:p3 wQ working '')" \
+  "$(mk_agent issue-3 wQ:p4 wQ working '')"
+export FAKE_AGENTS="$TMP/agents-q.json"
+export FAKE_KEYS="$TMP/keys-q.log" FAKE_PROMPTS="$TMP/prompts-q.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+reg "$SD_Q" "$T0" ws-wQ wQ wQ:p1 3 3 0 0 3 acme/q >/dev/null
+arm "$SD_Q" "$T0" 0.25 0.50 warning
+ST_Q1="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_eq "(q) two over-allotment builders interrupted, highest issue first" "wQ:p4 esc
+wQ:p3 esc" "$(cat "$FAKE_KEYS")"
+assert_jq "(q) no_room_at is this tick" "$ST_Q1" '.managers["ws-wQ"].no_room_at == '"$T0"
+# quota recovers 30 s later: room is back, so the re-send is cancelled...
+arm "$SD_Q" $(( T0 + 30000 )) 0.10 0.10 warning
+ST_Q2="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS=$(( T0 + 30000 )) "$GUARD" tick)"
+assert_jq "(q) unconstrained again, provider still hard" "$ST_Q2" \
+  '.constrained == false and .allowed_total == 3 and .providers.anthropic.hard == true'
+assert_eq "(q) no second esc once the manager has room" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(q) esc_sent stays 1" "$ST_Q2" \
+  '[.stalled[] | select(.cause == "paused") | .esc_sent] == [1,1]'
+assert_eq "(q) ... and no resume inside the cooldown" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_jq "(q) no_room_at still points at the constrained tick" "$ST_Q2" \
+  '.managers["ws-wQ"].no_room_at == '"$T0"
+# ... and 61 s after that tick the cooldown is over
+arm "$SD_Q" $(( T0 + 61000 )) 0.10 0.10 warning
+ST_Q3="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS=$(( T0 + 61000 )) "$GUARD" tick)"
+assert_eq "(q) both resumed, lowest issue number first" "wQ:p3
+wQ:p4" "$(cut -f1 <"$FAKE_PROMPTS")"
+assert_jq "(q) the entries are gone" "$ST_Q3" '(.stalled | length) == 0'
+assert_eq "(q) still only the two original esc" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 
 printf '\n== daemon lifecycle (start/status/stop, fake PATH) ==\n'
 DAEMON_STATE="$TMP/s-daemon"

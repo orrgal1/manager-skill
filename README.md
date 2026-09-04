@@ -115,19 +115,43 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
   falling back to `anthropic`). Every tick invalidates and re-reads
   `omp usage --json --provider <p>`, appends a sample per limit and least-squares-fits a burn rate
   over the last `MGR_GUARD_SLOPE_WINDOW_S`: `projected_at_reset = used + burn × hours_to_reset`.
-  A sample span shorter than `MGR_GUARD_MIN_SLOPE_SPAN_S` counts as zero burn; samples older than
-  24h are pruned.
-- **Dial-back.** A limit projected past 100% shrinks `allowed_total` (never below 1); an exhausted
-  one sets it to 0 until the window resets. `allowed_total` is water-filled over the live managers
-  by demand into a per-manager `allotment`, and `mgr board` reports
+  Samples are matched to a limit by *window*, not by the raw stamp — `omp usage` reports `resets_at`
+  with per-call millisecond jitter, so a sample belongs to the current window when its `resets_at`
+  is within 120 s of the limit's (both null matches too), and the slope is fitted over every
+  matched sample instead of the two that happened to collide on the same millisecond. A sample span
+  shorter than `MGR_GUARD_MIN_SLOPE_SPAN_S` counts as zero burn; samples older than 24h are pruned.
+  A projection over 100% must repeat for `MGR_GUARD_CONFIRM_TICKS` consecutive ticks before it
+  constrains anything (`over_ticks` and `sample_count` per limit in `mgr guard status`); increases
+  of `allowed_total` apply on the first tick.
+- **Dial-back.** A *confirmed* projection past 100% shrinks `allowed_total` (never below 1); an
+  exhausted limit sets it to 0 until the window resets. `allowed_total` is water-filled over the
+  live managers by demand into a per-manager `allotment`, and `mgr board` reports
   `cap_effective = min(cap, allotment)`. `launch` refuses when no slot is free; `adopt` never
   refuses — it returns `over_cap: true`, because leaving live work unmanaged is worse. Guard
-  stopped or stale → no throttle at all.
-- **Priorities.** Each project (repo) has a priority — `mgr priority N`, default 5, higher wins,
-  machine-wide. While quota is constrained the guard serves whole tiers top-down instead of
-  sharing evenly, so a bottom tier can drop to `allotment: 0`: its builders are interrupted with
-  `esc` and resumed by the guard itself once the share is back. `mgr priority 0` is how you park a
-  project — it is the bottom tier, so it is the first to be squeezed and the last to be served.
+  stopped or stale → no throttle at all. Every `allowed_changed` event carries `fit` — the binding
+  limit, its fitted slope and the `{t, used}` samples behind it — so the next incident is
+  diagnosable from `mgr guard status` alone.
+- **Priorities, and the two levels of response.** Each project (repo) has a priority —
+  `mgr priority N`, default 5, higher wins, machine-wide. While quota is constrained the guard
+  serves whole tiers top-down instead of sharing evenly, so a bottom tier can drop to
+  `allotment: 0`. What that does to its builders depends on *why* the quota is constrained:
+  - **Level 1 — projection.** The burn trajectory says the window will not fit. `allowed_total`
+    and `cap_effective` drop, new launches are refused, and running builders are left to finish
+    their turn; each over-allotment builder is held the moment herdr reports it idle (a paused
+    entry with `esc_sent: 0`, no keys sent). Over-allotment is counted against *every* unheld
+    builder of the manager, working or not, keeping working ones first, then adoptees, then the
+    lowest issue numbers — the same count decides when there is room again, so a hold is never
+    undone by the next tick.
+  - **Level 2 — hard.** The provider itself is in trouble: status `exhausted`/`warning`, or an
+    actual 429 seen on that provider this tick (`providers.<p>.hard`). Now over-allotment builders
+    that are still *working* are interrupted with `esc` (highest issue number first, adoptees last,
+    at most three tries).
+
+  The guard resumes them itself once the share is back: the cooldown counts from the last tick the
+  manager had no room (`MGR_GUARD_RESUME_COOLDOWN_S`, 60 s by default), not from the pause, and a
+  pending `esc` re-send is cancelled as soon as the manager has room again. `mgr priority 0` is how
+  you park a project — it is the bottom tier, so it is the first to be squeezed and the last to be
+  served.
 - **Stall detection.** For every `issue-*`, `adopt-*` and `manager*` agent that is not working, the
   guard reads the tail of the omp session JSONL: a last assistant message that stopped on an error
   with a 429 / rate-limit / quota-exhausted body is a stall.
@@ -157,7 +181,8 @@ a usage error (exit `2`).
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_MIN_SLOPE_SPAN_S` | `300` | minimum sample span before a slope is trusted; below it, burn is 0 |
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager |
-| `MGR_GUARD_RESUME_COOLDOWN_S` | `300` | how long a paused builder waits before the guard may resume it |
+| `MGR_GUARD_CONFIRM_TICKS` | `3` | consecutive ticks a limit must project past 100% before it constrains |
+| `MGR_GUARD_RESUME_COOLDOWN_S` | `60` | how long after its manager last had no room the guard may resume a paused builder |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's herdr toasts |
 | `MGR_GUARD_NOW_MS` | unset | pins the guard's clock in ms since the epoch; for tests |
 
