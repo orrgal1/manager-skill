@@ -286,23 +286,32 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
          | select((.workspace_id // "") == ($m.workspace_id // ""))
          | select((.pane_id | IN($spanes[])) | not) ]) as $all
     | ([ $all[] | select(.agent_status == "working") ]) as $ab
-    | $m + {active_builders: ($ab | length), builders: $ab, all_builders: $all})) as $live
-| ((([$live[] | (.demand // 0)] | add) // 0)) as $demand_total
+    | $m + {active_builders: ($ab | length), builders: $ab, all_builders: $all})) as $live1
+
+# ---- priority-derived cap ceiling: the top-priority project keeps its whole cap, everyone else
+# ---- scales down with its share of that priority, but never below one slot
+| ([$live1[] | .priority] | max) as $top_priority
+| ([$live1[] | select(.priority == $top_priority) | (.cap // 0)] | max) as $top_cap
+| ($live1 | map(. as $m
+    | (if ($top_priority // 0) <= 0 or $m.priority <= 0 then 1
+       else ([1, (($top_cap * $m.priority / $top_priority) | floor)] | max) end) as $dc
+    | $m + {derived_cap: $dc, demand_effective: ([($m.demand // 0), $dc] | min)})) as $live
+| ((([$live[] | .demand_effective] | add) // 0)) as $demand_total
 | ($allowed_total < $demand_total) as $constrained
 
 # ---- allotments: strict priority tiers, water-filling inside each tier
 | ([$live[] | .priority] | unique | sort | reverse) as $tiers
 | (reduce $tiers[] as $tp ({rem: $allowed_total, out: []};
      . as $acc
-     | ([$live[] | select(.priority == $tp)] | sort_by([(.demand // 0), .manager_id])) as $tier
+     | ([$live[] | select(.priority == $tp)] | sort_by([.demand_effective, .manager_id])) as $tier
      | (reduce range(0; ($tier | length)) as $i ({rem: $acc.rem, out: []};
           ((($tier | length) - $i)) as $left
           | ((.rem / $left) | floor) as $share
-          | ([($tier[$i].demand // 0), $share] | min) as $allot
+          | ([$tier[$i].demand_effective, $share] | min) as $allot
           | {rem: (.rem - $allot), out: (.out + [$tier[$i] + {allotment: $allot}])})) as $wf
      | (reduce range(0; ($wf.rem + 1)) as $_ ({rem: $wf.rem, out: ($wf.out | sort_by(.manager_id))};
           if .rem <= 0 then .
-          else ([.out | to_entries[] | select(.value.allotment < (.value.demand // 0))] | first) as $c
+          else ([.out | to_entries[] | select(.value.allotment < .value.demand_effective)] | first) as $c
             | if $c == null then . else {rem: (.rem - 1), out: (.out | (.[$c.key].allotment) += 1)} end
           end)) as $fill
      | {rem: $fill.rem, out: (.out + $fill.out)})) as $alloc
@@ -435,6 +444,7 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
 
 | {now: $now, builder_provider: $bp, ceiling: $ceiling, providers: $providers,
    allowed_total: $allowed_total, demand_total: $demand_total, constrained: $constrained,
+   top_priority: $top_priority, top_cap: $top_cap,
    priorities: $priorities, managers: $mgrsout, dead: ($dead | map(.manager_id)),
    stalled: $stalled, events: $events, reignite: $reignite,
    pause: ($pause_new + $pause_again), pause_stuck: $pause_stuck, resume: $resume}'
@@ -482,6 +492,8 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
            providers: $policy.providers,
            allowed_total: $policy.allowed_total,
            demand_total: $policy.demand_total,
+           top_priority: $policy.top_priority,
+           top_cap: $policy.top_cap,
            constrained: $policy.constrained,
            priorities: $policy.priorities,
            managers: ($policy.managers | map(del(.builders) | del(.all_builders) | . as $m

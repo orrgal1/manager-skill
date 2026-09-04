@@ -42,7 +42,8 @@ jq -n --arg cwd "$repo" --arg sess "$sess" '
 jq '{result:{agent:(.result.agents[0])}}' "$fix/agents.json" >"$fix/agent-issue-49.json"
 
 # guard running: allotment 1 for this workspace, issue-49 stalled on anthropic,
-# this repo at priority 7 while the machine as a whole is quota-constrained
+# this repo at priority 7 (the top priority, so derived_cap == its own cap 3)
+# while the machine as a whole is quota-constrained
 cat >"$fix/guard-running.json" <<'EOF'
 {"version":1,"guard":"running","pid":4242,"tick_at":1788523750609,"interval_s":60,
  "builder_provider":"anthropic",
@@ -53,10 +54,12 @@ cat >"$fix/guard-running.json" <<'EOF'
    "active_builders":3,"ceiling":6,"allowed_total":1,
    "reason":"projected 1.23 > 1 on anthropic:5h (burn 0.30/h, 2.1h to reset)"}},
  "allowed_total":1,"constrained":true,"demand_total":7,
+ "top_priority":7,"top_cap":3,
  "priorities":{"owner/name":7,"other/proj":2},
  "managers":{"ws-w9":{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1",
    "repo":"owner/name","cap":3,"in_flight":1,"adopting":0,"ready":1,"demand":2,
    "seen_at":1788523750609,"live":true,"allotment":1,"priority":7,"paused":false,
+   "derived_cap":3,"demand_effective":2,
    "active_builders":1}},
  "stalled":[{"pane_id":"w9:p2","name":"issue-49","workspace_id":"w9","session":"/x.jsonl",
    "provider":"anthropic","model":"claude-fable-5-1","error":"429 rate_limit_error",
@@ -78,16 +81,30 @@ cat >"$fix/stall-49.json" <<'EOF'
  "since":1788520000000,"retry_after_ms":976000}
 EOF
 
-# same guard, but this project is now the low-priority one: allotment 0 and its
-# only builder held by the guard with cause "paused"
+# same guard, but this project is now the low-priority one: priority 2 against a
+# top of 9 (cap 3) derives a cap of 1 (the floor), and the constrained quota
+# still leaves it allotment 0, so its only builder is held with cause "paused"
 jq '.priorities={"owner/name":2,"other/proj":9}
-    | .managers["ws-w9"] += {allotment:0,priority:2,paused:true,active_builders:0}
+    | .top_priority=9 | .top_cap=3
+    | .managers["ws-w9"] += {allotment:0,priority:2,paused:true,active_builders:0,
+                             derived_cap:1,demand_effective:1}
     | .stalled=[{pane_id:"w9:p2",name:"issue-49",workspace_id:"w9",session:"/x.jsonl",
                  provider:"anthropic",model:null,error:null,since:1788522000000,
                  retry_after_ms:null,attempts:0,last_reignite_at:null,next_reignite_at:null,
                  cause:"paused",paused_at:1788522000000,esc_sent:1,manager_id:"ws-w9"}]' \
   "$fix/guard-running.json" >"$fix/guard-paused.json"
 jq '.guard="stopped" | .pid=null' "$fix/guard-paused.json" >"$fix/guard-paused-stopped.json"
+
+# quota is fine (nothing constrained), but priority 2 against a top of 9 (cap 3)
+# derives a cap of 1: the derived ceiling, not the provider, is what binds here
+jq '.priorities={"owner/name":2,"other/proj":9}
+    | .top_priority=9 | .top_cap=3
+    | .constrained=false | .allowed_total=6
+    | .providers.anthropic.status="ok" | .providers.anthropic.reason="ok"
+    | .providers.anthropic.allowed_total=6
+    | .managers["ws-w9"] += {derived_cap:1,demand_effective:1,allotment:1,
+                             priority:2,paused:false}' \
+  "$fix/guard-running.json" >"$fix/guard-derived.json"
 
 # what `mgr-guard stall --pane w9:p2 <session>` prints for a paused builder: no
 # provider error at all, only the guard's own ledger entry
@@ -127,6 +144,8 @@ set -uo pipefail
 printf 'herdr %s\n' "$*" >>"$MGR_TEST_LOG"
 case "${1:-} ${2:-}" in
   "agent list") cat "$MGR_TEST_FIX/agents.json";;
+  "tab list")
+    printf '{"result":{"tabs":[{"tab_id":"w9:t1","label":"manager","workspace_id":"w9"},{"tab_id":"w9:t2","label":"#49 do-the-thing","workspace_id":"w9"}]}}\n';;
   "agent get")
     f="$MGR_TEST_FIX/agent-${3:-}.json"
     [ -f "$f" ] || exit 1
@@ -243,14 +262,16 @@ check 'quota.burn_per_hour'     0.3 "$(jq -r '.quota.burn_per_hour' <<<"$out")"
 check 'quota.projected_at_reset' 1.23 "$(jq -r '.quota.projected_at_reset' <<<"$out")"
 check 'quota.allowed_total'       1 "$(jq -r '.quota.allowed_total' <<<"$out")"
 check 'quota.allotment'           1 "$(jq -r '.quota.allotment' <<<"$out")"
+check 'quota.derived_cap'         3 "$(jq -r '.quota.derived_cap' <<<"$out")"
 check 'quota.stalled'          '[49]' "$(jq -c '.quota.stalled' <<<"$out")"
 check 'quota.paused_builders'    '[]' "$(jq -c '.quota.paused_builders' <<<"$out")"
 check 'quota.priority'            7 "$(jq -r '.quota.priority' <<<"$out")"
 check 'quota.constrained'      true "$(jq -r '.quota.constrained' <<<"$out")"
 check 'quota.paused'          false "$(jq -r '.quota.paused' <<<"$out")"
 check 'quota.managers' \
-  '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"allotment":1,"live":true,"priority":7,"paused":false}]' \
+  '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"derived_cap":3,"allotment":1,"live":true,"priority":7,"paused":false}]' \
   "$(jq -c '.quota.managers' <<<"$out")"
+# derived 3 == cap 3: the derived ceiling does not bite, so the provider speaks
 check 'quota.reason' \
   'projected 1.23 > 1 on anthropic:5h (burn 0.30/h, 2.1h to reset)' \
   "$(jq -r '.quota.reason' <<<"$out")"
@@ -435,6 +456,44 @@ check 'in_flight quota_paused'  true "$(jq -r '.in_flight[0].quota_paused' <<<"$
 check 'in_flight quota_stalled' false "$(jq -r '.in_flight[0].quota_stalled' <<<"$out")"
 check 'quota.managers[].priority' 2 "$(jq -r '.quota.managers[0].priority' <<<"$out")"
 check 'quota.managers[].paused' true "$(jq -r '.quota.managers[0].paused' <<<"$out")"
+check 'quota.derived_cap'         1 "$(jq -r '.quota.derived_cap' <<<"$out")"
+check 'quota.managers[].derived_cap' 1 \
+  "$(jq -r '.quota.managers[0].derived_cap' <<<"$out")"
+# allotment 0 is tighter than the derived cap 1: the quota, not the ceiling, binds
+check 'quota.reason' \
+  'projected 1.23 > 1 on anthropic:5h (burn 0.30/h, 2.1h to reset)' \
+  "$(jq -r '.quota.reason' <<<"$out")"
+
+printf '\n# 9b. quota is fine but the derived cap binds: reason explains the cap\n'
+export MGR_TEST_GUARD="$fix/guard-derived.json"
+out=$("$MGR" board --cap 3)
+check 'cap_effective'             1 "$(jq -r '.cap_effective' <<<"$out")"
+check 'slots_free'                0 "$(jq -r '.slots_free' <<<"$out")"
+check 'quota.constrained'     false "$(jq -r '.quota.constrained' <<<"$out")"
+check 'quota.paused'          false "$(jq -r '.quota.paused' <<<"$out")"
+check 'quota.allotment'           1 "$(jq -r '.quota.allotment' <<<"$out")"
+check 'quota.derived_cap'         1 "$(jq -r '.quota.derived_cap' <<<"$out")"
+check 'quota.managers[].derived_cap' 1 \
+  "$(jq -r '.quota.managers[0].derived_cap' <<<"$out")"
+check 'quota.reason' 'priority 2 vs top 9 (cap 3) → cap 1' \
+  "$(jq -r '.quota.reason' <<<"$out")"
+: >"$MGR_TEST_LOG"
+err=$("$MGR" launch 7 2>&1 >/dev/null); rc=$?
+check 'launch exit'               3 "$rc"
+check 'launch error code'         3 "$(jq -r '.error.code' <<<"$err")"
+check 'launch error message' \
+  'no free slots (cap=3, cap_effective=1, quota: priority 2 vs top 9 (cap 3) → cap 1)' \
+  "$(jq -r '.error.message' <<<"$err")"
+check 'no tab was created' 0 \
+  "$(grep -c 'herdr tab create' "$MGR_TEST_LOG" || true)"
+
+printf '\n# 9c. guard stopped: the derived cap is stale, so no derived reason\n'
+export MGR_TEST_GUARD="$fix/guard-paused-stopped.json"
+out=$("$MGR" board --cap 3)
+check 'cap_effective'             3 "$(jq -r '.cap_effective' <<<"$out")"
+check 'quota.derived_cap still shown' 1 "$(jq -r '.quota.derived_cap' <<<"$out")"
+check 'quota.reason is the provider reason' false \
+  "$(jq -r '.quota.reason | startswith("priority ")' <<<"$out")"
 
 # --------------------------------------------------- 10. wait on a paused builder
 

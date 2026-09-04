@@ -90,7 +90,7 @@ FAKE
 
 chmod +x "$BIN/omp" "$BIN/herdr"
 PATH="$BIN:$PATH"; export PATH
-# most scenarios pin a single-tick projection; (o) overrides this in line
+# most scenarios pin a single-tick projection; (o) and (p) override this in line
 MGR_GUARD_CONFIRM_TICKS=1; export MGR_GUARD_CONFIRM_TICKS
 
 # ------------------------------------------------------------------ fixtures
@@ -374,10 +374,14 @@ assert_jq "(g) N=abc error shape" "$BADP2" '.error.code == 2 and (.error.message
 MGR_STATE_DIR="$SD_G" "$GUARD" priority "" 3 >/dev/null 2>&1
 assert_eq "(g) empty repo exit code" 2 "$?"
 
-# ---- shared fixture for (h)-(j): three projects, priorities 8 / 5 / 2
+# ---- shared fixture for (h)-(j): three projects, priorities 8 / 7 / 6.
+# The priorities are close together on purpose: with cap 3 at the top the derived
+# cap ceiling (floor(3 * p / 8), min 1) is 3 / 2 / 2, so it never bites here and
+# these sections keep testing the provider throttle alone. (n) covers the ceiling.
 prios() { # prios <state-dir>
   MGR_STATE_DIR="$1" "$GUARD" priority acme/a 8 >/dev/null
-  MGR_STATE_DIR="$1" "$GUARD" priority acme/c 2 >/dev/null
+  MGR_STATE_DIR="$1" "$GUARD" priority acme/b 7 >/dev/null
+  MGR_STATE_DIR="$1" "$GUARD" priority acme/c 6 >/dev/null
 }
 regs3() { # regs3 <state-dir> <now> <demand-a> <demand-b> <demand-c>
   reg "$1" "$2" ws-wA wA wA:p1 3 0 0 "$3" "$3" acme/a >/dev/null
@@ -414,9 +418,12 @@ assert_jq "(h) demand_total 7"                "$ST_H0" '.demand_total == 7'
 assert_jq "(h) constrained false"             "$ST_H0" '.constrained == false'
 assert_jq "(h) unconstrained: everyone gets demand" "$ST_H0" \
   '.managers["ws-wA"].allotment == 3 and .managers["ws-wB"].allotment == 2 and .managers["ws-wC"].allotment == 2'
-assert_jq "(h) priorities in state"           "$ST_H0" '.priorities == {"acme/a":8,"acme/c":2}'
+assert_jq "(h) priorities in state"           "$ST_H0" '.priorities == {"acme/a":8,"acme/b":7,"acme/c":6}'
 assert_jq "(h) manager priorities annotated"  "$ST_H0" \
-  '.managers["ws-wA"].priority == 8 and .managers["ws-wB"].priority == 5 and .managers["ws-wC"].priority == 2'
+  '.managers["ws-wA"].priority == 8 and .managers["ws-wB"].priority == 7 and .managers["ws-wC"].priority == 6'
+assert_jq "(h) derived caps do not bite here" "$ST_H0" \
+  '[.managers["ws-wA"], .managers["ws-wB"], .managers["ws-wC"]]
+   | map([.derived_cap, .demand_effective]) == [[3,3],[2,2],[2,2]]'
 assert_jq "(h) nobody paused"                 "$ST_H0" '[.managers[] | select(.paused)] | length == 0'
 assert_jq "(h) no internal fields leak into state" "$ST_H0" \
   '([.managers[] | select(has("builders") or has("all_builders"))] | length) == 0
@@ -424,7 +431,8 @@ assert_jq "(h) no internal fields leak into state" "$ST_H0" \
    and .managers["ws-wA"].no_room_at != null'
 assert_jq "(h) priority_changed events"       "$ST_H0" \
   '[.events[] | select(.kind == "priority_changed") | .detail] as $d
-   | ($d | length) == 2 and ($d | index("acme/a: 5 -> 8") != null) and ($d | index("acme/c: 5 -> 2") != null)'
+   | ($d | length) == 3 and ($d | index("acme/a: 5 -> 8") != null)
+     and ($d | index("acme/b: 5 -> 7") != null) and ($d | index("acme/c: 5 -> 6") != null)'
 if grep -q 'priority_changed: acme/a: 5 -> 8' "$FAKE_TOASTS"; then pass "(h) priority_changed toast"; else fail "(h) no priority_changed toast"; fi
 assert_eq "(h) no esc sent" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 arm "$SD_H" $(( T0 + 1800000 )) 0.25 0.50     # burn 0.5/h, 2h to reset -> allowed_total 4
@@ -433,8 +441,8 @@ assert_jq "(h) active_builders 8"     "$ST_H1" '.providers.anthropic.active_buil
 assert_jq "(h) allowed_total 4"       "$ST_H1" '.allowed_total == 4'
 assert_jq "(h) constrained true"      "$ST_H1" '.constrained == true'
 assert_jq "(h) tier 8 gets demand 3"  "$ST_H1" '.managers["ws-wA"].allotment == 3'
-assert_jq "(h) tier 5 gets leftover 1" "$ST_H1" '.managers["ws-wB"].allotment == 1'
-assert_jq "(h) tier 2 gets nothing"   "$ST_H1" '.managers["ws-wC"].allotment == 0'
+assert_jq "(h) tier 7 gets leftover 1" "$ST_H1" '.managers["ws-wB"].allotment == 1'
+assert_jq "(h) tier 6 gets nothing"   "$ST_H1" '.managers["ws-wC"].allotment == 0'
 assert_jq "(h) no new priority_changed" "$ST_H1" '[.events[] | select(.kind == "priority_changed" and .at == '"$(( T0 + 1800000 ))"')] | length == 0'
 
 printf '\n== (i) hard pause of the lowest tier ==\n'
@@ -468,7 +476,7 @@ assert_jq "(i) ws-wC marked paused"   "$ST_I1" '.managers["ws-wC"].paused == tru
 assert_jq "(i) paused events"         "$ST_I1" \
   '[.events[] | select(.kind == "paused") | .detail] as $d
    | ($d | length) == 4
-     and ([$d[] | select(test("wC:p9 issue-9 \\(ws-wC priority 2, allotment 0\\)"))] | length) == 1'
+     and ([$d[] | select(test("wC:p9 issue-9 \\(ws-wC priority 6, allotment 0\\)"))] | length) == 1'
 if grep -q 'paused: wC:p9' "$FAKE_TOASTS"; then pass "(i) paused toast"; else fail "(i) no paused toast"; fi
 assert_eq "(i) no prompts on a pause" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
 # still working on the next tick -> esc again (2/3)
@@ -506,7 +514,7 @@ wB:p2
 wB:p3
 wC:p7
 wC:p9" "$(cut -f1 <"$FAKE_PROMPTS" | sort)"
-if grep -q "mgr-guard: this project's quota allotment is back (priority 2, allotment 2)." "$FAKE_PROMPTS"; then
+if grep -q "mgr-guard: this project's quota allotment is back (priority 6, allotment 2)." "$FAKE_PROMPTS"; then
   pass "(j) resume text"
 else
   fail "(j) resume text: $(cut -f2 <"$FAKE_PROMPTS" | head -1)"
@@ -640,7 +648,89 @@ assert_eq "(m) unpaused pane + missing file -> exit 4" 4 "$?"
 MGR_STATE_DIR="$SD_L" "$GUARD" stall --pane >/dev/null 2>&1
 assert_eq "(m) --pane without a file -> exit 2" 2 "$?"
 
-printf '\n== (n) jittered resets_at: every in-window sample is fitted ==\n'
+printf '\n== (n) priority-derived cap ceiling ==\n'
+export FAKE_PROMPTS="$TMP/prompts-n.log" FAKE_TOASTS="$TMP/toasts-n.log" FAKE_KEYS="$TMP/keys-n.log"
+: >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"; : >"$FAKE_KEYS"
+managers3() { # managers3 <file> <ws...>: one idle manager pane per workspace, no builders
+  local out="$1"; shift
+  local a=() w
+  for w in "$@"; do a+=("$(mk_agent "manager-$w" "$w:p1" "$w" idle '')"); done
+  agents_file "$out" "${a[@]}"
+}
+
+# ---- (n1) priorities 10 / 5 / 3, cap 3 and demand 3 each: only the top project keeps
+# its whole cap, the others scale down to floor(3 * p / 10) with a floor of one slot
+SD_N1="$TMP/s-n1"
+managers3 "$TMP/agents-n1.json" wP wQ wR
+export FAKE_AGENTS="$TMP/agents-n1.json"
+reg "$SD_N1" "$T0" ws-wP wP wP:p1 3 0 0 3 3 acme/p >/dev/null
+reg "$SD_N1" "$T0" ws-wQ wQ wQ:p1 3 0 0 3 3 acme/q >/dev/null
+reg "$SD_N1" "$T0" ws-wR wR wR:p1 3 0 0 3 3 acme/r >/dev/null
+MGR_STATE_DIR="$SD_N1" "$GUARD" priority acme/p 10 >/dev/null
+MGR_STATE_DIR="$SD_N1" "$GUARD" priority acme/q 5 >/dev/null
+MGR_STATE_DIR="$SD_N1" "$GUARD" priority acme/r 3 >/dev/null
+arm "$SD_N1" "$T0" 0.25 0.25          # no burn -> allowed_total = ceiling 9, provider ok
+ST_N1="$(MGR_STATE_DIR="$SD_N1" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(n1) provider is not the limit" "$ST_N1" \
+  '.allowed_total == 9 and .providers.anthropic.reason == "ok" and .constrained == false'
+assert_jq "(n1) top_priority 10, top_cap 3" "$ST_N1" '.top_priority == 10 and .top_cap == 3'
+assert_jq "(n1) demand_total counts the effective demand" "$ST_N1" '.demand_total == 5'
+assert_jq "(n1) derived_cap / demand_effective / allotment 3-1-1" "$ST_N1" \
+  '[.managers["ws-wP"], .managers["ws-wQ"], .managers["ws-wR"]]
+   | map([.priority, .derived_cap, .demand_effective, .allotment])
+     == [[10,3,3,3],[5,1,1,1],[3,1,1,1]]'
+assert_jq "(n1) the registered demand is untouched" "$ST_N1" \
+  '[.managers["ws-wP"], .managers["ws-wQ"], .managers["ws-wR"]] | map(.demand) == [3,3,3]'
+assert_jq "(n1) the ceiling still sums the registered caps" "$ST_N1" '.providers.anthropic.ceiling == 9'
+assert_eq "(n1) nothing paused, nothing prompted" 0 \
+  "$(( $(wc -l <"$FAKE_KEYS") + $(wc -l <"$FAKE_PROMPTS") ))"
+
+# ---- (n2) a tie at the top takes the largest cap of the tied projects as the scale
+SD_N2="$TMP/s-n2"
+reg "$SD_N2" "$T0" ws-wP wP wP:p1 3 0 0 3 3 acme/p >/dev/null
+reg "$SD_N2" "$T0" ws-wQ wQ wQ:p1 2 0 0 2 2 acme/q >/dev/null
+reg "$SD_N2" "$T0" ws-wR wR wR:p1 3 0 0 3 3 acme/r >/dev/null
+MGR_STATE_DIR="$SD_N2" "$GUARD" priority acme/p 10 >/dev/null
+MGR_STATE_DIR="$SD_N2" "$GUARD" priority acme/q 10 >/dev/null
+MGR_STATE_DIR="$SD_N2" "$GUARD" priority acme/r 5 >/dev/null
+arm "$SD_N2" "$T0" 0.25 0.25
+ST_N2="$(MGR_STATE_DIR="$SD_N2" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(n2) top_cap is the max cap among the tied top projects" "$ST_N2" \
+  '.top_priority == 10 and .top_cap == 3'
+assert_jq "(n2) both tied projects derive the top cap, the tier below derives floor(3*5/10)" "$ST_N2" \
+  '[.managers["ws-wP"], .managers["ws-wQ"], .managers["ws-wR"]]
+   | map([.derived_cap, .demand_effective, .allotment]) == [[3,3,3],[3,2,2],[1,1,1]]'
+
+# ---- (n3) a project whose own cap is already below the derived cap keeps its own cap
+SD_N3="$TMP/s-n3"
+managers3 "$TMP/agents-n3.json" wP wS
+export FAKE_AGENTS="$TMP/agents-n3.json"
+reg "$SD_N3" "$T0" ws-wP wP wP:p1 3 0 0 3 3 acme/p >/dev/null
+reg "$SD_N3" "$T0" ws-wS wS wS:p1 1 0 0 1 1 acme/s >/dev/null
+MGR_STATE_DIR="$SD_N3" "$GUARD" priority acme/p 10 >/dev/null
+MGR_STATE_DIR="$SD_N3" "$GUARD" priority acme/s 8 >/dev/null
+arm "$SD_N3" "$T0" 0.25 0.25
+ST_N3="$(MGR_STATE_DIR="$SD_N3" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(n3) derived 2 but the registered cap 1 binds" "$ST_N3" \
+  '.top_cap == 3 and (.managers["ws-wS"] | .cap == 1 and .derived_cap == 2
+                      and .demand == 1 and .demand_effective == 1 and .allotment == 1)'
+
+# ---- (n4) priority 0 still derives one slot: pausing a project is a separate function
+SD_N4="$TMP/s-n4"
+managers3 "$TMP/agents-n4.json" wP wZ
+export FAKE_AGENTS="$TMP/agents-n4.json"
+reg "$SD_N4" "$T0" ws-wP wP wP:p1 3 0 0 3 3 acme/p >/dev/null
+reg "$SD_N4" "$T0" ws-wZ wZ wZ:p1 3 0 0 3 3 acme/z >/dev/null
+MGR_STATE_DIR="$SD_N4" "$GUARD" priority acme/p 10 >/dev/null
+MGR_STATE_DIR="$SD_N4" "$GUARD" priority acme/z 0 >/dev/null
+arm "$SD_N4" "$T0" 0.25 0.25
+ST_N4="$(MGR_STATE_DIR="$SD_N4" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(n4) priority 0 -> derived_cap 1, one slot allotted" "$ST_N4" \
+  '(.managers["ws-wZ"] | .priority == 0 and .derived_cap == 1
+    and .demand == 3 and .demand_effective == 1 and .allotment == 1)
+   and .demand_total == 4 and .constrained == false'
+
+printf '\n== (o) jittered resets_at: every in-window sample is fitted ==\n'
 # fit_window <samples.jsonl> <limit> <resets-at> <tolerance-ms> -> "<count> <slope>",
 # the guard's least-squares fit recomputed from the fixture it was handed
 fit_window() {
@@ -654,182 +744,182 @@ fit_window() {
     | ([$xs[] | (. - $mx) * (. - $mx)] | add) as $sxx
     | (($n | tostring) + " " + (((($sxy / $sxx) * 100) | round) / 100 | tostring))' "$1"
 }
-SD_N="$TMP/s-n"
-mkdir -p "$SD_N"
-RESET_N=$(( T0 + 585000000 ))          # ~162.5 h out, the incident's weekly window
-CUR_N=$(( RESET_N + 402 ))             # this tick's jittered stamp, colliding with two samples
-mk_usage "$TMP/usage-n.json" ok 0.24 "$CUR_N"
-agents_file "$TMP/agents-n.json" \
-  "$(mk_agent manager wN:p1 wN idle '')" \
-  "$(mk_agent issue-1 wN:p2 wN working '')"
-export FAKE_USAGE="$TMP/usage-n.json" FAKE_AGENTS="$TMP/agents-n.json"
-export FAKE_KEYS="$TMP/keys-n.log" FAKE_PROMPTS="$TMP/prompts-n.log"
+SD_O="$TMP/s-o"
+mkdir -p "$SD_O"
+RESET_O=$(( T0 + 585000000 ))          # ~162.5 h out, the incident's weekly window
+CUR_O=$(( RESET_O + 402 ))             # this tick's jittered stamp, colliding with two samples
+mk_usage "$TMP/usage-o.json" ok 0.24 "$CUR_O"
+agents_file "$TMP/agents-o.json" \
+  "$(mk_agent manager wO:p1 wO idle '')" \
+  "$(mk_agent issue-1 wO:p2 wO working '')"
+export FAKE_USAGE="$TMP/usage-o.json" FAKE_AGENTS="$TMP/agents-o.json"
+export FAKE_KEYS="$TMP/keys-o.log" FAKE_PROMPTS="$TMP/prompts-o.log"
 : >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
-reg "$SD_N" "$T0" ws-wN wN wN:p1 3 1 0 0 1 acme/n >/dev/null
+reg "$SD_O" "$T0" ws-wO wO wO:p1 3 1 0 0 1 acme/o >/dev/null
 # the incident's rows: usage creeps 0.22 -> 0.24 over 1065 s while resets_at jitters by ms
-: >"$SD_N/samples.jsonl"
+: >"$SD_O/samples.jsonl"
 for row in "1065000 0.22 402" "1024000 0.23 -376" "963000 0.23 338" \
            "589000 0.23 43" "521000 0.24 402" "20000 0.24 282"; do
   set -- $row
-  jq -nc --argjson t $(( T0 - $1 )) --argjson u "$2" --argjson r $(( RESET_N + $3 )) \
+  jq -nc --argjson t $(( T0 - $1 )) --argjson u "$2" --argjson r $(( RESET_O + $3 )) \
     '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:$u, resets_at:$r, status:"ok"}' \
-    >>"$SD_N/samples.jsonl"
+    >>"$SD_O/samples.jsonl"
 done
 # and one sample from a different window: five minutes off, it must not be fitted
-jq -nc --argjson t $(( T0 - 300000 )) --argjson r $(( RESET_N + 300000 )) \
+jq -nc --argjson t $(( T0 - 300000 )) --argjson r $(( RESET_O + 300000 )) \
   '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:0.3, resets_at:$r, status:"ok"}' \
-  >>"$SD_N/samples.jsonl"
-ST_N="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_N" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
-read -r WIN_N SLOPE_N <<<"$(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 120000)"
-read -r COLL_N COLLSLOPE_N <<<"$(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 0)"
-assert_eq "(n) the window holds seven samples (six seeded plus this tick)" 7 "$WIN_N"
-assert_jq "(n) sample_count is the whole window" "$ST_N" \
+  >>"$SD_O/samples.jsonl"
+ST_O="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+read -r WIN_O SLOPE_O <<<"$(fit_window "$SD_O/samples.jsonl" anthropic:5h "$CUR_O" 120000)"
+read -r COLL_O COLLSLOPE_O <<<"$(fit_window "$SD_O/samples.jsonl" anthropic:5h "$CUR_O" 0)"
+assert_eq "(o) the window holds seven samples (six seeded plus this tick)" 7 "$WIN_O"
+assert_jq "(o) sample_count is the whole window" "$ST_O" \
   '.providers.anthropic.limits[0].sample_count == 7'
-assert_jq "(n) burn_per_hour is the least-squares slope over all seven" "$ST_N" \
-  '.providers.anthropic.limits[0].burn_per_hour == '"$SLOPE_N"
-assert_eq "(n) ms-equality would only have seen the colliding samples" 3 "$COLL_N"
-if [ "$SLOPE_N" = "$COLLSLOPE_N" ]; then
-  fail "(n) the fixture does not distinguish window matching from ms equality ($SLOPE_N)"
+assert_jq "(o) burn_per_hour is the least-squares slope over all seven" "$ST_O" \
+  '.providers.anthropic.limits[0].burn_per_hour == '"$SLOPE_O"
+assert_eq "(o) ms-equality would only have seen the colliding samples" 3 "$COLL_O"
+if [ "$SLOPE_O" = "$COLLSLOPE_O" ]; then
+  fail "(o) the fixture does not distinguish window matching from ms equality ($SLOPE_O)"
 else
-  pass "(n) ms-equality slope $COLLSLOPE_N differs from the window slope $SLOPE_N"
+  pass "(o) ms-equality slope $COLLSLOPE_O differs from the window slope $SLOPE_O"
 fi
-assert_jq "(n) the five-minutes-off sample is not fitted" "$ST_N" \
+assert_jq "(o) the five-minutes-off sample is not fitted" "$ST_O" \
   '.providers.anthropic.limits[0].used == 0.24 and .providers.anthropic.limits[0].burn_per_hour > 0'
-assert_jq "(n) one tick over 1 only watches, it does not constrain" "$ST_N" \
+assert_jq "(o) one tick over 1 only watches, it does not constrain" "$ST_O" \
   '.constrained == false and .providers.anthropic.limits[0].over_ticks == 1
    and (.providers.anthropic.limits[0].fits | not)
    and (.providers.anthropic.reason | startswith("ok (watching: anthropic:5h projected "))
    and (.providers.anthropic.reason | endswith("tick 1/3)"))'
-assert_eq "(n) nothing is interrupted" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_eq "(o) nothing is interrupted" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 
-printf '\n== (o) a projection constrains only after CONFIRM_TICKS ticks ==\n'
-SD_O="$TMP/s-o"
-agents_file "$TMP/agents-o.json" \
-  "$(mk_agent manager wO:p1 wO idle '')" \
-  "$(mk_agent issue-1 wO:p2 wO working '')" \
-  "$(mk_agent issue-2 wO:p3 wO working '')" \
-  "$(mk_agent issue-3 wO:p4 wO working '')"
-export FAKE_AGENTS="$TMP/agents-o.json" FAKE_KEYS="$TMP/keys-o.log" FAKE_PROMPTS="$TMP/prompts-o.log"
+printf '\n== (p) a projection constrains only after CONFIRM_TICKS ticks ==\n'
+SD_P="$TMP/s-p"
+agents_file "$TMP/agents-p.json" \
+  "$(mk_agent manager wP:p1 wP idle '')" \
+  "$(mk_agent issue-1 wP:p2 wP working '')" \
+  "$(mk_agent issue-2 wP:p3 wP working '')" \
+  "$(mk_agent issue-3 wP:p4 wP working '')"
+export FAKE_AGENTS="$TMP/agents-p.json" FAKE_KEYS="$TMP/keys-p.log" FAKE_PROMPTS="$TMP/prompts-p.log"
 : >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
-reg "$SD_O" "$T0" ws-wO wO wO:p1 3 3 0 0 3 acme/o >/dev/null
-arm "$SD_O" "$T0" 0.25 0.50
-ST_O1="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
-assert_jq "(o) tick 1: ceiling kept, watching 1/3" "$ST_O1" \
+reg "$SD_P" "$T0" ws-wP wP wP:p1 3 3 0 0 3 acme/p >/dev/null
+arm "$SD_P" "$T0" 0.25 0.50
+ST_P1="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(p) tick 1: ceiling kept, watching 1/3" "$ST_P1" \
   '.allowed_total == 3 and .constrained == false
    and .providers.anthropic.limits[0].over_ticks == 1
    and (.providers.anthropic.reason | startswith("ok (watching:"))
    and (.providers.anthropic.reason | endswith("tick 1/3)"))'
-arm "$SD_O" $(( T0 + 60000 )) 0.25 0.50
-ST_O2="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
-assert_jq "(o) tick 2: ceiling kept, watching 2/3" "$ST_O2" \
+arm "$SD_P" $(( T0 + 60000 )) 0.25 0.50
+ST_P2="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+assert_jq "(p) tick 2: ceiling kept, watching 2/3" "$ST_P2" \
   '.allowed_total == 3 and .constrained == false
    and .providers.anthropic.limits[0].over_ticks == 2
    and (.providers.anthropic.reason | endswith("tick 2/3)"))'
-arm "$SD_O" $(( T0 + 120000 )) 0.25 0.50
-ST_O3="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS=$(( T0 + 120000 )) "$GUARD" tick)"
-assert_jq "(o) tick 3: the projection is confirmed and constrains" "$ST_O3" \
+arm "$SD_P" $(( T0 + 120000 )) 0.25 0.50
+ST_P3="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS=$(( T0 + 120000 )) "$GUARD" tick)"
+assert_jq "(p) tick 3: the projection is confirmed and constrains" "$ST_P3" \
   '.allowed_total == 1 and .constrained == true
    and .providers.anthropic.limits[0].over_ticks == 3
    and (.providers.anthropic.reason | startswith("projected"))'
-assert_jq "(o) the allowed_changed event carries the fit" "$ST_O3" \
+assert_jq "(p) the allowed_changed event carries the fit" "$ST_P3" \
   '[.events[] | select(.kind == "allowed_changed" and .at == '"$(( T0 + 120000 ))"')] | first
    | .fit.limit == "anthropic:5h"
      and .fit.slope == 0.5
      and (.fit.samples | length) >= 2
      and (([.fit.samples[] | select(has("t") and has("used"))] | length) == (.fit.samples | length))'
-assert_jq "(o) the fit slope is the reported burn" "$ST_O3" \
+assert_jq "(p) the fit slope is the reported burn" "$ST_P3" \
   '([.events[] | select(.kind == "allowed_changed" and .at == '"$(( T0 + 120000 ))"')] | first | .fit.slope)
    == .providers.anthropic.limits[0].burn_per_hour'
-arm "$SD_O" $(( T0 + 180000 )) 0.10 0.10
-ST_O4="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS=$(( T0 + 180000 )) "$GUARD" tick)"
-assert_jq "(o) tick 4: a fitting limit lifts the cap at once" "$ST_O4" \
+arm "$SD_P" $(( T0 + 180000 )) 0.10 0.10
+ST_P4="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS=$(( T0 + 180000 )) "$GUARD" tick)"
+assert_jq "(p) tick 4: a fitting limit lifts the cap at once" "$ST_P4" \
   '.allowed_total == 3 and .constrained == false
    and .providers.anthropic.limits[0].over_ticks == 0
    and .providers.anthropic.reason == "ok"'
-assert_eq "(o) a projection never sends keys" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_eq "(p) a projection never sends keys" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 
-printf '\n== (p) level 1 holds at the turn boundary, level 2 interrupts ==\n'
-SD_P="$TMP/s-p"
-agents_file "$TMP/agents-p-working.json" \
-  "$(mk_agent manager wP:p1 wP idle '')" \
-  "$(mk_agent issue-1 wP:p2 wP working '')" \
-  "$(mk_agent issue-2 wP:p3 wP working '')" \
-  "$(mk_agent issue-3 wP:p4 wP working '')"
-agents_file "$TMP/agents-p-idle3.json" \
-  "$(mk_agent manager wP:p1 wP idle '')" \
-  "$(mk_agent issue-1 wP:p2 wP working '')" \
-  "$(mk_agent issue-2 wP:p3 wP working '')" \
-  "$(mk_agent issue-3 wP:p4 wP idle '')"
-export FAKE_AGENTS="$TMP/agents-p-working.json"
-export FAKE_KEYS="$TMP/keys-p.log" FAKE_PROMPTS="$TMP/prompts-p.log" FAKE_TOASTS="$TMP/toasts-p.log"
-: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"
-reg "$SD_P" "$T0" ws-wP wP wP:p1 3 3 0 0 3 acme/p >/dev/null
-arm "$SD_P" "$T0" 0.25 0.50
-ST_P1="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
-assert_jq "(p) constrained by the projection alone, provider not hard" "$ST_P1" \
-  '.constrained == true and .allowed_total == 1 and .managers["ws-wP"].allotment == 1
-   and .providers.anthropic.hard == false'
-assert_eq "(p) working builders are left alone" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
-assert_jq "(p) nothing is paused while they work" "$ST_P1" \
-  '(.stalled | length) == 0 and .managers["ws-wP"].paused == false'
-# the over-allotment builder finishes its turn -> held at the boundary, still no keys
-export FAKE_AGENTS="$TMP/agents-p-idle3.json"
-arm "$SD_P" $(( T0 + 60000 )) 0.25 0.50
-ST_P2="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
-assert_jq "(p) the idle over-allotment builder is held" "$ST_P2" \
-  '[.stalled[] | select(.cause == "paused")] as $p
-   | ($p | length) == 1 and $p[0].pane_id == "wP:p4" and $p[0].esc_sent == 0
-     and $p[0].name == "issue-3" and $p[0].paused_at == '"$(( T0 + 60000 ))"'
-     and .providers.anthropic.hard == false'
-assert_eq "(p) a hold sends no keys" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
-assert_jq "(p) the hold is an event" "$ST_P2" \
-  '[.events[] | select(.kind == "paused") | .detail]
-   | length == 1 and (.[0] | test("wP:p4 issue-3 \\(ws-wP priority 5, allotment 1\\)"))'
-if grep -q 'paused: wP:p4' "$FAKE_TOASTS"; then pass "(p) hold toast"; else fail "(p) no hold toast"; fi
-# the provider itself goes to warning -> level 2, the working one is interrupted
-arm "$SD_P" $(( T0 + 120000 )) 0.25 0.50 warning
-ST_P3="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS=$(( T0 + 120000 )) "$GUARD" tick)"
-assert_jq "(p) warning makes the provider hard" "$ST_P3" '.providers.anthropic.hard == true'
-assert_eq "(p) the working over-allotment builder is esc'd" "wP:p3 esc" "$(cat "$FAKE_KEYS")"
-assert_jq "(p) and it gets an esc'd entry" "$ST_P3" \
-  '[.stalled[] | select(.pane_id == "wP:p3")] | first | .esc_sent == 1'
-assert_jq "(p) the kept builder is untouched" "$ST_P3" \
-  '[.stalled[] | select(.pane_id == "wP:p2")] | length == 0'
-
-printf '\n== (q) room again cancels the pending esc re-send ==\n'
+printf '\n== (q) level 1 holds at the turn boundary, level 2 interrupts ==\n'
 SD_Q="$TMP/s-q"
-agents_file "$TMP/agents-q.json" \
+agents_file "$TMP/agents-q-working.json" \
   "$(mk_agent manager wQ:p1 wQ idle '')" \
   "$(mk_agent issue-1 wQ:p2 wQ working '')" \
   "$(mk_agent issue-2 wQ:p3 wQ working '')" \
   "$(mk_agent issue-3 wQ:p4 wQ working '')"
-export FAKE_AGENTS="$TMP/agents-q.json"
-export FAKE_KEYS="$TMP/keys-q.log" FAKE_PROMPTS="$TMP/prompts-q.log"
-: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+agents_file "$TMP/agents-q-idle3.json" \
+  "$(mk_agent manager wQ:p1 wQ idle '')" \
+  "$(mk_agent issue-1 wQ:p2 wQ working '')" \
+  "$(mk_agent issue-2 wQ:p3 wQ working '')" \
+  "$(mk_agent issue-3 wQ:p4 wQ idle '')"
+export FAKE_AGENTS="$TMP/agents-q-working.json"
+export FAKE_KEYS="$TMP/keys-q.log" FAKE_PROMPTS="$TMP/prompts-q.log" FAKE_TOASTS="$TMP/toasts-q.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"
 reg "$SD_Q" "$T0" ws-wQ wQ wQ:p1 3 3 0 0 3 acme/q >/dev/null
-arm "$SD_Q" "$T0" 0.25 0.50 warning
+arm "$SD_Q" "$T0" 0.25 0.50
 ST_Q1="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
-assert_eq "(q) two over-allotment builders interrupted, highest issue first" "wQ:p4 esc
-wQ:p3 esc" "$(cat "$FAKE_KEYS")"
-assert_jq "(q) no_room_at is this tick" "$ST_Q1" '.managers["ws-wQ"].no_room_at == '"$T0"
+assert_jq "(q) constrained by the projection alone, provider not hard" "$ST_Q1" \
+  '.constrained == true and .allowed_total == 1 and .managers["ws-wQ"].allotment == 1
+   and .providers.anthropic.hard == false'
+assert_eq "(q) working builders are left alone" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(q) nothing is paused while they work" "$ST_Q1" \
+  '(.stalled | length) == 0 and .managers["ws-wQ"].paused == false'
+# the over-allotment builder finishes its turn -> held at the boundary, still no keys
+export FAKE_AGENTS="$TMP/agents-q-idle3.json"
+arm "$SD_Q" $(( T0 + 60000 )) 0.25 0.50
+ST_Q2="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+assert_jq "(q) the idle over-allotment builder is held" "$ST_Q2" \
+  '[.stalled[] | select(.cause == "paused")] as $p
+   | ($p | length) == 1 and $p[0].pane_id == "wQ:p4" and $p[0].esc_sent == 0
+     and $p[0].name == "issue-3" and $p[0].paused_at == '"$(( T0 + 60000 ))"'
+     and .providers.anthropic.hard == false'
+assert_eq "(q) a hold sends no keys" 0 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(q) the hold is an event" "$ST_Q2" \
+  '[.events[] | select(.kind == "paused") | .detail]
+   | length == 1 and (.[0] | test("wQ:p4 issue-3 \\(ws-wQ priority 5, allotment 1\\)"))'
+if grep -q 'paused: wQ:p4' "$FAKE_TOASTS"; then pass "(q) hold toast"; else fail "(q) no hold toast"; fi
+# the provider itself goes to warning -> level 2, the working one is interrupted
+arm "$SD_Q" $(( T0 + 120000 )) 0.25 0.50 warning
+ST_Q3="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS=$(( T0 + 120000 )) "$GUARD" tick)"
+assert_jq "(q) warning makes the provider hard" "$ST_Q3" '.providers.anthropic.hard == true'
+assert_eq "(q) the working over-allotment builder is esc'd" "wQ:p3 esc" "$(cat "$FAKE_KEYS")"
+assert_jq "(q) and it gets an esc'd entry" "$ST_Q3" \
+  '[.stalled[] | select(.pane_id == "wQ:p3")] | first | .esc_sent == 1'
+assert_jq "(q) the kept builder is untouched" "$ST_Q3" \
+  '[.stalled[] | select(.pane_id == "wQ:p2")] | length == 0'
+
+printf '\n== (r) room again cancels the pending esc re-send ==\n'
+SD_R="$TMP/s-r"
+agents_file "$TMP/agents-r.json" \
+  "$(mk_agent manager wR:p1 wR idle '')" \
+  "$(mk_agent issue-1 wR:p2 wR working '')" \
+  "$(mk_agent issue-2 wR:p3 wR working '')" \
+  "$(mk_agent issue-3 wR:p4 wR working '')"
+export FAKE_AGENTS="$TMP/agents-r.json"
+export FAKE_KEYS="$TMP/keys-r.log" FAKE_PROMPTS="$TMP/prompts-r.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+reg "$SD_R" "$T0" ws-wR wR wR:p1 3 3 0 0 3 acme/r >/dev/null
+arm "$SD_R" "$T0" 0.25 0.50 warning
+ST_R1="$(MGR_STATE_DIR="$SD_R" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_eq "(r) two over-allotment builders interrupted, highest issue first" "wR:p4 esc
+wR:p3 esc" "$(cat "$FAKE_KEYS")"
+assert_jq "(r) no_room_at is this tick" "$ST_R1" '.managers["ws-wR"].no_room_at == '"$T0"
 # quota recovers 30 s later: room is back, so the re-send is cancelled...
-arm "$SD_Q" $(( T0 + 30000 )) 0.10 0.10 warning
-ST_Q2="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS=$(( T0 + 30000 )) "$GUARD" tick)"
-assert_jq "(q) unconstrained again, provider still hard" "$ST_Q2" \
+arm "$SD_R" $(( T0 + 30000 )) 0.10 0.10 warning
+ST_R2="$(MGR_STATE_DIR="$SD_R" MGR_GUARD_NOW_MS=$(( T0 + 30000 )) "$GUARD" tick)"
+assert_jq "(r) unconstrained again, provider still hard" "$ST_R2" \
   '.constrained == false and .allowed_total == 3 and .providers.anthropic.hard == true'
-assert_eq "(q) no second esc once the manager has room" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
-assert_jq "(q) esc_sent stays 1" "$ST_Q2" \
+assert_eq "(r) no second esc once the manager has room" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(r) esc_sent stays 1" "$ST_R2" \
   '[.stalled[] | select(.cause == "paused") | .esc_sent] == [1,1]'
-assert_eq "(q) ... and no resume inside the cooldown" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
-assert_jq "(q) no_room_at still points at the constrained tick" "$ST_Q2" \
-  '.managers["ws-wQ"].no_room_at == '"$T0"
+assert_eq "(r) ... and no resume inside the cooldown" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_jq "(r) no_room_at still points at the constrained tick" "$ST_R2" \
+  '.managers["ws-wR"].no_room_at == '"$T0"
 # ... and 61 s after that tick the cooldown is over
-arm "$SD_Q" $(( T0 + 61000 )) 0.10 0.10 warning
-ST_Q3="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS=$(( T0 + 61000 )) "$GUARD" tick)"
-assert_eq "(q) both resumed, lowest issue number first" "wQ:p3
-wQ:p4" "$(cut -f1 <"$FAKE_PROMPTS")"
-assert_jq "(q) the entries are gone" "$ST_Q3" '(.stalled | length) == 0'
-assert_eq "(q) still only the two original esc" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+arm "$SD_R" $(( T0 + 61000 )) 0.10 0.10 warning
+ST_R3="$(MGR_STATE_DIR="$SD_R" MGR_GUARD_NOW_MS=$(( T0 + 61000 )) "$GUARD" tick)"
+assert_eq "(r) both resumed, lowest issue number first" "wR:p3
+wR:p4" "$(cut -f1 <"$FAKE_PROMPTS")"
+assert_jq "(r) the entries are gone" "$ST_R3" '(.stalled | length) == 0'
+assert_eq "(r) still only the two original esc" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
 
 printf '\n== daemon lifecycle (start/status/stop, fake PATH) ==\n'
 DAEMON_STATE="$TMP/s-daemon"
@@ -868,6 +958,7 @@ SD_Y="$TMP/s-y"
 export FAKE_USAGE="$TMP/usage-ok.json"
 ST_Y="$(MGR_STATE_DIR="$SD_Y" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
 assert_jq "no agents, no managers -> ceiling 1" "$ST_Y" '.allowed_total == 1 and (.managers | length) == 0'
+assert_jq "no managers -> top_priority/top_cap null" "$ST_Y" '.top_priority == null and .top_cap == null'
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then

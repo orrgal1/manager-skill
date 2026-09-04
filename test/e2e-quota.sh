@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # End-to-end: real bin/mgr + real bin/mgr-guard, fake omp/herdr/gh.
 # Scenario A: two managers, one builder dead on a 429, provider exhausted ->
-# recovered; the guard throttles, then reignites; mgr board/launch/wait
-# reflect the guard's verdict (including waiting *through* a quota hold).
+# recovered; the guard throttles, then reignites; the priority-derived cap
+# ceiling takes over as the binding limit once the provider recovers, and a
+# paused builder only resumes once it has room again *and* the no-room cooldown
+# has expired; mgr board/launch/wait reflect the guard's verdict (including
+# waiting *through* a quota hold).
 # Scenario B (issue #4): the live incident — a 7-day limit whose resets_at
 # jitters by milliseconds, six seeded samples plus a 1% step, two managers at
-# different priorities. The burn is fitted over the whole window, the
-# projection only constrains after MGR_GUARD_CONFIRM_TICKS ticks, no working
-# builder is esc-interrupted until the provider itself goes hard, and recovery
-# restores the ceiling on the same tick and resumes within the 60 s cooldown.
+# different priorities (shape 5 under lore 10, whose cap 6 leaves shape its full
+# derived cap of 3). The burn is fitted over the whole window, the projection
+# only constrains after MGR_GUARD_CONFIRM_TICKS ticks, no working builder is
+# esc-interrupted until the provider itself goes hard, and recovery restores the
+# ceiling on the same tick and resumes within the 60 s cooldown.
 # Exit non-zero on any failed assertion.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -89,6 +93,7 @@ case "\$1 \$2" in
     exit 0;;
   "agent prompt") printf '%s\t%s\n' "\$3" "\$4" >>"$T/prompts.log"; printf '{}\n';;
   "agent send-keys") printf '%s %s\n' "\$3" "\$4" >>"$T/keys.log"; printf '{}\n';;
+  "tab list") printf '{"result":{"tabs":[]}}\n';;
   "notification show") exit 0;;
   *) exit 1;;
 esac
@@ -234,7 +239,7 @@ bd=$("$ROOT/bin/mgr" board --cap 3)
 is "cap_effective without guard" "$(jq -r '.cap_effective' <<<"$bd")" 3
 is "quota.guard" "$(jq -r '.quota.guard' <<<"$bd")" stopped
 
-echo "# 9. priorities: this project (acme/proj, w3) is low, acme/shape (w9) is high; constrained -> w3 paused"
+echo "# 9. priorities: this project (acme/proj, w3) is low, acme/shape (w9) is high; w3's cap is derived down to 1 and the quota constrains it to 0 -> paused"
 bd=$("$ROOT/bin/mgr" priority 2)
 is "mgr priority sets acme/proj" "$(jq -c '[.repo,.priority]' <<<"$bd")" '["acme/proj",2]'
 "$ROOT/bin/mgr-guard" priority acme/shape 8 >/dev/null
@@ -255,6 +260,13 @@ is "constrained" "$(jq -r '.constrained' <<<"$st")" true
 is "allowed_total" "$(jq -r '.allowed_total' <<<"$st")" 1
 is "w9 (prio 8) allotment" "$(jq -r '.managers["ws-w9"].allotment' <<<"$st")" 1
 is "w3 (prio 2) allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 0
+is "top_priority" "$(jq -r '.top_priority' <<<"$st")" 8
+is "top_cap" "$(jq -r '.top_cap' <<<"$st")" 3
+# floor(3 * 2 / 8) = 0, lifted to the one-slot floor; w9 sets the scale and keeps its cap
+is "w3 derived_cap" "$(jq -r '.managers["ws-w3"].derived_cap' <<<"$st")" 1
+is "w9 derived_cap" "$(jq -r '.managers["ws-w9"].derived_cap' <<<"$st")" 3
+is "w3 demand stays the registered 3" "$(jq -r '.managers["ws-w3"].demand' <<<"$st")" 3
+is "w3 demand_effective" "$(jq -r '.managers["ws-w3"].demand_effective' <<<"$st")" 1
 is "w3 paused" "$(jq -r '.managers["ws-w3"].paused' <<<"$st")" true
 is "esc sent to issue-50" "$(cat "$T/keys.log")" "w3:p3 esc"
 is "paused entry" "$(jq -r '[.stalled[] | select(.cause=="paused")] | .[0].name' <<<"$st")" issue-50
@@ -272,6 +284,12 @@ is "quota.paused_builders" "$(jq -c '.quota.paused_builders' <<<"$bd")" '[50]'
 is "quota.stalled (429 only)" "$(jq -c '.quota.stalled' <<<"$bd")" '[49]'
 is "in_flight 50 quota_paused" "$(jq -r '.in_flight[] | select(.number==50) | .quota_paused' <<<"$bd")" true
 is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 0
+is "quota.derived_cap" "$(jq -r '.quota.derived_cap' <<<"$bd")" 1
+# the quota bites harder than the derived cap here (allotment 0 < derived 1), so the
+# board keeps reporting the provider reason
+case "$(jq -r '.quota.reason' <<<"$bd")" in "projected 1.9 > 1 on anthropic:5h"*) ok "quota.reason is the provider reason";; *) bad "quota.reason: $(jq -r '.quota.reason' <<<"$bd")";; esac
+is "quota.managers key order" "$(jq -c '.quota.managers[0] | keys_unsorted' <<<"$bd")" \
+  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","priority","paused"]'
 : >"$T/waits.log"
 out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50 --no-quota-block)
 is "wait status" "$(jq -r '.agent_status' <<<"$out")" quota-paused
@@ -295,7 +313,7 @@ is "no stall key" "$(jq -r 'has("stall")' <<<"$out")" false
 is "report" "$(jq -r '.report' <<<"$out")" null
 is "parked, then settled" "$(sed 's/[[:space:]]*$//' "$T/waits.log" | tr '\n' '|')" "issue-50 --until working|issue-50 settle|"
 
-echo "# 11. quota back: no resume inside the 60s no_room_at cooldown, then issue-50 resumes"
+echo "# 11. quota back: the derived cap still holds w3 to one slot, and no resume inside the 60s no_room_at cooldown"
 : >"$MGR_STATE_DIR/samples.jsonl"; usage_file ok 0.1 "$R2" >"$FAKE_USAGE"
 : >"$T/prompts.log"; : >"$T/keys.log"
 # the cooldown is counted from the last tick w3 had no room, which is the tick of step 9
@@ -305,11 +323,15 @@ is "no_room_at ws-w3 is the constrained tick" "$(jq -r '.managers["ws-w3"].no_ro
 nra=$(jq -r '[.stalled[] | select(.name=="issue-49") | .next_reignite_at] | first' "$MGR_STATE_DIR/state.json")
 st=$(MGR_GUARD_NOW_MS=$((NOW2 + 30000)) "$ROOT/bin/mgr-guard" tick)   # 30s < 60s cooldown
 is "constrained now false" "$(jq -r '.constrained' <<<"$st")" false
-is "w3 allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 3
 is "allowed_total back to the ceiling" "$(jq -r '.allowed_total' <<<"$st")" 6
+is "w3 derived_cap unchanged by the quota" "$(jq -r '.managers["ws-w3"].derived_cap' <<<"$st")" 1
+is "w3 demand_effective" "$(jq -r '.managers["ws-w3"].demand_effective' <<<"$st")" 1
+# the provider is no longer the binding limit, but the derived cap is: 1, not the demand of 3
+is "w3 allotment is the derived cap, not the demand" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 1
+is "w9 allotment" "$(jq -r '.managers["ws-w9"].allotment' <<<"$st")" 2
 p2=$(awk -F'\t' '$1=="w3:p2"' "$T/prompts.log" | wc -l | tr -d ' ')
 if [ "$nra" != null ] && [ "$((NOW2 + 30000))" -ge "$nra" ]; then
-  # w3's allotment (3) now exceeds its working builders (0), so the 429 entry is due
+  # w3's one slot is unoccupied (issue-49 stalled, issue-50 held), so the 429 entry is due
   is "429 reignite fires once its backoff is due" "$p2" 1
 else
   is "429 reignite still inside its backoff" "$p2" 0
@@ -318,10 +340,47 @@ is "no resume inside the cooldown" "$(awk -F'\t' '$1=="w3:p3"' "$T/prompts.log" 
 is "paused entry survives the cooldown" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 1
 is "no_room_at unchanged" "$(jq -r '.managers["ws-w3"].no_room_at' <<<"$st")" "$NOW2"
 is "no esc re-send once there is room" "$(lines "$T/keys.log")" 0
-st=$(MGR_GUARD_NOW_MS=$((NOW2 + 61000)) "$ROOT/bin/mgr-guard" tick)   # 61s > 60s cooldown
+
+echo "# 12. board/launch: the derived cap, not the provider, is now the binding limit"
+guard_alive
+bd=$(MGR_GUARD_NOW_MS=$((NOW2 + 30000)) "$ROOT/bin/mgr" board --cap 3)
+is "quota.derived_cap" "$(jq -r '.quota.derived_cap' <<<"$bd")" 1
+is "quota.allotment" "$(jq -r '.quota.allotment' <<<"$bd")" 1
+is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 1
+is "quota.reason" "$(jq -r '.quota.reason' <<<"$bd")" 'priority 2 vs top 8 (cap 3) → cap 1'
+set +e
+err=$(MGR_GUARD_NOW_MS=$((NOW2 + 30000)) "$ROOT/bin/mgr" launch 51 --cap 3 2>&1 >/dev/null); rc=$?
+set -e
+is "launch exit" "$rc" 3
+is "launch refusal names the derived cap" "$(jq -r '.error.message' <<<"$err")" \
+  'no free slots (cap=3, cap_effective=1, quota: priority 2 vs top 8 (cap 3) → cap 1)'
+guard_gone
+
+echo "# 13. the reignited issue-49 takes the only slot, so issue-50 stays paused past the cooldown"
+jq -c '(.result.agents[] | select(.name=="issue-49") | .agent_status) = "working"' "$AGENTS" >"$AGENTS.new" && mv "$AGENTS.new" "$AGENTS"
+T13=$((NOW2 + 400000))
+st=$(MGR_GUARD_NOW_MS=$T13 "$ROOT/bin/mgr-guard" tick)
+is "issue-49 is back to work" "$(jq -r '.managers["ws-w3"].active_builders' <<<"$st")" 1
+is "w3 allotment still 1" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 1
+is "429 entry gone once it works again" "$(jq -r '[.stalled[] | select(.cause=="429")] | length' <<<"$st")" 0
+is "no resume past the cooldown: no room" "$(awk -F'\t' '$1=="w3:p3"' "$T/prompts.log" | wc -l | tr -d ' ')" 0
+is "paused entry survives" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 1
+is "w3 still paused" "$(jq -r '.managers["ws-w3"].paused' <<<"$st")" true
+# the working builder fills w3's only slot, so this tick is a fresh no-room tick:
+# the resume cooldown restarts from here
+is "no_room_at ws-w3 is this tick" "$(jq -r '.managers["ws-w3"].no_room_at' <<<"$st")" "$T13"
+is "no esc: the provider is ok again" "$(lines "$T/keys.log")" 0
+
+echo "# 14. mgr priority 8 ties with acme/shape -> derived cap 3, and issue-50 resumes once step 13's cooldown expires"
+"$ROOT/bin/mgr" priority 8 >/dev/null
+st=$(MGR_GUARD_NOW_MS=$((T13 + 70000)) "$ROOT/bin/mgr-guard" tick)   # 70s > the 60s since the last no-room tick
+is "top_priority" "$(jq -r '.top_priority' <<<"$st")" 8
+is "top_cap (max cap of the tied top)" "$(jq -r '.top_cap' <<<"$st")" 3
+is "w3 derived_cap" "$(jq -r '.managers["ws-w3"].derived_cap' <<<"$st")" 3
+is "w3 allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 3
 resume=$(awk -F'\t' '$1=="w3:p3"{print $2}' "$T/prompts.log")
 is "resume prompt sent once" "$(awk -F'\t' '$1=="w3:p3"' "$T/prompts.log" | wc -l | tr -d ' ')" 1
-case "$resume" in "mgr-guard: this project's quota allotment is back (priority 2, allotment 3)."*) ok "resume text";; *) bad "resume text: $resume";; esac
+case "$resume" in "mgr-guard: this project's quota allotment is back (priority 8, allotment 3)."*) ok "resume text";; *) bad "resume text: $resume";; esac
 # esc_sent was 1, so the resume names the interruption rather than a turn-boundary hold
 case "$resume" in *"interrupted your previous turn"*) ok "resume text names the interrupt";; *) bad "resume text: $resume";; esac
 is "paused entry removed" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 0
@@ -333,7 +392,7 @@ is "still no esc after recovery" "$(lines "$T/keys.log")" 0
 # Scenario B: the issue #4 incident, replayed end to end. Its own state dir,
 # its own agents, its own clock, and the shipped defaults for the two knobs the
 # incident hinged on (3 confirmations, 60 s resume cooldown).
-echo "# 12. incident fixture: acme/shape (prio 5, three working builders) vs acme/lore (prio 10)"
+echo "# 15. incident fixture: acme/shape (prio 5, cap 3, three working builders) vs acme/lore (prio 10, cap 6)"
 export MGR_STATE_DIR="$T/state2"
 export HERDR_WORKSPACE_ID=w9 HERDR_PANE_ID=w9:p1 HERDR_TAB_ID=w9:t1
 mkdir -p "$MGR_STATE_DIR/managers"
@@ -392,13 +451,15 @@ jq -nc --arg s "$SESS_OK" '{result:{agents:[
   {name:"manager-lore",pane_id:"w7:p1",tab_id:"w7:t1",workspace_id:"w7",cwd:"/l",agent:"omp",agent_status:"idle"},
   {name:"issue-77",pane_id:"w7:p2",tab_id:"w7:t2",workspace_id:"w7",cwd:"/l-issue-77-d",agent:"omp",agent_status:"working",agent_session:{value:$s}}]}}' >"$AGENTS"
 MGR_GUARD_NOW_MS=$I0 "$ROOT/bin/mgr-guard" register '{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1","repo":"acme/shape","primary":"/s","cap":3,"in_flight":3,"adopting":0,"ready":1,"demand":3}' >/dev/null
-MGR_GUARD_NOW_MS=$I0 "$ROOT/bin/mgr-guard" register '{"manager_id":"ws-w7","workspace_id":"w7","pane_id":"w7:p1","repo":"acme/lore","primary":"/l","cap":3,"in_flight":1,"adopting":0,"ready":2,"demand":3}' >/dev/null
+# lore's cap is 6 so that the priority-derived ceiling leaves shape its whole cap:
+# floor(6 * 5 / 10) = 3. The incident's own priorities (5 vs 10) are what is under test
+MGR_GUARD_NOW_MS=$I0 "$ROOT/bin/mgr-guard" register '{"manager_id":"ws-w7","workspace_id":"w7","pane_id":"w7:p1","repo":"acme/lore","primary":"/l","cap":6,"in_flight":1,"adopting":0,"ready":2,"demand":3}' >/dev/null
 "$ROOT/bin/mgr-guard" priority acme/shape 5 >/dev/null
 "$ROOT/bin/mgr-guard" priority acme/lore 10 >/dev/null
 is "shape priority" "$(jq -r '."acme/shape"' "$MGR_STATE_DIR/priorities.json")" 5
 is "lore priority" "$(jq -r '."acme/lore"' "$MGR_STATE_DIR/priorities.json")" 10
 
-echo "# 13. tick 1: the whole jittered window is fitted, and the projection only watches"
+echo "# 16. tick 1: the whole jittered window is fitted, and the projection only watches"
 st=$(itick $I0 ok 0.24 402)
 sc=$(jq -r "$FQ | .sample_count" <<<"$st")
 ge "sample_count (every in-window row)" "$sc" 7
@@ -408,7 +469,10 @@ is "burn_per_hour > 0" "$(jq -n --argjson b "$burn" '$b > 0')" true
 is "burn_per_hour is the least-squares slope of those rows" \
   "$burn" "$(fit_slope "$(jq -r "$FQ | .resets_at" <<<"$st")" "$I0")"
 is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 1
-is "allowed_total stays at the ceiling" "$(jq -r '.allowed_total' <<<"$st")" 6
+is "allowed_total stays at the ceiling (3+6)" "$(jq -r '.allowed_total' <<<"$st")" 9
+is "top_cap (lore's cap)" "$(jq -r '.top_cap' <<<"$st")" 6
+is "shape derived_cap (floor(6 * 5 / 10))" "$(jq -r '.managers["ws-w9"].derived_cap' <<<"$st")" 3
+is "shape demand_effective" "$(jq -r '.managers["ws-w9"].demand_effective' <<<"$st")" 3
 is "constrained" "$(jq -r '.constrained' <<<"$st")" false
 reason=$(jq -r '.providers.anthropic.reason' <<<"$st")
 case "$reason" in "ok (watching: anthropic:7d:fable projected"*) ok "reason watches without acting";;
@@ -430,17 +494,17 @@ is "launch exit" "$rc" 3
 case "$err" in *"no free slots (cap=3)"*) ok "launch refused on the cap alone";; *) bad "launch refusal: $err";; esac
 case "$err" in *"quota:"*) bad "launch refusal blames quota: $err";; *) ok "launch refusal does not blame quota";; esac
 
-echo "# 14. tick 2: a second over-1 projection still only watches"
+echo "# 17. tick 2: a second over-1 projection still only watches"
 st=$(itick $((I0 + 20000)) ok 0.24 -376)
 is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 2
-is "allowed_total stays at the ceiling" "$(jq -r '.allowed_total' <<<"$st")" 6
+is "allowed_total stays at the ceiling" "$(jq -r '.allowed_total' <<<"$st")" 9
 is "constrained" "$(jq -r '.constrained' <<<"$st")" false
 reason=$(jq -r '.providers.anthropic.reason' <<<"$st")
 case "$reason" in "ok (watching: anthropic:7d:fable projected"*) ok "reason still watching";;
   *) bad "reason: $reason";; esac
 is "no esc" "$(lines "$T/keys.log")" 0
 
-echo "# 15. tick 3: the 1% step confirms the projection -> constrain, still no interrupt"
+echo "# 18. tick 3: the 1% step confirms the projection -> constrain, still no interrupt"
 T3=$((I0 + 40000))
 st=$(itick $T3 ok 0.25 338)
 is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 3
@@ -452,7 +516,7 @@ want=$(jq -n --argjson a "$(jq -r '.providers.anthropic.active_builders' <<<"$st
   '(((($r - $now) / 3600000) * 100 | round) / 100) as $h
    | ([1, (($a * ((1 - $u) / ($b * $h))) | floor)] | max)')
 is "allowed_total = max(1, floor(act*(1-used)/(burn*hours)))" "$allowed" "$want"
-is "allowed_total below the ceiling" "$(jq -n --argjson a "$allowed" '$a < 6')" true
+is "allowed_total below the ceiling" "$(jq -n --argjson a "$allowed" '$a < 9')" true
 is "constrained" "$(jq -r '.constrained' <<<"$st")" true
 reason=$(jq -r '.providers.anthropic.reason' <<<"$st")
 case "$reason" in projected*) ok "reason acts on the projection";; *) bad "reason: $reason";; esac
@@ -476,7 +540,7 @@ guard_gone
 is "launch exit" "$rc" 3
 case "$err" in *"quota: projected"*) ok "launch refusal names the projection";; *) bad "launch refusal: $err";; esac
 
-echo "# 16. tick 4: shape's highest issue goes idle and is held at its turn boundary"
+echo "# 19. tick 4: shape's highest issue goes idle and is held at its turn boundary"
 jq -c '(.result.agents[] | select(.name=="issue-9") | .agent_status) = "idle"' "$AGENTS" >"$AGENTS.new" && mv "$AGENTS.new" "$AGENTS"
 T4=$((I0 + 60000))
 st=$(itick $T4 ok 0.25 43)
@@ -488,7 +552,7 @@ is "paused event" "$(jq -r --argjson at "$T4" '[.events[] | select(.kind=="pause
 is "still no esc" "$(lines "$T/keys.log")" 0
 is "no_room_at ws-w9 is this tick" "$(jq -r '.managers["ws-w9"].no_room_at' <<<"$st")" "$T4"
 
-echo "# 17. tick 5: the 5h limit turns warning -> level 2 escs the still-working ones"
+echo "# 20. tick 5: the 5h limit turns warning -> level 2 escs the still-working ones"
 T5=$((I0 + 80000))
 st=$(itick $T5 warning 0.25 -219)
 is "provider hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" true
@@ -500,7 +564,7 @@ is "issue-9 is still a turn-boundary hold" "$(jq -r '[.stalled[] | select(.name=
 is "shape paused" "$(jq -r '.managers["ws-w9"].paused' <<<"$st")" true
 is "lore untouched" "$(jq -r '.managers["ws-w7"].paused' <<<"$st")" false
 
-echo "# 18. tick 6: a flat window restores the ceiling on the same tick and resumes everyone"
+echo "# 21. tick 6: a flat window restores the ceiling on the same tick and resumes everyone"
 T6=$((T5 + 60000))
 { fable_sample $((T6 - 1000000)) 0.24 402
   fable_sample $((T6 - 800000))  0.24 -376
@@ -512,7 +576,7 @@ T6=$((T5 + 60000))
 st=$(itick $T6 ok 0.24 402)
 is "burn_per_hour" "$(jq -r "$FQ | .burn_per_hour" <<<"$st")" 0
 is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 0
-is "allowed_total back to the ceiling immediately" "$(jq -r '.allowed_total' <<<"$st")" 6
+is "allowed_total back to the ceiling immediately" "$(jq -r '.allowed_total' <<<"$st")" 9
 is "constrained" "$(jq -r '.constrained' <<<"$st")" false
 is "provider not hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" false
 is "resume prompts, lowest issue first" "$(cut -f1 "$T/prompts.log" | tr '\n' '|')" "w9:p2|w9:p3|w9:p4|"
@@ -527,7 +591,7 @@ is "resumed events" "$(jq -r --argjson at "$T6" '[.events[] | select(.kind=="res
 is "shape no longer paused" "$(jq -r '.managers["ws-w9"].paused' <<<"$st")" false
 is "no esc re-send after recovery" "$(lines "$T/keys.log")" 2
 
-echo "# 19. tick 7: nothing left to do -- no keys, no holds, full cap"
+echo "# 22. tick 7: nothing left to do -- no keys, no holds, full cap"
 T7=$((T5 + 120000))
 st=$(itick $T7 ok 0.24 -376)
 is "still no new esc" "$(lines "$T/keys.log")" 2

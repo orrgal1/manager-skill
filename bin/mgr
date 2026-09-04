@@ -44,9 +44,112 @@ slugify() {
 
 sanitize_pane() { printf '%s' "$1" | tr ':' '-' | tr '[:upper:]' '[:lower:]'; }
 
+# ----------------------------------------------------------- config store
+#
+# Per-repo harness configuration lives in the primary checkout's .git/config
+# under `mgr.*`: every worktree of the repo shares it and no working tree is
+# ever dirtied by it. The MGR_* env vars override the store for one invocation;
+# `mgr config` itself only ever reads and writes the store.
+
+# must run as its own simple command: `die` inside $(…) kills only a subshell
+cfg_check_key() { # cfg_check_key <key>
+  case "${1:-}" in
+    omp-arg|env|brief-extra|cap) ;;
+    *) die 2 "unknown config key: ${1:-} (omp-arg|env|brief-extra|cap)";;
+  esac
+}
+
+cfg_multi() { # cfg_multi <key> — true for the ordered, multi-valued keys
+  case "$1" in omp-arg|env) return 0;; *) return 1;; esac
+}
+
+cfg_check_value() { # cfg_check_value <key> <value>
+  local k
+  case "$1" in
+    env)
+      case "$2" in
+        *=*) k="${2%%=*}";;
+        *) die 2 "env value must be KEY=VALUE: $2";;
+      esac
+      case "$k" in
+        ''|[0-9]*|*[!A-Za-z0-9_]*) die 2 "env value must be KEY=VALUE: $2";;
+      esac;;
+    omp-arg) [ -n "$2" ] || die 2 "omp-arg must not be empty";;
+    cap) case "$2" in ''|*[!0-9]*) die 2 "cap must be a non-negative integer: $2";; esac;;
+  esac
+}
+
+# `git config --get-all` exits 1 on a key that is simply not set
+cfg_get_all() { # cfg_get_all <key> -> stored values, one per line
+  local pri
+  pri=$(primary)
+  git -C "$pri" config --local --get-all "mgr.$1" 2>/dev/null || true
+}
+
+cfg_get_one() { # cfg_get_one <key> -> the single stored value ("" when unset)
+  cfg_get_all "$1" | tail -n 1
+}
+
+# stored values never contain newlines, so one value per line round-trips
+json_lines() { # json_lines <newline-separated> -> JSON array of non-empty lines
+  jq -R -s -c 'split("\n") | map(select(length > 0))' <<<"$1"
+}
+
+# the MGR_* list vars are whitespace-separated with no quoting; globbing is off
+# so a word like `--flag=*.ts` reaches its target verbatim.
+split_ws() { # split_ws <string> -> one word per line
+  local had_f=false
+  case "$-" in *f*) had_f=true;; esac
+  set -f
+  # deliberate word splitting on IFS
+  # shellcheck disable=SC2086
+  printf '%s\n' $1
+  $had_f || set +f
+}
+
+eff_omp_args() { # effective extra omp argv, one per line
+  [ -n "${MGR_OMP_ARGS:-}" ] && { split_ws "$MGR_OMP_ARGS"; return; }
+  cfg_get_all omp-arg
+}
+
+eff_env() { # effective KEY=VALUE tab env, one per line
+  [ -n "${MGR_ENV:-}" ] && { split_ws "$MGR_ENV"; return; }
+  cfg_get_all env
+}
+
+eff_brief_extra() { # effective brief-extra path ("" when unset)
+  [ -n "${MGR_BRIEF_EXTRA:-}" ] && { printf '%s' "$MGR_BRIEF_EXTRA"; return; }
+  cfg_get_one brief-extra
+}
+
+config_json() { # config_json <cap> -> the effective config object
+  jq -nc --argjson omp "$(json_lines "$(eff_omp_args)")" \
+    --argjson env "$(json_lines "$(eff_env)")" \
+    --arg brief "$(eff_brief_extra)" --argjson cap "$1" \
+    '{"omp-arg":$omp, env:$env,
+      "brief-extra":(if $brief=="" then null else $brief end), cap:$cap}'
+}
+
+# brief-extra is operator prose appended to every builder brief. A path that is
+# set but unreadable is a warning, not a failure: the builder still gets its
+# contract. `$(cat …)` drops the file's trailing newlines, which is harmless.
+brief_with_extra() { # brief_with_extra <brief> -> brief [+ blank line + file]
+  local path extra
+  path=$(eff_brief_extra)
+  [ -n "$path" ] || { printf '%s' "$1"; return; }
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    warn "brief-extra file not found: $path"
+    printf '%s' "$1"
+    return
+  fi
+  extra=$(cat "$path")
+  printf '%s\n\n%s' "$1" "$extra"
+}
+
 cap_of() { # cap_of <explicit-or-empty>
   local c="${1:-}"
   [ -n "$c" ] || c="${MGR_CAP:-}"
+  [ -n "$c" ] || c=$(cfg_get_one cap)
   [ -n "$c" ] || c=3
   case "$c" in ''|*[!0-9]*) die 2 "cap must be a non-negative integer: $c";; esac
   printf '%s' "$c"
@@ -282,7 +385,87 @@ cmd_priority() {
   exec "$guard_bin" priority "$rp" "$arg"
 }
 
+# ---------------------------------------------------------------- config
+
+CFG_USAGE='usage: mgr config <set|add|get|unset|list> [key] [value]'
+
+cfg_value_json() { # cfg_value_json <key> -> {key,value} in that key's shape
+  local one
+  case "$1" in
+    omp-arg|env)
+      jq -nc --arg k "$1" --argjson v "$(json_lines "$(cfg_get_all "$1")")" \
+        '{key:$k,value:$v}';;
+    cap)
+      one=$(cfg_get_one cap)
+      jq -nc --arg k "$1" --arg v "$one" \
+        '{key:$k,value:(if $v=="" then null else ($v|tonumber) end)}';;
+    *)
+      one=$(cfg_get_one "$1")
+      jq -nc --arg k "$1" --arg v "$one" \
+        '{key:$k,value:(if $v=="" then null else $v end)}';;
+  esac
+}
+
+cfg_list_json() {
+  jq -nc --argjson omp "$(json_lines "$(cfg_get_all omp-arg)")" \
+    --argjson env "$(json_lines "$(cfg_get_all env)")" \
+    --arg brief "$(cfg_get_one brief-extra)" --arg cap "$(cfg_get_one cap)" \
+    '{"omp-arg":$omp, env:$env,
+      "brief-extra":(if $brief=="" then null else $brief end),
+      cap:(if $cap=="" then null else ($cap|tonumber) end)}'
+}
+
+# The store, never the effective values: an operator inspecting the config must
+# see what is written down, not what this shell's MGR_* vars would override.
+cmd_config() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    list)      [ $# -eq 0 ] || die 2 "$CFG_USAGE";;
+    get|unset) [ $# -eq 1 ] || die 2 "$CFG_USAGE";;
+    set|add)   [ $# -eq 2 ] || die 2 "$CFG_USAGE";;
+    *)         die 2 "$CFG_USAGE";;
+  esac
+  # resolve (and cache) the primary here: inside $(…) its `die` would only kill
+  # the subshell and leave `git -C ""` to fail with a confusing message.
+  primary >/dev/null
+  local pri; pri=$(primary)
+  [ "$sub" = list ] && { cfg_list_json; return; }
+
+  local key="$1"
+  cfg_check_key "$key"
+  case "$sub" in
+    get) ;;
+    unset) git -C "$pri" config --local --unset-all "mgr.$key" 2>/dev/null || true;;
+    set)
+      cfg_check_value "$key" "$2"
+      git -C "$pri" config --local --replace-all "mgr.$key" "$2" \
+        || die 1 "git config --replace-all mgr.$key failed";;
+    add)
+      cfg_multi "$key" || die 2 "config key $key is single-valued: use set"
+      cfg_check_value "$key" "$2"
+      git -C "$pri" config --local --add "mgr.$key" "$2" \
+        || die 1 "git config --add mgr.$key failed";;
+  esac
+  cfg_value_json "$key"
+}
+
 # ---------------------------------------------------------------- board
+
+# The manager's own tab, so a headless caller can see (and never adopt) it.
+# `herdr agent list` carries no tab label, so the label lives in `herdr tab
+# list` and is joined to the live agents by tab_id. No manager tab, no agent on
+# it, or an unusable tab list all mean "no manager" — the board still answers.
+manager_json() { # manager_json <agents-json> -> {pane_id,tab_id,agent,cwd} or null
+  local tabs ids
+  tabs=$(herdr tab list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null) \
+    || { warn "herdr tab list failed"; printf 'null'; return; }
+  ids=$(jq -c '[.result.tabs[]? | select(.label == "manager") | .tab_id] | sort' \
+    <<<"$tabs" 2>/dev/null) \
+    || { warn "herdr tab list failed"; printf 'null'; return; }
+  jq -nc --argjson ids "$ids" --argjson ag "$1" \
+    '[$ids[] as $t | $ag[] | select(.tab_id == $t)
+      | {pane_id, tab_id, agent:.name, cwd}] | .[0] // null'
+}
 
 cmd_board() {
   local cap=""
@@ -296,13 +479,15 @@ cmd_board() {
 
   # resolved before the jq call: `die` inside a command substitution would only
   # kill its own subshell, so each of these must be its own simple command.
-  local b_repo b_primary b_issues b_agents b_extra b_guard board
+  local b_repo b_primary b_issues b_agents b_extra b_guard b_config b_manager board
   b_repo=$(repo)
   b_primary=$(primary)
   b_issues=$(open_issues)
   b_agents=$(ws_agents)
   b_extra=$(tracked_missing_issues "$b_issues" "$b_agents")
   b_guard=$(guard_state)
+  b_config=$(config_json "$cap")
+  b_manager=$(manager_json "$b_agents")
 
   board=$(jq -n \
     --argjson issues "$b_issues" \
@@ -310,12 +495,15 @@ cmd_board() {
     --argjson ag "$b_agents" \
     --argjson cap "$cap" \
     --argjson guard "$b_guard" \
+    --argjson config "$b_config" \
+    --argjson manager "$b_manager" \
     --arg repo "$b_repo" \
     --arg primary "$b_primary" \
     --arg ws "${HERDR_WORKSPACE_ID:-}" \
     --arg self "${HERDR_PANE_ID:-}" \
     "$JQ_BLOCKERS"'
     ($issues | map(.number)) as $open |
+    ($manager.pane_id // null) as $mgrpane |
     def pol: if ([.labels[].name]|index("mgr:manual-approve")) then "manual-approve" else "auto-merge" end;
     def lbl($n): ([.labels[].name]|index($n)) != null;
     ($issues | map(. + {state:"open", policy: pol,
@@ -344,7 +532,7 @@ cmd_board() {
             | {number,title,policy,blocked_by}] | sort_by(.number)) as $blocked |
     ([$ag[] | select(.name != null and (.name|startswith("adopt-")))
             | {pane_id,tab_id,agent:.name,agent_status,cwd}] | sort_by(.pane_id)) as $adopting |
-    ([$ag[] | select(.pane_id != $self)
+    ([$ag[] | select(.pane_id != $self) | select(.pane_id != $mgrpane)
             | select((.name == null) or ((.name|startswith("issue-")|not)
                                          and (.name|startswith("adopt-")|not)))
             | {pane_id,tab_id,name,agent_kind,agent_status,cwd,branch,
@@ -370,8 +558,15 @@ cmd_board() {
      // ($lims | sort_by(.used // 0) | last)) as $bl |
     ($guard.managers[("ws-" + $ws)] // null) as $me |
     ($me.allotment // null) as $allot |
+    ($me.derived_cap // null) as $derived |
     # no allotment yet (registered after the last tick): the global verdict is the ceiling
     (if $gs == "running" then ([$cap, ($allot // $guard.allowed_total // $cap)] | min) else $cap end) as $capeff |
+    # when the priority-derived cap ceiling bites at least as hard as the quota allotment
+    # it, not the quota, is the binding limit — so say so instead of the provider reason
+    (if $gs == "running" and $derived != null and $derived < $cap and (($allot // $derived) >= $derived)
+     then "priority " + ($me.priority|tostring) + " vs top " + ($guard.top_priority|tostring)
+          + " (cap " + ($guard.top_cap|tostring) + ") → cap " + ($derived|tostring)
+     else $pv.reason // null end) as $qreason |
     # guard-held builders of this workspace, split by why the guard holds them:
     # a 429 comes from the provider, "paused" is the guard keeping quota for a
     # higher-priority project. An entry without a cause predates the split.
@@ -382,6 +577,7 @@ cmd_board() {
     ([$held[] | select(.cause == "429") | .n] | unique) as $qstalled |
     ([$held[] | select(.cause == "paused") | .n] | unique) as $qpaused |
     {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
+     self:(if $self=="" then null else $self end), manager:$manager, config:$config,
      cap:$cap, cap_effective:$capeff,
      slots_free:([0, ($capeff - ($inflight|length) - ($adopting|length))] | max),
      in_flight:[$inflight[] | .number as $rn
@@ -395,13 +591,14 @@ cmd_board() {
             burn_per_hour:($bl.burn_per_hour // null),
             projected_at_reset:($bl.projected_at_reset // null),
             allowed_total:($pv.allowed_total // $guard.allowed_total // null),
-            allotment:$allot, reason:($pv.reason // null),
+            allotment:$allot, derived_cap:$derived, reason:$qreason,
             priority:($guard.priorities[$repo] // 5),
             constrained:($guard.constrained // false),
             paused:($me.paused // false),
             managers:([($guard.managers // {}) | to_entries[]
                        | {manager_id:(.value.manager_id // .key), repo:(.value.repo // null),
                           cap:(.value.cap // null), in_flight:(.value.in_flight // null),
+                          derived_cap:(.value.derived_cap // null),
                           allotment:(.value.allotment // null), live:(.value.live // false),
                           priority:(.value.priority // null), paused:(.value.paused // false)}]
                       | sort_by(.manager_id)),
@@ -464,6 +661,20 @@ cmd_launch() {
 
   ensure_labels
 
+  # the effective harness config, read before anything is created: one --env per
+  # entry for the tab, the omp argv for `herdr agent start … -- …`. bash 3.2
+  # needs the `${a[@]+…}` idiom to expand a possibly-empty array under `set -u`.
+  local -a env_args=() omp_args=()
+  local v
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    env_args+=(--env "$v")
+  done < <(eff_env)
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    omp_args+=("$v")
+  done < <(eff_omp_args)
+
   git -C "$pri" worktree add -b "$branch" "$wt" main >/dev/null 2>&1 \
     || die 1 "git worktree add -b $branch $wt main failed"
 
@@ -475,7 +686,8 @@ cmd_launch() {
   }
 
   created=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$wt" \
-    --label "#$n $slug" --no-focus 2>/dev/null) || { teardown_launch; die 1 "herdr tab create failed"; }
+    --label "#$n $slug" ${env_args[@]+"${env_args[@]}"} --no-focus 2>/dev/null) \
+    || { teardown_launch; die 1 "herdr tab create failed"; }
   tab_id=$(jq -r '.result.tab.tab_id // empty' <<<"$created")
   pane_id=$(jq -r '.result.root_pane.pane_id // empty' <<<"$created")
   if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
@@ -483,9 +695,11 @@ cmd_launch() {
   fi
 
   # a freshly created pane needs a moment to reach its interactive shell prompt
+  local -a start_cmd=(herdr agent start "issue-$n" --kind omp --pane "$pane_id" --timeout 120000)
+  if [ ${#omp_args[@]} -gt 0 ]; then start_cmd+=(-- "${omp_args[@]}"); fi
   local started=false
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if herdr agent start "issue-$n" --kind omp --pane "$pane_id" --timeout 120000 >/dev/null 2>&1; then
+    if "${start_cmd[@]}" >/dev/null 2>&1; then
       started=true; break
     fi
     sleep 1
@@ -494,6 +708,7 @@ cmd_launch() {
 
   local brief
   brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
+  brief=$(brief_with_extra "$brief")
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
 
@@ -577,6 +792,7 @@ cmd_adopt() {
 
     local brief
     brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
     jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
@@ -592,6 +808,7 @@ cmd_adopt() {
     herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
     local brief
     brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"), then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Resume your work only after bind succeeds."
+    brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
 
     jq -nc --arg agent "$newname" --arg tab "$tab" --arg pane "$pane" \
@@ -913,14 +1130,25 @@ mgr — manager CLI for herdr-hosted omp builders
                                       idempotent, status is cheap (files + kill -0)
   mgr priority [N|--clear]            show/set this repo's quota priority (machine-wide,
                                       default 5, higher wins; 0 pauses the project)
+  mgr config <set|add|get|unset|list> [key] [value]
+                                      per-repo harness config: omp-arg (extra omp argv),
+                                      env (KEY=VALUE for the builder's tab), brief-extra
+                                      (markdown file appended to every brief), cap.
+                                      Stored in the primary checkout's .git/config
+                                      under mgr.*, shared by every worktree
   mgr paths                           absolute paths of root/SKILL.md/builder.md/mgr,
                                       resolved from this script's real location
   mgr --version                       this checkout's package.json version
 
 env: MGR_CAP        default concurrency cap
+     MGR_OMP_ARGS   extra omp argv (whitespace-split; replaces mgr.omp-arg)
+     MGR_ENV        KEY=VALUE tab env (whitespace-split; replaces mgr.env)
+     MGR_BRIEF_EXTRA  markdown file appended to every brief (replaces mgr.brief-extra)
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
      MGR_GUARD_RESUME_COOLDOWN_S  seconds before a paused builder may resume (60)
+     HERDR_WORKSPACE_ID  target workspace (all commands; headless use sets it explicitly)
+     HERDR_PANE_ID       the caller's pane (bind, board.self only)
 EOF
 }
 
@@ -949,6 +1177,7 @@ main() {
     retire)        cmd_retire "$@";;
     guard)         cmd_guard "$@";;
     priority)      cmd_priority "$@";;
+    config)        cmd_config "$@";;
     _parse-report) cmd_parse_report "$@";;
     *) die 2 "unknown subcommand: $sub (try: mgr --help)";;
   esac
