@@ -680,10 +680,8 @@ jq -nc --argjson t $(( T0 - 300000 )) --argjson r $(( RESET_N + 300000 )) \
   '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:0.3, resets_at:$r, status:"ok"}' \
   >>"$SD_N/samples.jsonl"
 ST_N="$(MGR_GUARD_CONFIRM_TICKS=3 MGR_STATE_DIR="$SD_N" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
-set -- $(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 120000)
-WIN_N="$1"; SLOPE_N="$2"
-set -- $(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 0)
-COLL_N="$1"; COLLSLOPE_N="$2"
+read -r WIN_N SLOPE_N <<<"$(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 120000)"
+read -r COLL_N COLLSLOPE_N <<<"$(fit_window "$SD_N/samples.jsonl" anthropic:5h "$CUR_N" 0)"
 assert_eq "(n) the window holds seven samples (six seeded plus this tick)" 7 "$WIN_N"
 assert_jq "(n) sample_count is the whole window" "$ST_N" \
   '.providers.anthropic.limits[0].sample_count == 7'
