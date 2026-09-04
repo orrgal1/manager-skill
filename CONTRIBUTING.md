@@ -44,6 +44,8 @@ shellcheck -S warning bin/mgr bin/mgr-guard install.sh test/*.sh
   `{"error":{"code":N,"message":"…"}}` on stderr, and the exit codes keep their meaning
   (`1` unexpected · `2` usage · `3` refused · `4` not found). Changing a board field or an exit
   code means updating `SKILL.md` in the same PR.
+- Bump `version` in `package.json` (semver) when a change should reach consumers who install with
+  `pnpm add github:orrgal1/manager-skill` — there is no other release step.
 - No new runtime dependencies without a reason in the issue.
 
 ## Where the design lives
