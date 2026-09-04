@@ -315,6 +315,7 @@ by `-`, e.g. `adopt-w26-p3`.
 | `MGR_STATE_DIR` | `~/.local/state/mgr-guard` | the guard's ledger: pid, log, `state.json`, manager registrations |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
+| `MGR_GUARD_CONFIRM_TICKS` | `3` | consecutive ticks a limit must project past 100% before it constrains `allowed_total` |
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the guard exits after this long with no live manager |
 | `MGR_GUARD_RESUME_COOLDOWN_S` | `60` | how long the guard waits, counted from the last tick this project had no room, before resuming a paused builder |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's toasts |
