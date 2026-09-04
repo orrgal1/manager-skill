@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        # pinned so CI reports exactly what contributors see with this version
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.$(uname -m).tar.xz"
+          curl -fsSL "$url" | tar -xJ
+          sudo install "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+      - name: Lint
+        run: shellcheck -S warning bin/mgr bin/mgr-guard install.sh test/*.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check prerequisites
+        # jq ships on both runner images; install it only if that ever changes.
+        # The tests fake gh/herdr/omp on their own PATH, so those are not needed.
+        run: |
+          bash --version | head -1
+          if ! command -v jq >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then brew install jq
+            else sudo apt-get update && sudo apt-get install -y jq
+            fi
+          fi
+          jq --version
+      - name: Configure git
+        # tests run `git init` in temp dirs; keep identity and branch name deterministic
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.com"
+          git config --global init.defaultBranch main
+      - name: Test
+        run: test/run.sh

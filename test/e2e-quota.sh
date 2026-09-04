@@ -6,13 +6,32 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+cleanup() { rm -rf "$T"; if [ -n "${GUARD_FAKE_PID:-}" ]; then kill "$GUARD_FAKE_PID" 2>/dev/null || true; fi; }
+trap cleanup EXIT
 export MGR_STATE_DIR="$T/state" MGR_GUARD_NOTIFY=0 MGR_GUARD_MIN_SLOPE_SPAN_S=1
 FAKE="$T/bin"; mkdir -p "$FAKE"
 fail=0
 ok()   { printf 'ok   %s\n' "$1"; }
 bad()  { printf 'FAIL %s\n' "$1"; fail=1; }
 is()   { if [ "$2" = "$3" ]; then ok "$1 = $2"; else bad "$1: got '$2' want '$3'"; fi; }
+
+# `mgr` treats the guard as running when guard.pid holds a live pid (kill -0), so
+# the fixture pins a real process there. It must outlive the assertions in the
+# block -- a short `sleep` would expire mid-block on a loaded machine and the
+# guard would read as stopped -- so it is long-lived and retired explicitly.
+GUARD_FAKE_PID=""
+guard_alive() {
+  mkdir -p "$MGR_STATE_DIR"
+  sleep 600 & GUARD_FAKE_PID=$!
+  printf '%s\n' "$GUARD_FAKE_PID" >"$MGR_STATE_DIR/guard.pid"
+}
+guard_gone() {
+  if [ -n "$GUARD_FAKE_PID" ]; then
+    kill "$GUARD_FAKE_PID" 2>/dev/null || true
+    wait "$GUARD_FAKE_PID" 2>/dev/null || true
+    GUARD_FAKE_PID=""
+  fi
+}
 
 # ---- fixtures
 SESS="$T/issue-49.jsonl"
@@ -94,7 +113,7 @@ is "no prompt yet" "$([ -f "$T/prompts.log" ] && wc -l <"$T/prompts.log" | tr -d
 
 echo "# 2. mgr board (real mgr, real guard) sees the throttle and registers itself"
 # make the guard look alive: status checks guard.pid + tick freshness
-sleep 1 & echo $! >"$MGR_STATE_DIR/guard.pid"
+guard_alive
 bd=$(MGR_GUARD_NOW_MS=$NOW0 "$ROOT/bin/mgr" board --cap 3)
 is "quota.guard" "$(jq -r '.quota.guard' <<<"$bd")" running
 is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 0
@@ -110,7 +129,7 @@ err=$(MGR_GUARD_NOW_MS=$NOW0 "$ROOT/bin/mgr" launch 51 --cap 3 2>&1 >/dev/null);
 set -e
 is "launch exit" "$rc" 3
 case "$err" in *"cap_effective=0, quota: exhausted: anthropic:5h"*) ok "launch refusal names the quota";; *) bad "launch refusal: $err";; esac
-wait 2>/dev/null || true
+guard_gone
 
 echo "# 4. window reset: usage ok, guard restores capacity and reignites issue-49 once"
 NOW1=$((RESET + 60000))
@@ -135,9 +154,9 @@ echo "# 6. trajectory: burn projects past 1 before reset -> dial back"
 NOW2=$((NOW1 + 3600000)); R2=$((NOW2 + 7200000))   # 2h to reset
 : >"$MGR_STATE_DIR/samples.jsonl"
 usage_file ok 0.7 "$R2" >"$FAKE_USAGE"
-sleep 1 & echo $! >"$MGR_STATE_DIR/guard.pid"
+guard_alive
 MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" board --cap 3 >/dev/null   # heartbeat after the clock jump
-wait 2>/dev/null || true
+guard_gone
 for i in 0 1 2; do
   t=$((NOW2 - 1200000 + i * 600000)); u=$(jq -n "0.5 + $i * 0.1")
   jq -nc --argjson t "$t" --argjson u "$u" --argjson r "$R2" '{t:$t,provider:"anthropic",limit:"anthropic:5h",used:$u,resets_at:$r,status:"ok"}' >>"$MGR_STATE_DIR/samples.jsonl"
@@ -154,13 +173,13 @@ is "ws-w3 allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 1
 is "ws-w9 allotment" "$(jq -r '.managers["ws-w9"].allotment' <<<"$st")" 0
 
 echo "# 7. mgr wait on the stalled builder with the guard running parks until working"
-sleep 1 & echo $! >"$MGR_STATE_DIR/guard.pid"
+guard_alive
 out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 49)
 is "wait status (settled, still stalled)" "$(jq -r '.agent_status' <<<"$out")" quota-stalled
 is "stall.provider" "$(jq -r '.stall.provider' <<<"$out")" anthropic
 is "stall.guard" "$(jq -r '.stall.guard' <<<"$out")" running
 is "waited --until working first" "$(head -1 "$T/waits.log")" "issue-49 --until working"
-wait 2>/dev/null || true
+guard_gone
 
 echo "# 8. guard stopped: wait returns immediately with guard=stopped; board does not throttle"
 rm -f "$MGR_STATE_DIR/guard.pid"; : >"$T/waits.log"
@@ -178,9 +197,9 @@ is "mgr priority sets acme/proj" "$(jq -c '[.repo,.priority]' <<<"$bd")" '["acme
 is "priorities.json" "$(jq -c . "$MGR_STATE_DIR/priorities.json")" '{"acme/proj":2,"acme/shape":8}'
 # w9 gets a working builder; w3's issue-50 is working and will be the pause candidate
 jq -c --arg s50 "$SESS_OK" '.result.agents += [{name:"issue-12",pane_id:"w9:p4",tab_id:"w9:t4",workspace_id:"w9",cwd:"/s-issue-12",agent:"omp",agent_status:"working",agent_session:{value:$s50}}]' "$AGENTS" >"$AGENTS.new" && mv "$AGENTS.new" "$AGENTS"
-sleep 1 & echo $! >"$MGR_STATE_DIR/guard.pid"
+guard_alive
 MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" board --cap 3 >/dev/null
-wait 2>/dev/null || true
+guard_gone
 "$ROOT/bin/mgr-guard" register '{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1","repo":"acme/shape","primary":"/s","cap":3,"in_flight":1,"adopting":0,"ready":1,"demand":2}' >/dev/null
 # keep the projection binding: same rising samples, allowed_total stays 1 (active builders: issue-50 + issue-12 = 2 -> floor(2*0.25)=0 -> max 1)
 st=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr-guard" tick)
@@ -196,7 +215,7 @@ is "paused event" "$(jq -r '[.events[] | select(.kind=="paused")] | length' <<<"
 
 echo "# 10. board and wait in the paused project"
 jq -c '(.result.agents[] | select(.name=="issue-50") | .agent_status) = "idle"' "$AGENTS" >"$AGENTS.new" && mv "$AGENTS.new" "$AGENTS"
-sleep 2 & echo $! >"$MGR_STATE_DIR/guard.pid"
+guard_alive
 bd=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" board --cap 3)
 is "quota.priority" "$(jq -r '.quota.priority' <<<"$bd")" 2
 is "quota.constrained" "$(jq -r '.quota.constrained' <<<"$bd")" true
@@ -210,7 +229,7 @@ out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50)
 is "wait status" "$(jq -r '.agent_status' <<<"$out")" quota-paused
 is "stall.cause" "$(jq -r '.stall.cause' <<<"$out")" paused
 is "parked --until working first" "$(head -1 "$T/waits.log")" "issue-50 --until working"
-wait 2>/dev/null || true
+guard_gone
 
 echo "# 11. quota back: w3 gets room again and issue-50 is resumed after the cooldown"
 : >"$MGR_STATE_DIR/samples.jsonl"; usage_file ok 0.1 "$R2" >"$FAKE_USAGE"; : >"$T/prompts.log"

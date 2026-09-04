@@ -471,8 +471,8 @@ cmd_launch() {
   fi
 
   # a freshly created pane needs a moment to reach its interactive shell prompt
-  local try started=false
-  for try in 1 2 3 4 5 6 7 8 9 10; do
+  local started=false
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     if herdr agent start "issue-$n" --kind omp --pane "$pane_id" --timeout 120000 >/dev/null 2>&1; then
       started=true; break
     fi

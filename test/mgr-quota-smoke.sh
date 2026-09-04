@@ -181,7 +181,7 @@ export HERDR_PANE_ID=w9:p1
 export HERDR_TAB_ID=w9:t1
 : >"$MGR_TEST_LOG"; : >"$MGR_TEST_REGISTER"
 
-cd "$repo"
+cd "$repo" || exit 1
 
 fails=0
 check() { # check <name> <expected> <actual>

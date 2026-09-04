@@ -96,7 +96,13 @@ PATH="$BIN:$PATH"; export PATH
 T0=1700000000000   # pinned "now" base, ms, divisible by 1000
 
 iso_ms() { # iso_ms <ms>
-  date -u -r $(( ${1} / 1000 )) +%Y-%m-%dT%H:%M:%S.000Z
+  local s=$(( ${1} / 1000 ))
+  # GNU date renders an epoch with -d @N; BSD/macOS date uses -r N
+  if date --version >/dev/null 2>&1; then
+    date -u -d "@$s" +%Y-%m-%dT%H:%M:%S.000Z
+  else
+    date -u -r "$s" +%Y-%m-%dT%H:%M:%S.000Z
+  fi
 }
 
 mk_usage() { # mk_usage <file> <status> <used-fraction> <resets-at-ms>
@@ -169,14 +175,15 @@ reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <a
 }
 
 arm() { # arm <state-dir> <now-ms> <used-prev> <used-now>: seed one prior sample + the usage fixture
-  local sd="$1" now="$2" prev="$3" cur="$4" reset
+  local sd="$1" now="$2" prev="$3" cur="$4" reset usage
   reset=$(( now + 7200000 ))
   mkdir -p "$sd"
   jq -nc --argjson t "$(( now - 1800000 ))" --argjson u "$prev" --argjson r "$reset" \
     '{t:$t, provider:"anthropic", limit:"anthropic:5h", used:$u, resets_at:$r, status:"ok"}' \
     >"$sd/samples.jsonl"
-  mk_usage "$TMP/usage-armed-$(basename "$sd").json" ok "$cur" "$reset"
-  export FAKE_USAGE="$TMP/usage-armed-$(basename "$sd").json"
+  usage="$TMP/usage-armed-$(basename "$sd").json"
+  mk_usage "$usage" ok "$cur" "$reset"
+  export FAKE_USAGE="$usage"
 }
 
 printf '== help / usage ==\n'

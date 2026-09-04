@@ -1,0 +1,12 @@
+# agent-harness scratch
+.omp/
+.claude/worktrees/
+
+# guard leftovers if MGR_STATE_DIR is ever pointed inside the checkout
+*.log
+guard.pid
+guard.lock/
+.tmp.*
+
+# os
+.DS_Store

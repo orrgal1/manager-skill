@@ -57,7 +57,21 @@ now_ms() { # tests pin the clock with MGR_GUARD_NOW_MS
 
 iso_of() { # iso_of <ms>
   local s=$(( ${1:-0} / 1000 ))
-  date -u -r "$s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown'
+  # GNU date renders an epoch with -d @N; BSD/macOS date uses -r N (GNU -r is a file's mtime)
+  if date --version >/dev/null 2>&1; then
+    date -u -d "@$s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown'
+  else
+    date -u -r "$s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown'
+  fi
+}
+
+mtime_of() { # mtime_of <path> -> epoch seconds, 0 when unknown
+  # GNU stat spells mtime -c %Y; BSD/macOS stat spells it -f %m
+  if stat --version >/dev/null 2>&1; then
+    stat -c %Y "$1" 2>/dev/null || printf '0'
+  else
+    stat -f %m "$1" 2>/dev/null || printf '0'
+  fi
 }
 
 log() { # log <level> <msg...>
@@ -831,8 +845,8 @@ cmd_start() {
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
     # a stale lock (no live pid, older than 60 s) is ours to clear
     local age=0 mt
-    mt=$(stat -f %m "$LOCKDIR" 2>/dev/null || printf '0')
-    age=$(( $(date +%s) - mt ))
+    mt=$(mtime_of "$LOCKDIR")
+    age=$(( $(date +%s) - ${mt:-0} ))
     if [ "$age" -ge 60 ]; then
       rmdir "$LOCKDIR" 2>/dev/null || true
       mkdir "$LOCKDIR" 2>/dev/null || die 3 "another mgr-guard start is in progress ($LOCKDIR)"
@@ -864,8 +878,7 @@ cmd_stop() {
     return 0
   fi
   kill -TERM "$pid" 2>/dev/null || true
-  local i
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
   done
