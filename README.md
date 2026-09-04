@@ -113,10 +113,11 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
 - **Priorities.** Each project (repo) has a priority — `mgr priority N`, default 5, higher wins,
   machine-wide. It does two things. First, constrained or not, it derives a cap ceiling: the
   top-priority live project keeps its own cap, every other project gets
-  `derived_cap = max(1, floor(top_cap × priority / top_priority))`, and its demand entering the
-  allotment is `min(cap, derived_cap)` — water-filling can only lower that further, never raise
-  it. `top_cap` is the top project's `--cap` (not its momentary allotment, so the numbers are
-  stable); ties at the top all keep their own cap. Example: top project priority 10, cap 3; a
+  `derived_cap = max(1, floor(top_cap × priority / top_priority))`, so its effective cap is
+  `min(cap, derived_cap)`; its demand (what it actually has to run, never more than that) enters
+  the allotment, and water-filling can only lower it further, never raise it. `top_cap` is the
+  top project's `--cap` (not its momentary allotment, so the numbers are stable); ties at the
+  top all keep their own cap. Example: top project priority 10, cap 3; a
   project at priority 5 gets `floor(3 × 5/10) = 1`, so with its own cap 3 it runs at
   `min(3, 1) = 1`, and with its own cap 1 or less its own cap wins; priority 1 still gets
   `max(1, floor(0.3)) = 1`. No project derives below 1, so this is not how you pause one.
