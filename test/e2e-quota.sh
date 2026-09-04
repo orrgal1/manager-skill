@@ -72,6 +72,7 @@ case "\$1 \$2" in
   "agent wait") printf '%s %s\n' "\$3" "\${4:-settle} \${5:-}" >>"$T/waits.log"; exit 0;;
   "agent prompt") printf '%s\t%s\n' "\$3" "\$4" >>"$T/prompts.log"; printf '{}\n';;
   "agent send-keys") printf '%s %s\n' "\$3" "\$4" >>"$T/keys.log"; printf '{}\n';;
+  "tab list") printf '{"result":{"tabs":[]}}\n';;
   "notification show") exit 0;;
   *) exit 1;;
 esac

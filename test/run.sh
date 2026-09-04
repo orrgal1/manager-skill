@@ -5,7 +5,7 @@ set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
-tests="guard-smoke mgr-quota-smoke e2e-quota"
+tests="guard-smoke mgr-quota-smoke mgr-config-smoke e2e-quota"
 failed=0
 
 for t in $tests; do

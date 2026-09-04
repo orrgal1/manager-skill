@@ -127,6 +127,8 @@ set -uo pipefail
 printf 'herdr %s\n' "$*" >>"$MGR_TEST_LOG"
 case "${1:-} ${2:-}" in
   "agent list") cat "$MGR_TEST_FIX/agents.json";;
+  "tab list")
+    printf '{"result":{"tabs":[{"tab_id":"w9:t1","label":"manager","workspace_id":"w9"},{"tab_id":"w9:t2","label":"#49 do-the-thing","workspace_id":"w9"}]}}\n';;
   "agent get")
     f="$MGR_TEST_FIX/agent-${3:-}.json"
     [ -f "$f" ] || exit 1
