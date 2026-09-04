@@ -167,15 +167,16 @@ $MGR wait <N|pane_id>
 ```
 
 Run it as a **background** bash job (`async: true`, `timeout: 0`); it blocks until the builder goes
-idle and the result is delivered to you. Never run it in the foreground. One wait per builder.
+idle and the result is delivered to you — quota holds are waited through, not returned. Never run
+it in the foreground. One wait per builder.
 
 On delivery, `{"number","pane_id","agent_status","report"}` — plus `stall` when the turn died on a
 rate limit. Read `agent_status` before `report`:
 
 | `agent_status` | Do |
 |---|---|
-| `quota-stalled` | Relay `stall` to the operator: `provider`, `error`, and when the window resets (`resets_at`). Do **not** prompt it, do **not** retire it — the work is intact. If `stall.guard` is `stopped`, run `$MGR guard start`. Then `$MGR wait N` again in the background: the guard re-prompts the builder once the quota is back, and that wait returns the real report. |
-| `quota-paused` | The provider is fine — the guard interrupted this builder to keep quota for a higher-priority project, because this project's `allotment` no longer covers it. Relay that: `stall.cause` is `paused`, plus the board's `quota.priority` and `quota.allotment`. Do **not** prompt it, do **not** retire it — the work is intact and the tab stays. Then `$MGR wait N` again in the background: the guard resumes it by itself once the share is back, and that wait returns the real report. Only the operator may change the ranking (`$MGR priority`). |
+| `quota-stalled` | You only ever see this with `stall.guard` = `stopped` — a running guard makes the wait ride the hold out by itself. Run `$MGR guard start`, then `$MGR wait N` again in the background. Do **not** prompt it, do **not** retire it — the work is intact. Relay the stall (`provider`, `error`, `resets_at`) only if the operator asks. |
+| `quota-paused` | Same, for a builder the guard held to keep quota for a higher-priority project (`stall.cause` is `paused`): with the guard running the wait keeps going, so seeing it means `stall.guard` is `stopped`. Run `$MGR guard start` and wait again. Do **not** prompt it, do **not** retire it — the tab and the work stay. Relay it (plus `quota.priority`, `quota.allotment`) only if the operator asks; only the operator may change the ranking (`$MGR priority`). |
 
 **`number` is null** — an adoptee idled before binding. Read what it said, answer, wait again:
 
@@ -193,10 +194,10 @@ Otherwise branch on `report.status`:
 | `awaiting-approval` | Give the operator the PR URL and the builder's own summary (its last non-report issue comment). Do **not** retire — the tab stays alive for the fixes. The slot frees itself. |
 | `blocked` / `failed` | Relay `reason` verbatim, keep the tab, ask the operator how to proceed: `$MGR prompt N "<answer>"` + wait again, or `$MGR retire N`. Never guess the answer for them. |
 
-`report` is `null` — check `agent_status` first: `quota-stalled` and `quota-paused` are not
-questions, they are the rows above, and prompting one only buys another 429 or takes quota back
-from a higher-priority project. Otherwise the builder stopped without reporting, which almost
-always means it asked a question. Same as the unbound case, addressed by issue:
+`report` is `null` — the builder stopped without reporting, which almost always means it asked a
+question. Never prompt one the guard is holding (`agent_status` `quota-stalled`/`quota-paused`):
+that only buys another 429 or takes quota back from a higher-priority project. Otherwise, same as
+the unbound case, addressed by issue:
 `herdr agent read issue-N --source recent-unwrapped --lines 60`, relay it, answer with
 `$MGR prompt N "…"`, wait again. `agent_status: blocked` gets the same treatment.
 
@@ -257,7 +258,7 @@ Trust the report, not the idle state.
 | `$MGR launch <N> [--cap N]` | worktree + tab + omp builder + brief + label + comment |
 | `$MGR adopt <pane_id\|tab_id> [N]` | make a live session a builder; without N it self-registers |
 | `$MGR bind <N>` | builder-side only; you never run this |
-| `$MGR wait <N\|pane_id>` | block until idle, return the parsed `manager-report` |
+| `$MGR wait <N\|pane_id> [--no-quota-block]` | block until idle, return the parsed `manager-report`; quota holds are waited through unless `--no-quota-block` |
 | `$MGR prompt <N> <text…>` | send text to builder `issue-N` |
 | `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue |
 | `$MGR guard start [--interval S]` | start the quota-guard daemon; idempotent, shared by all managers |
@@ -315,5 +316,5 @@ by `-`, e.g. `adopt-w26-p3`.
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the guard exits after this long with no live manager |
-| `MGR_GUARD_RESUME_COOLDOWN_S` | `300` | how long a paused builder waits before the guard may resume it |
+| `MGR_GUARD_RESUME_COOLDOWN_S` | `60` | how long the guard waits, counted from the last tick this project had no room, before resuming a paused builder |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's toasts |

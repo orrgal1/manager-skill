@@ -131,7 +131,16 @@ case "${1:-} ${2:-}" in
     f="$MGR_TEST_FIX/agent-${3:-}.json"
     [ -f "$f" ] || exit 1
     cat "$f";;
-  "agent wait")   exit 0;;
+  "agent wait")
+    # the guard's resume, faked: MGR_TEST_ON_RESUME (if it names an executable)
+    # is what the guard would have done to the builder while mgr parked on it
+    case " $* " in
+      *" --until working "*)
+        if [ -n "${MGR_TEST_ON_RESUME:-}" ] && [ -x "$MGR_TEST_ON_RESUME" ]; then
+          "$MGR_TEST_ON_RESUME"
+        fi;;
+    esac
+    exit 0;;
   "agent prompt") exit 0;;
   *) exit 1;;
 esac
@@ -144,7 +153,14 @@ printf 'mgr-guard %s\n' "$*" >>"$MGR_TEST_LOG"
 case "${1:-}" in
   status) cat "$MGR_TEST_GUARD";;
   stall)
-    if [ -f "$MGR_TEST_STALL" ]; then cat "$MGR_TEST_STALL"; else printf 'null\n'; fi;;
+    # MGR_TEST_RESUMED exists -> the hold is over. MGR_TEST_STALL_AFTER names a
+    # marker the first check creates: the hold lands only after that check.
+    if [ -n "${MGR_TEST_RESUMED:-}" ] && [ -f "$MGR_TEST_RESUMED" ]; then
+      printf 'null\n'
+    elif [ -n "${MGR_TEST_STALL_AFTER:-}" ] && [ ! -f "$MGR_TEST_STALL_AFTER" ]; then
+      : >"$MGR_TEST_STALL_AFTER"; printf 'null\n'
+    elif [ -f "$MGR_TEST_STALL" ]; then cat "$MGR_TEST_STALL"
+    else printf 'null\n'; fi;;
   priority)
     shift
     if [ $# -eq 0 ]; then
@@ -164,7 +180,13 @@ case "${1:-}" in
   *) printf '{"error":{"code":2,"message":"usage"}}\n' >&2; exit 2;;
 esac
 EOF
-chmod +x "$bin/gh" "$bin/herdr" "$bin/mgr-guard"
+# what the guard does while mgr parks on `--until working`: it brings the
+# builder back, so every later stall check comes back empty
+cat >"$bin/on-resume" <<'EOF'
+#!/usr/bin/env bash
+: >"$MGR_TEST_RESUMED"
+EOF
+chmod +x "$bin/gh" "$bin/herdr" "$bin/mgr-guard" "$bin/on-resume"
 
 # ------------------------------------------------------------------ env
 
@@ -176,6 +198,9 @@ export MGR_TEST_LOG="$tmp/calls.log"
 export MGR_TEST_REGISTER="$tmp/register.log"
 export MGR_TEST_GUARD="$fix/guard-running.json"
 export MGR_TEST_STALL="$fix/stall-49.json"
+export MGR_TEST_RESUMED="$tmp/resumed"
+export MGR_TEST_ON_RESUME=            # set per case; empty = the guard does nothing
+export MGR_TEST_STALL_AFTER=          # set per case; the hold lands after check #1
 export HERDR_WORKSPACE_ID=w9
 export HERDR_PANE_ID=w9:p1
 export HERDR_TAB_ID=w9:t1
@@ -191,6 +216,14 @@ check() { # check <name> <expected> <actual>
     printf 'FAIL %s\n       expected: %s\n       actual:   %s\n' "$1" "$2" "$3"
     fails=$((fails + 1))
   fi
+}
+
+# the wait/stall calls mgr made, in order — one token each
+calls() {
+  sed -n 's/^herdr agent wait issue-49 --until working$/park/p
+          s/^herdr agent wait issue-49$/settle/p
+          s/^mgr-guard stall --pane .*/stall/p' "$MGR_TEST_LOG" \
+    | tr '\n' ' ' | sed 's/ *$//'
 }
 
 # --------------------------------------------------- 1. throttled board
@@ -295,25 +328,60 @@ check 'usage lists guard' 1 "$("$MGR" --help | grep -c 'mgr guard <start|stop|st
 check 'usage lists MGR_GUARD_BIN' 1 "$("$MGR" --help | grep -c 'MGR_GUARD_BIN')"
 check 'usage lists priority' 1 "$("$MGR" --help | grep -c 'mgr priority \[N|--clear\]')"
 
-# --------------------------------------------------- 6. guard running: reignition wait
+# --------------------------------------------------- 6. guard running: the wait rides it out
 
-printf '\n# 6. guard running: wait parks on --until working, then re-checks the stall\n'
+printf '\n# 6. guard running: the wait parks on the resume and keeps going\n'
 export MGR_TEST_GUARD="$fix/guard-running.json"
+export MGR_TEST_ON_RESUME="$bin/on-resume"
+rm -f "$MGR_TEST_RESUMED"; : >"$MGR_TEST_LOG"
 out=$("$MGR" wait 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'agent_status passthrough' blocked "$(jq -r '.agent_status' <<<"$out")"
+check 'no stall key'          false "$(jq -r 'has("stall")' <<<"$out")"
+check 'wait report'            null "$(jq -r '.report' <<<"$out")"
+check 'parked, settled, re-checked the stall' 'stall park settle stall' "$(calls)"
+
+printf '\n# 6b. --no-quota-block returns the hold to the caller instead\n'
+export MGR_TEST_ON_RESUME=
+rm -f "$MGR_TEST_RESUMED"; : >"$MGR_TEST_LOG"
+out=$("$MGR" wait 49 --no-quota-block); rc=$?
 check 'wait exit'                 0 "$rc"
 check 'wait agent_status' quota-stalled "$(jq -r '.agent_status' <<<"$out")"
 check 'stall.guard'        running "$(jq -r '.stall.guard' <<<"$out")"
 check 'stall.resets_at from first limit' 1788530000000 \
   "$(jq -r '.stall.resets_at' <<<"$out")"
-check 'waited for the reignition' 1 \
-  "$(grep -c 'herdr agent wait issue-49 --until working' "$MGR_TEST_LOG")"
-check 'then waited for the settle' 1 \
-  "$(grep -cx 'herdr agent wait issue-49' "$MGR_TEST_LOG")"
+check 'parked once, settled once, then gave up' 'stall park settle stall' "$(calls)"
+
+printf '\n# 6c. the hold lands after the settle: the loop parks and waits it out\n'
+export MGR_TEST_ON_RESUME="$bin/on-resume"
+export MGR_TEST_STALL_AFTER="$tmp/held-after"
+rm -f "$MGR_TEST_RESUMED" "$MGR_TEST_STALL_AFTER"; : >"$MGR_TEST_LOG"
+out=$("$MGR" wait 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'agent_status passthrough' blocked "$(jq -r '.agent_status' <<<"$out")"
+check 'no stall key'          false "$(jq -r 'has("stall")' <<<"$out")"
+check 'settled, was held, parked, settled again' \
+  'stall settle stall park settle stall' "$(calls)"
+export MGR_TEST_STALL_AFTER=
+
+printf '\n# 6d. wait usage: exactly one target, flag on either side\n'
+err=$("$MGR" wait 49 50 2>&1 >/dev/null); rc=$?
+check 'two targets exit'          2 "$rc"
+check 'two targets message' 'usage: mgr wait <N|pane_id> [--no-quota-block]' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" wait --no-quota-block 2>&1 >/dev/null); rc=$?
+check 'no target exit'            2 "$rc"
+check 'usage lists --no-quota-block' 1 \
+  "$("$MGR" --help | grep -c 'mgr wait <N|pane_id> \[--no-quota-block\]')"
+check 'usage lists the 60s resume cooldown' 1 \
+  "$("$MGR" --help | grep -c 'MGR_GUARD_RESUME_COOLDOWN_S.*(60)')"
 
 # --------------------------------------------------- 7. not stalled: ordinary result
 
 printf '\n# 7. builder not stalled: the ordinary wait result\n'
 export MGR_TEST_STALL="$tmp/no-stall.json"   # absent -> the guard prints null
+export MGR_TEST_ON_RESUME=
+rm -f "$MGR_TEST_RESUMED"
 out=$("$MGR" wait 49)
 check 'agent_status passthrough' blocked "$(jq -r '.agent_status' <<<"$out")"
 check 'no stall key'          false "$(jq -r 'has("stall")' <<<"$out")"
@@ -373,7 +441,7 @@ check 'quota.managers[].paused' true "$(jq -r '.quota.managers[0].paused' <<<"$o
 printf '\n# 10. wait on a builder the guard paused for a higher-priority project\n'
 export MGR_TEST_STALL="$fix/stall-49-paused.json"
 export MGR_TEST_GUARD="$fix/guard-paused-stopped.json"
-: >"$MGR_TEST_LOG"
+rm -f "$MGR_TEST_RESUMED"; : >"$MGR_TEST_LOG"
 out=$("$MGR" wait 49); rc=$?
 check 'wait exit'                 0 "$rc"
 check 'wait number'              49 "$(jq -r '.number' <<<"$out")"
@@ -390,16 +458,27 @@ check 'the guard was asked about this pane' 1 \
 check 'no herdr agent wait when guard is down' 0 \
   "$(grep -c 'herdr agent wait' "$MGR_TEST_LOG" || true)"
 
-printf '\n# 10b. guard running: a paused builder parks on the resume, same as a 429\n'
+printf '\n# 10b. guard running: a paused builder is waited out, same as a 429\n'
 export MGR_TEST_GUARD="$fix/guard-paused.json"
-: >"$MGR_TEST_LOG"
-out=$("$MGR" wait 49)
+export MGR_TEST_ON_RESUME="$bin/on-resume"
+rm -f "$MGR_TEST_RESUMED"; : >"$MGR_TEST_LOG"
+out=$("$MGR" wait 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'agent_status passthrough' blocked "$(jq -r '.agent_status' <<<"$out")"
+check 'no stall key'          false "$(jq -r 'has("stall")' <<<"$out")"
+check 'wait report'            null "$(jq -r '.report' <<<"$out")"
+check 'parked, settled, re-checked the stall' 'stall park settle stall' "$(calls)"
+
+printf '\n# 10c. --no-quota-block, flag first: the pause is returned to the caller\n'
+export MGR_TEST_ON_RESUME=
+rm -f "$MGR_TEST_RESUMED"; : >"$MGR_TEST_LOG"
+out=$("$MGR" wait --no-quota-block 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'wait number'              49 "$(jq -r '.number' <<<"$out")"
 check 'wait agent_status' quota-paused "$(jq -r '.agent_status' <<<"$out")"
+check 'stall.cause'         paused "$(jq -r '.stall.cause' <<<"$out")"
 check 'stall.guard'        running "$(jq -r '.stall.guard' <<<"$out")"
-check 'parked on the resume' 1 \
-  "$(grep -c 'herdr agent wait issue-49 --until working' "$MGR_TEST_LOG")"
-check 'then waited for the settle' 1 \
-  "$(grep -cx 'herdr agent wait issue-49' "$MGR_TEST_LOG")"
+check 'parked once, settled once, then gave up' 'stall park settle stall' "$(calls)"
 
 # --------------------------------------------------- 11. self-location
 

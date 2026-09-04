@@ -679,8 +679,15 @@ cmd_parse_report() {
 # ---------------------------------------------------------------- wait
 
 cmd_wait() {
-  local arg="${1:-}"
-  [ -n "$arg" ] || die 2 "usage: mgr wait <N|pane_id>"
+  local arg="" no_quota_block=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-quota-block) no_quota_block=true; shift;;
+      *) [ -n "$arg" ] && die 2 "usage: mgr wait <N|pane_id> [--no-quota-block]"
+         arg="$1"; shift;;
+    esac
+  done
+  [ -n "$arg" ] || die 2 "usage: mgr wait <N|pane_id> [--no-quota-block]"
   local target n=""
   case "$arg" in
     ''|*[!0-9]*) target="$arg";;
@@ -712,36 +719,50 @@ cmd_wait() {
     fi
   fi
 
-  herdr agent wait "$target" >/dev/null 2>&1 || true
+  # the settle, then the verdict — and by default the verdict may be "the guard
+  # is holding it again", which is not an answer for the caller but another lap.
+  local report
+  while :; do
+    herdr agent wait "$target" >/dev/null 2>&1 || true
 
-  got=$(herdr agent get "$target" 2>/dev/null) || die 4 "agent target $target is not live"
-  status=$(jq -r '.result.agent.agent_status // "unknown"' <<<"$got")
-  name=$(jq -r '.result.agent.name // ""' <<<"$got")
-  pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
-  sess=$(jq -r '.result.agent.agent_session.value // empty' <<<"$got")
-  if [ -z "$n" ]; then
-    case "$name" in issue-*) n="${name#issue-}";; esac
-    case "$n" in ''|*[!0-9]*) n="";; esac
-  fi
-
-  local report='null'
-  if [ -n "$n" ]; then
-    report=$(parse_report "$n")
-    if [ "$(jq -r '.status // ""' <<<"$report")" = "awaiting-approval" ]; then
-      ensure_labels
-      gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
-        || warn "could not swap labels on #$n"
+    got=$(herdr agent get "$target" 2>/dev/null) || die 4 "agent target $target is not live"
+    status=$(jq -r '.result.agent.agent_status // "unknown"' <<<"$got")
+    name=$(jq -r '.result.agent.name // ""' <<<"$got")
+    pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
+    sess=$(jq -r '.result.agent.agent_session.value // empty' <<<"$got")
+    if [ -z "$n" ]; then
+      case "$name" in issue-*) n="${name#issue-}";; esac
+      case "$n" in ''|*[!0-9]*) n="";; esac
     fi
-  fi
 
-  # (b) it settled with no fresh report because the guard is holding it again
-  if [ "$report" = null ] && [ "$status" != working ]; then
-    stall=$(guard_stall "$pane" "$sess" || true)
-    if [ -n "$stall" ]; then
-      quota_stalled_json "$n" "$pane" "$stall"
-      return 0
+    report='null'
+    if [ -n "$n" ]; then
+      report=$(parse_report "$n")
+      if [ "$(jq -r '.status // ""' <<<"$report")" = "awaiting-approval" ]; then
+        ensure_labels
+        gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
+          || warn "could not swap labels on #$n"
+      fi
     fi
-  fi
+
+    # (b) it settled with no fresh report because the guard is holding it again.
+    # Reviving it is the guard's own job, so a running guard just means another
+    # lap; with no guard nobody will, and the caller has to hear about it. The
+    # cached verdict is dropped first — a guard that died mid-wait must show up.
+    if [ "$report" = null ] && [ "$status" != working ]; then
+      MGR_GUARD_CACHE=""
+      stall=$(guard_stall "$pane" "$sess" || true)
+      if [ -n "$stall" ]; then
+        if [ "$no_quota_block" = false ] && [ "$(guard_state | jq -r '.guard')" = running ]; then
+          herdr agent wait "$target" --until working >/dev/null 2>&1 || true
+          continue
+        fi
+        quota_stalled_json "$n" "$pane" "$stall"
+        return 0
+      fi
+    fi
+    break
+  done
 
   jq -nc --arg n "$n" --arg pane "$pane" --arg st "$status" --argjson report "$report" \
     '{number:(if $n=="" then null else ($n|tonumber) end), pane_id:$pane,
@@ -883,7 +904,9 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
                                       without N it self-registers via `mgr bind`)
   mgr bind <N>                        run BY a builder in its own pane to bind to issue N
-  mgr wait <N|pane_id>                block until the builder settles; report its status
+  mgr wait <N|pane_id> [--no-quota-block]
+                                      block until the builder reports; quota holds are
+                                      waited through (--no-quota-block: return on them)
   mgr prompt <N> <text...>            send text to builder issue-N
   mgr retire <N> [--close]            close tab, remove worktree/branch, clear labels
   mgr guard <start|stop|status>       the deterministic quota-guard daemon: start is
@@ -897,7 +920,7 @@ mgr — manager CLI for herdr-hosted omp builders
 env: MGR_CAP        default concurrency cap
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
-     MGR_GUARD_RESUME_COOLDOWN_S  seconds before a paused builder may resume (300)
+     MGR_GUARD_RESUME_COOLDOWN_S  seconds before a paused builder may resume (60)
 EOF
 }
 
