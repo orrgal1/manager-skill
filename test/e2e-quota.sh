@@ -191,7 +191,7 @@ bd=$("$ROOT/bin/mgr" board --cap 3)
 is "cap_effective without guard" "$(jq -r '.cap_effective' <<<"$bd")" 3
 is "quota.guard" "$(jq -r '.quota.guard' <<<"$bd")" stopped
 
-echo "# 9. priorities: this project (acme/proj, w3) is low, acme/shape (w9) is high; constrained -> w3 paused"
+echo "# 9. priorities: this project (acme/proj, w3) is low, acme/shape (w9) is high; w3's cap is derived down to 1 and the quota constrains it to 0 -> paused"
 bd=$("$ROOT/bin/mgr" priority 2)
 is "mgr priority sets acme/proj" "$(jq -c '[.repo,.priority]' <<<"$bd")" '["acme/proj",2]'
 "$ROOT/bin/mgr-guard" priority acme/shape 8 >/dev/null
@@ -208,6 +208,13 @@ is "constrained" "$(jq -r '.constrained' <<<"$st")" true
 is "allowed_total" "$(jq -r '.allowed_total' <<<"$st")" 1
 is "w9 (prio 8) allotment" "$(jq -r '.managers["ws-w9"].allotment' <<<"$st")" 1
 is "w3 (prio 2) allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 0
+is "top_priority" "$(jq -r '.top_priority' <<<"$st")" 8
+is "top_cap" "$(jq -r '.top_cap' <<<"$st")" 3
+# floor(3 * 2 / 8) = 0, lifted to the one-slot floor; w9 sets the scale and keeps its cap
+is "w3 derived_cap" "$(jq -r '.managers["ws-w3"].derived_cap' <<<"$st")" 1
+is "w9 derived_cap" "$(jq -r '.managers["ws-w9"].derived_cap' <<<"$st")" 3
+is "w3 demand stays the registered 3" "$(jq -r '.managers["ws-w3"].demand' <<<"$st")" 3
+is "w3 demand_effective" "$(jq -r '.managers["ws-w3"].demand_effective' <<<"$st")" 1
 is "w3 paused" "$(jq -r '.managers["ws-w3"].paused' <<<"$st")" true
 is "esc sent to issue-50" "$(cat "$T/keys.log")" "w3:p3 esc"
 is "paused entry" "$(jq -r '[.stalled[] | select(.cause=="paused")] | .[0].name' <<<"$st")" issue-50
@@ -225,6 +232,12 @@ is "quota.paused_builders" "$(jq -c '.quota.paused_builders' <<<"$bd")" '[50]'
 is "quota.stalled (429 only)" "$(jq -c '.quota.stalled' <<<"$bd")" '[49]'
 is "in_flight 50 quota_paused" "$(jq -r '.in_flight[] | select(.number==50) | .quota_paused' <<<"$bd")" true
 is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 0
+is "quota.derived_cap" "$(jq -r '.quota.derived_cap' <<<"$bd")" 1
+# the quota bites harder than the derived cap here (allotment 0 < derived 1), so the
+# board keeps reporting the provider reason
+case "$(jq -r '.quota.reason' <<<"$bd")" in "projected 1.9 > 1 on anthropic:5h"*) ok "quota.reason is the provider reason";; *) bad "quota.reason: $(jq -r '.quota.reason' <<<"$bd")";; esac
+is "quota.managers key order" "$(jq -c '.quota.managers[0] | keys_unsorted' <<<"$bd")" \
+  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","priority","paused"]'
 : >"$T/waits.log"
 out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50)
 is "wait status" "$(jq -r '.agent_status' <<<"$out")" quota-paused
@@ -232,18 +245,53 @@ is "stall.cause" "$(jq -r '.stall.cause' <<<"$out")" paused
 is "parked --until working first" "$(head -1 "$T/waits.log")" "issue-50 --until working"
 guard_gone
 
-echo "# 11. quota back: w3 gets room again and issue-50 is resumed after the cooldown"
+echo "# 11. quota back, but the derived cap still holds w3 to one slot"
 : >"$MGR_STATE_DIR/samples.jsonl"; usage_file ok 0.1 "$R2" >"$FAKE_USAGE"; : >"$T/prompts.log"
 st=$(MGR_GUARD_NOW_MS=$((NOW2 + 60000)) "$ROOT/bin/mgr-guard" tick)   # inside the 300s cooldown
 is "constrained now false" "$(jq -r '.constrained' <<<"$st")" false
-is "w3 allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 3
-# w3 has room again, so the 429-stalled issue-49 (w3:p2) is reignited now; the paused issue-50 waits out the cooldown
-is "429 reignite now that w3 has room" "$(cut -f1 "$T/prompts.log")" w3:p2
+is "w3 derived_cap unchanged by the quota" "$(jq -r '.managers["ws-w3"].derived_cap' <<<"$st")" 1
+is "w3 demand_effective" "$(jq -r '.managers["ws-w3"].demand_effective' <<<"$st")" 1
+is "w3 allotment is the derived cap, not the demand" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 1
+is "w9 allotment" "$(jq -r '.managers["ws-w9"].allotment' <<<"$st")" 2
+# one slot is still room, so the 429-stalled issue-49 (w3:p2) is reignited; the paused issue-50 waits out the cooldown
+is "429 reignite now that w3 has a slot" "$(cut -f1 "$T/prompts.log")" w3:p2
 is "no resume inside cooldown" "$(cut -f1 "$T/prompts.log" | { grep -c 'w3:p3' || true; })" 0
+
+echo "# 12. board/launch: the derived cap, not the provider, is now the binding limit"
+guard_alive
+bd=$(MGR_GUARD_NOW_MS=$((NOW2 + 60000)) "$ROOT/bin/mgr" board --cap 3)
+is "quota.derived_cap" "$(jq -r '.quota.derived_cap' <<<"$bd")" 1
+is "quota.allotment" "$(jq -r '.quota.allotment' <<<"$bd")" 1
+is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 1
+is "quota.reason" "$(jq -r '.quota.reason' <<<"$bd")" 'priority 2 vs top 8 (cap 3) → cap 1'
+set +e
+err=$(MGR_GUARD_NOW_MS=$((NOW2 + 60000)) "$ROOT/bin/mgr" launch 51 --cap 3 2>&1 >/dev/null); rc=$?
+set -e
+is "launch exit" "$rc" 3
+is "launch refusal names the derived cap" "$(jq -r '.error.message' <<<"$err")" \
+  'no free slots (cap=3, cap_effective=1, quota: priority 2 vs top 8 (cap 3) → cap 1)'
+guard_gone
+
+echo "# 13. the reignited issue-49 takes the only slot, so issue-50 stays paused past the cooldown"
+jq -c '(.result.agents[] | select(.name=="issue-49") | .agent_status) = "working"' "$AGENTS" >"$AGENTS.new" && mv "$AGENTS.new" "$AGENTS"
 st=$(MGR_GUARD_NOW_MS=$((NOW2 + 400000)) "$ROOT/bin/mgr-guard" tick)
+is "issue-49 is back to work" "$(jq -r '.managers["ws-w3"].active_builders' <<<"$st")" 1
+is "w3 allotment still 1" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 1
+is "429 entry gone once it works again" "$(jq -r '[.stalled[] | select(.cause=="429")] | length' <<<"$st")" 0
+is "no resume past the cooldown: no room" "$(awk -F'\t' '$1=="w3:p3"' "$T/prompts.log" | wc -l | tr -d ' ')" 0
+is "paused entry survives" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 1
+is "w3 still paused" "$(jq -r '.managers["ws-w3"].paused' <<<"$st")" true
+
+echo "# 14. mgr priority 8 ties with acme/shape -> derived cap 3 and issue-50 resumes"
+"$ROOT/bin/mgr" priority 8 >/dev/null
+st=$(MGR_GUARD_NOW_MS=$((NOW2 + 410000)) "$ROOT/bin/mgr-guard" tick)
+is "top_priority" "$(jq -r '.top_priority' <<<"$st")" 8
+is "top_cap (max cap of the tied top)" "$(jq -r '.top_cap' <<<"$st")" 3
+is "w3 derived_cap" "$(jq -r '.managers["ws-w3"].derived_cap' <<<"$st")" 3
+is "w3 allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 3
 resume=$(awk -F'\t' '$1=="w3:p3"{print $2}' "$T/prompts.log")
 is "resume prompt sent once" "$(awk -F'\t' '$1=="w3:p3"' "$T/prompts.log" | wc -l | tr -d ' ')" 1
-case "$resume" in "mgr-guard: this project's quota allotment is back (priority 2, allotment 3)."*) ok "resume text";; *) bad "resume text: $resume";; esac
+case "$resume" in "mgr-guard: this project's quota allotment is back (priority 8, allotment 3)."*) ok "resume text";; *) bad "resume text: $resume";; esac
 is "paused entry removed" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 0
 is "resumed event" "$(jq -r '[.events[] | select(.kind=="resumed")] | length' <<<"$st")" 1
 is "w3 no longer paused" "$(jq -r '.managers["ws-w3"].paused' <<<"$st")" false

@@ -75,7 +75,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | I want to approve that one myself | adds `mgr:manual-approve` before launching |
 | what's on the board | `mgr board` as a table |
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
-| set the priority to 8 | `mgr priority 8` — this project outranks the others when quota is tight |
+| set the priority to 8 | `mgr priority 8` — outranks the others when quota is tight, and scales this project's cap ceiling toward the top project's the further behind it is |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Headless use
@@ -150,10 +150,20 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
   refuses — it returns `over_cap: true`, because leaving live work unmanaged is worse. Guard
   stopped or stale → no throttle at all.
 - **Priorities.** Each project (repo) has a priority — `mgr priority N`, default 5, higher wins,
-  machine-wide. While quota is constrained the guard serves whole tiers top-down instead of
-  sharing evenly, so a bottom tier can drop to `allotment: 0`: its builders are interrupted with
-  `esc` and resumed by the guard itself once the share is back. `mgr priority 0` is how you park a
-  project — it is the bottom tier, so it is the first to be squeezed and the last to be served.
+  machine-wide. It does two things. First, constrained or not, it derives a cap ceiling: the
+  top-priority live project keeps its own cap, every other project gets
+  `derived_cap = max(1, floor(top_cap × priority / top_priority))`, so its effective cap is
+  `min(cap, derived_cap)`; its demand (what it actually has to run, never more than that) enters
+  the allotment, and water-filling can only lower it further, never raise it. `top_cap` is the
+  top project's `--cap` (not its momentary allotment, so the numbers are stable); ties at the
+  top all keep their own cap. Example: top project priority 10, cap 3; a
+  project at priority 5 gets `floor(3 × 5/10) = 1`, so with its own cap 3 it runs at
+  `min(3, 1) = 1`, and with its own cap 1 or less its own cap wins; priority 1 still gets
+  `max(1, floor(0.3)) = 1`. No project derives below 1, so this is not how you pause one.
+  Second, while quota is constrained the guard serves whole tiers top-down instead of sharing
+  evenly, so a bottom tier can drop to `allotment: 0`: its builders are interrupted with `esc`
+  and resumed by the guard itself once the share is back. `mgr priority 0` is the bottom tier —
+  first to be squeezed, last to be served — which is how a project is parked today.
 - **Stall detection.** For every `issue-*`, `adopt-*` and `manager*` agent that is not working, the
   guard reads the tail of the omp session JSONL: a last assistant message that stopped on an error
   with a 429 / rate-limit / quota-exhausted body is a stall.

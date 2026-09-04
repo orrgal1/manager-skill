@@ -220,10 +220,10 @@ Trust the report, not the idle state.
 | set the cap to N | `$MGR config set cap N` (persisted in the repo, shared by every worktree), then `$MGR board`. `cap_effective` can still be lower when the guard throttles — report that instead of raising the cap |
 | run builders with extra omp args / env / an extra brief directive | `$MGR config add omp-arg <arg>` (repeat; order kept) / `$MGR config add env KEY=VALUE` / `$MGR config set brief-extra /abs/file.md`. `omp-arg` and `env` reach newly launched builders only; `brief-extra` also reaches adopted ones |
 | show the harness config | `$MGR config list` |
-| set priority to N / this project is more important than … | `$MGR priority N`, then `$MGR board` and report the new `quota.priority` / `quota.allotment`. The number is machine-wide per repo (default 5, higher wins) and only bites when quota is constrained: the guard serves whole priority tiers top-down, so the lowest tiers lose their builders first |
-| pause this project | `$MGR priority 0` — the bottom tier gets nothing while quota is constrained, so the guard interrupts this project's builders and resumes them itself when the quota or the priority comes back. Tabs, worktrees and issues are untouched; this is not `cancel` |
+| set priority to N / this project is more important than … | `$MGR priority N`, then `$MGR board` and report the new `quota.priority` / `quota.derived_cap` / `quota.allotment`. The number is machine-wide per repo (default 5, higher wins). It scales this project's cap ceiling toward the top-priority project's — `derived_cap = max(1, floor(top_cap × priority / top_priority))`, never below 1 — whether or not quota is constrained; and once quota *is* constrained the guard also serves whole priority tiers top-down, so the lowest tiers lose their builders first |
+| pause this project | `$MGR priority 0` — the bottom tier: while quota is constrained the guard interrupts this project's builders and resumes them itself when the quota or the priority comes back. Its derived cap ceiling still floors to `1` (the formula never goes to 0); pausing works through water-filling and tier order, not the derived cap. Tabs, worktrees and issues are untouched; this is not `cancel` |
 | status / what's on the board | `$MGR board`, reported as a short table |
-| quota status | `$MGR guard status`, reported as a short table: providers, managers with their priorities and allotments, stalled and paused builders |
+| quota status | `$MGR guard status`, reported as a short table: providers, managers with their priorities, derived caps and allotments, stalled and paused builders |
 | dedupe the issues | Intake (a) over the whole open list |
 | adopt the other tabs | **Adoption** |
 | launch the next one | `$MGR board`, then `$MGR launch` the lowest `ready` number |
@@ -272,8 +272,8 @@ Trust the report, not the idle state.
 | `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue |
 | `$MGR guard start [--interval S]` | start the quota-guard daemon; idempotent, shared by all managers |
 | `$MGR guard stop` | stop it — read the Rules before you ever do |
-| `$MGR guard status` | the guard's whole verdict: providers, allowed_total, managers, allotments, stalled |
-| `$MGR priority [N\|--clear]` | this project's priority: no argument reads it, `N` sets it (integer ≥ 0, default 5, higher wins), `--clear` restores the default |
+| `$MGR guard status` | the guard's whole verdict: providers, allowed_total, managers, derived caps, allotments, stalled |
+| `$MGR priority [N\|--clear]` | this project's priority: no argument reads it, `N` sets it (integer ≥ 0, default 5, higher wins), `--clear` restores the default. Scales this project's derived cap ceiling toward the top-priority project's |
 | `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`. Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
 
 Exit codes: `0` ok · `1` unexpected · `2` usage · `3` refused / invalid state · `4` not found.
@@ -292,8 +292,9 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `quota.provider` `status` `used` `resets_at` | the builders' provider, its limit status, used fraction, window reset (ms) |
 | `quota.burn_per_hour` `projected_at_reset` | measured burn rate and where usage lands by the reset |
 | `quota.allowed_total` `allotment` | builders the guard allows machine-wide · this manager's share |
-| `quota.reason` | why, in words — quote it to the operator |
-| `quota.managers` | every live manager: `manager_id`, `repo`, `cap`, `in_flight`, `priority`, `allotment`, `paused`, `live` |
+| `quota.derived_cap` | this project's priority-derived cap ceiling — `max(1, floor(top_cap × priority / top_priority))`, never below 1, `null` when the guard has no live top project. `cap_effective` already reflects it once it is below `allotment` |
+| `quota.reason` | why, in words — quote it to the operator; e.g. `priority 3 vs top 10 (cap 3) → cap 1` when the derived cap, not the quota share, is what is limiting this project |
+| `quota.managers` | every live manager: `manager_id`, `repo`, `cap`, `in_flight`, `derived_cap`, `allotment`, `live`, `priority`, `paused` |
 | `quota.priority` | this repo's priority — default 5, higher wins, machine-wide |
 | `quota.constrained` | `true` when `allowed_total` is below the total demand, so tiers start losing builders |
 | `quota.paused` `quota.paused_builders` | `true` when the guard paused builders of this project · the issue numbers it paused |

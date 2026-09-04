@@ -558,8 +558,15 @@ cmd_board() {
      // ($lims | sort_by(.used // 0) | last)) as $bl |
     ($guard.managers[("ws-" + $ws)] // null) as $me |
     ($me.allotment // null) as $allot |
+    ($me.derived_cap // null) as $derived |
     # no allotment yet (registered after the last tick): the global verdict is the ceiling
     (if $gs == "running" then ([$cap, ($allot // $guard.allowed_total // $cap)] | min) else $cap end) as $capeff |
+    # when the priority-derived cap ceiling bites at least as hard as the quota allotment
+    # it, not the quota, is the binding limit — so say so instead of the provider reason
+    (if $gs == "running" and $derived != null and $derived < $cap and (($allot // $derived) >= $derived)
+     then "priority " + ($me.priority|tostring) + " vs top " + ($guard.top_priority|tostring)
+          + " (cap " + ($guard.top_cap|tostring) + ") → cap " + ($derived|tostring)
+     else $pv.reason // null end) as $qreason |
     # guard-held builders of this workspace, split by why the guard holds them:
     # a 429 comes from the provider, "paused" is the guard keeping quota for a
     # higher-priority project. An entry without a cause predates the split.
@@ -584,13 +591,14 @@ cmd_board() {
             burn_per_hour:($bl.burn_per_hour // null),
             projected_at_reset:($bl.projected_at_reset // null),
             allowed_total:($pv.allowed_total // $guard.allowed_total // null),
-            allotment:$allot, reason:($pv.reason // null),
+            allotment:$allot, derived_cap:$derived, reason:$qreason,
             priority:($guard.priorities[$repo] // 5),
             constrained:($guard.constrained // false),
             paused:($me.paused // false),
             managers:([($guard.managers // {}) | to_entries[]
                        | {manager_id:(.value.manager_id // .key), repo:(.value.repo // null),
                           cap:(.value.cap // null), in_flight:(.value.in_flight // null),
+                          derived_cap:(.value.derived_cap // null),
                           allotment:(.value.allotment // null), live:(.value.live // false),
                           priority:(.value.priority // null), paused:(.value.paused // false)}]
                       | sort_by(.manager_id)),
