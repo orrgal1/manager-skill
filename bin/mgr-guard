@@ -1,0 +1,708 @@
+#!/usr/bin/env bash
+# mgr-guard — deterministic quota guard for mgr-managed omp builders.
+# Watches provider usage, projects burn to window reset, dials concurrency,
+# detects rate-limit stalls in session JSONLs and re-prompts them when the
+# quota is back. No agent, no LLM: pure bash + jq.
+# Deps: jq (hard), omp + herdr (soft: their failures degrade a single entry).
+# All stdout is JSON; errors are JSON on stderr.
+set -euo pipefail
+
+# ---------------------------------------------------------------- primitives
+
+die() { # die <exit-code> <message>
+  local code="$1"; shift
+  jq -nc --argjson c "$code" --arg m "$*" '{error:{code:$c,message:$m}}' >&2
+  exit "$code"
+}
+warn() { printf 'mgr-guard: warning: %s\n' "$*" >&2; }
+
+command -v jq >/dev/null 2>&1 || { printf 'mgr-guard: missing dependency: jq\n' >&2; exit 1; }
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+STATE_DIR="${MGR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mgr-guard}"
+PIDFILE="$STATE_DIR/guard.pid"
+LOGFILE="$STATE_DIR/guard.log"
+STATEFILE="$STATE_DIR/state.json"
+MGRDIR="$STATE_DIR/managers"
+SAMPLES="$STATE_DIR/samples.jsonl"
+LOCKDIR="$STATE_DIR/guard.lock"
+
+INTERVAL_S="${MGR_GUARD_INTERVAL:-60}"
+SLOPE_WINDOW_S="${MGR_GUARD_SLOPE_WINDOW_S:-1800}"
+MIN_SLOPE_SPAN_S="${MGR_GUARD_MIN_SLOPE_SPAN_S:-300}"
+IDLE_EXIT_S="${MGR_GUARD_IDLE_EXIT_S:-1800}"
+NOTIFY="${MGR_GUARD_NOTIFY:-1}"
+
+int_or() { # int_or <value> <fallback>
+  case "${1:-}" in
+    ''|*[!0-9]*) printf '%s' "$2";;
+    *) if [ "$1" -gt 0 ]; then printf '%s' "$1"; else printf '%s' "$2"; fi;;
+  esac
+}
+INTERVAL_S=$(int_or "$INTERVAL_S" 60)
+SLOPE_WINDOW_S=$(int_or "$SLOPE_WINDOW_S" 1800)
+MIN_SLOPE_SPAN_S=$(int_or "$MIN_SLOPE_SPAN_S" 300)
+case "${IDLE_EXIT_S:-}" in ''|*[!0-9]*) IDLE_EXIT_S=1800;; esac
+
+ensure_state_dir() { mkdir -p "$MGRDIR" 2>/dev/null || die 1 "cannot create state dir: $STATE_DIR"; }
+
+now_ms() { # tests pin the clock with MGR_GUARD_NOW_MS
+  if [ -n "${MGR_GUARD_NOW_MS:-}" ]; then printf '%s' "$MGR_GUARD_NOW_MS"; return; fi
+  printf '%s000' "$(date +%s)"
+}
+
+iso_of() { # iso_of <ms>
+  local s=$(( ${1:-0} / 1000 ))
+  date -u -r "$s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown'
+}
+
+log() { # log <level> <msg...>
+  local lvl="$1"; shift
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s %s %s\n' "$(iso_of "$(now_ms)")" "$lvl" "$*" >>"$LOGFILE" 2>/dev/null || true
+}
+
+atomic_write() { # atomic_write <dest>   (content on stdin)
+  local dest="$1" tmp
+  tmp="$(dirname "$dest")/.tmp.$$.${RANDOM}"
+  if cat >"$tmp"; then mv -f "$tmp" "$dest"; else rm -f "$tmp"; return 1; fi
+}
+
+pidfile_pid() {
+  [ -f "$PIDFILE" ] || return 0
+  tr -dc '0-9' <"$PIDFILE" 2>/dev/null || true
+}
+
+live_pid() { # prints the pid when the recorded process is alive
+  local p; p=$(pidfile_pid)
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then printf '%s' "$p"; fi
+}
+
+# ---------------------------------------------------------------- jq programs
+
+RATE_RE='rate.?limit|too many requests|(^|[^0-9])429([^0-9]|$)|resource_exhausted|quota_exhausted|usage.?limit|insufficient_quota|overloaded'
+
+# raw session lines on stdin -> {provider,model,stall}
+JQ_SESSION_FACTS='
+def ts_ms($s):
+  (($s // "") | sub("\\.[0-9]+Z$"; "Z"))
+  | if . == "" then null else ((fromdateiso8601 * 1000)? // null) end;
+[ inputs | (fromjson? // empty) | select(type == "object")
+  | select((.type == "message") and ((.message | type) == "object") and (.message.role == "assistant")) ]
+| (last // null) as $m
+| if $m == null then {provider: null, model: null, stall: null}
+  else ($m.message.errorMessage // "") as $em
+  | {provider: ($m.message.provider // null), model: ($m.message.model // null)}
+    + {stall:
+        (if ($m.message.stopReason == "error")
+            and (($m.message.errorStatus == 429) or ($em | test($re; "i")))
+         then {provider: ($m.message.provider // null),
+               model: ($m.message.model // null),
+               error: ($em | .[0:300]),
+               since: ((ts_ms($m.timestamp)) // $now),
+               retry_after_ms: ((($em | capture("retry-after-ms=(?<n>[0-9]+)") | .n | tonumber)?) // null)}
+         else null end)}
+  end'
+
+# the whole policy: trajectory, verdict, allotments, stall bookkeeping, events
+JQ_POLICY='
+def hrs($ms): $ms / 3600000;
+def r2: (. * 100 | round) / 100;
+def r1: (. * 10 | round) / 10;
+def pct: (. * 100 | round);
+def iso($ms): if $ms == null then "unknown" else (($ms / 1000) | floor | todate) end;
+def slope($s):
+  ($s | length) as $n
+  | if $n < 2 then 0
+    else ((($s | last).t) - (($s | first).t)) as $span
+    | if $span < ($min_span * 1000) then 0
+      else ([$s[] | hrs(.t)]) as $xs | ([$s[] | .used]) as $ys
+        | (($xs | add) / $n) as $mx | (($ys | add) / $n) as $my
+        | ([range(0; $n) | ($xs[.] - $mx) * ($ys[.] - $my)] | add) as $sxy
+        | ([$xs[] | (. - $mx) * (. - $mx)] | add) as $sxx
+        | if $sxx == 0 then 0
+          else (($sxy / $sxx) as $b | if $b < 0 then 0 else $b end) end
+      end
+    end;
+
+# ---- managers: live vs dead registrations
+($managers | map(. + {live: (((.pane_id // "") | IN($panes[])) and ((.seen_at // 0) >= ($now - 3600000)))})) as $mgrs
+| ($mgrs | map(select(.live))) as $live
+| ($mgrs | map(select(.live | not))) as $dead
+| (if ($live | length) == 0 then 1 else ([$live[] | (.cap // 0)] | add) end) as $ceiling
+
+# ---- stalled sessions (upsert against the previous tick)
+| ([ $agents[] | select((.stall != null) and (.agent_status != "working")) ] | map(
+    . as $a | $a.stall as $s
+    | (($s.retry_after_ms // 60000)) as $ra
+    | ($s.since + ([$ra, 900000] | min)) as $first
+    | ((($prev.stalled // []) | map(select(.pane_id == $a.pane_id)) | first) // null) as $p
+    | {pane_id: $a.pane_id, name: $a.name, workspace_id: $a.workspace_id, session: $a.session,
+       provider: $s.provider, model: $s.model, error: $s.error, since: $s.since,
+       retry_after_ms: $s.retry_after_ms}
+      + (if ($p != null) and ($p.since == $s.since)
+         then {attempts: ($p.attempts // 0), last_reignite_at: ($p.last_reignite_at // null),
+               next_reignite_at: ($p.next_reignite_at // $first)}
+         else {attempts: 0, last_reignite_at: null, next_reignite_at: $first} end)
+  )) as $stalled
+| ($stalled | map(.pane_id)) as $spanes
+
+# ---- per-provider trajectory + verdict
+| def active($P): [ $agents[]
+    | select(((.name // "") | test("^(issue-|adopt-)")))
+    | select((.pane_id | IN($spanes[])) | not)
+    | select((.provider == $P) or ((.provider == null) and ($P == $bp))) ] | length;
+  ($reports | map(
+    . as $r
+    | (($r.limits // []) | map(
+        . as $l
+        | ([ $samples[] | select((.provider == $r.provider) and (.limit == $l.id)
+              and (.resets_at == $l.resets_at) and (.t >= ($now - ($slope_window * 1000)))) ]
+           | sort_by(.t)) as $s
+        | slope($s) as $bph
+        | (if ($l.resets_at // null) == null then 0 else hrs([0, ($l.resets_at - $now)] | max) end) as $htr
+        | (($l.used // 0) + ($bph * $htr)) as $proj
+        | {id: $l.id, label: ($l.label // $l.id), status: ($l.status // "unknown"),
+           used: (($l.used // 0) | r2), resets_at: ($l.resets_at // null),
+           burn_per_hour: ($bph | r2), projected_at_reset: ($proj | r2), fits: ($proj <= 1),
+           hours_to_reset: ($htr | r2)}
+      )) as $limits
+    | (active($r.provider)) as $act
+    | ([$limits[] | select((.status == "exhausted") or (.used >= 1))] | sort_by(.resets_at // 0)) as $ex
+    | (if ($limits | length) == 0 then "unknown"
+       elif ($limits | any(.status == "exhausted")) then "exhausted"
+       elif ($limits | any(.status == "warning")) then "warning"
+       else "ok" end) as $pstat
+    | (if ($r.ok | not) then
+         {status: "unknown", binding_limit: null, recovers_at: null, allowed_total: $ceiling,
+          reason: ("unknown: omp usage unavailable for " + $r.provider)}
+       elif ($ex | length) > 0 then
+         (($ex | first)) as $b
+         | {status: "exhausted", binding_limit: $b.id, recovers_at: ($b.resets_at // null),
+            allowed_total: 0,
+            reason: ("exhausted: " + $b.id + " resets at " + iso($b.resets_at // null))}
+       else
+         ([$limits[] | select(.fits | not)]) as $bad
+         | if ($bad | length) > 0 then
+             ([ $bad[] | . as $l
+                | (($l.burn_per_hour * $l.hours_to_reset)) as $den
+                | (if $den <= 0 then $ceiling
+                   else ([1, ((($act) * ((1 - $l.used) / $den)) | floor)] | max) end) as $al
+                | {id: $l.id, allowed: $al, l: $l} ] | sort_by([.allowed, .id])) as $cands
+             | ($cands | first) as $b
+             | {status: $pstat, binding_limit: $b.id, recovers_at: ($b.l.resets_at // null),
+                allowed_total: ([$ceiling, $b.allowed] | min),
+                reason: ("projected " + ($b.l.projected_at_reset | tostring) + " > 1 on " + $b.id
+                         + " (burn " + ($b.l.burn_per_hour | tostring) + "/h, "
+                         + (($b.l.hours_to_reset | r1) | tostring) + "h to reset)")}
+           else
+             ([$limits[] | select(.status == "warning") | (.id + " at " + ((.used | pct) | tostring) + "%")]) as $w
+             | {status: $pstat, binding_limit: null, recovers_at: null, allowed_total: $ceiling,
+                reason: (if ($w | length) > 0 then ("ok (warning: " + ($w | join(", ")) + ")") else "ok" end)}
+           end
+       end) as $v
+    | {key: $r.provider,
+       value: {status: $v.status, fetched_at: ($r.fetched_at // null),
+               limits: ($limits | map(del(.hours_to_reset))),
+               binding_limit: $v.binding_limit, recovers_at: $v.recovers_at,
+               active_builders: $act, ceiling: $ceiling,
+               allowed_total: $v.allowed_total, reason: $v.reason}}
+  ) | from_entries) as $providers
+| ((($providers[$bp] // null) | if . == null then null else .allowed_total end)
+   // ([$providers[] | .allowed_total] | min) // $ceiling) as $allowed_total
+
+# ---- water-filling allotments over live managers
+| ($live | sort_by([(.demand // 0), .manager_id])) as $sorted
+| (reduce range(0; ($sorted | length)) as $i ({rem: $allowed_total, out: []};
+     ((($sorted | length) - $i)) as $left
+     | ((.rem / $left) | floor) as $share
+     | ([($sorted[$i].demand // 0), $share] | min) as $allot
+     | {rem: (.rem - $allot), out: (.out + [$sorted[$i] + {allotment: $allot}])})) as $wf
+| (reduce range(0; ($wf.rem + 1)) as $_ ({rem: $wf.rem, out: ($wf.out | sort_by(.manager_id))};
+     if .rem <= 0 then .
+     else ([.out | to_entries[] | select(.value.allotment < (.value.demand // 0))] | first) as $c
+       | if $c == null then . else {rem: (.rem - 1), out: (.out | (.[$c.key].allotment) += 1)} end
+     end)) as $fill
+
+# ---- events for this tick (reignite events are appended after the prompts run)
+| ([ ($dead[] | {at: $now, kind: "manager_dropped",
+                 detail: (.manager_id + ": "
+                   + (if (((.pane_id // "") | IN($panes[])) | not)
+                      then ("pane " + (.pane_id // "?") + " is gone")
+                      else "heartbeat older than 1h" end))}),
+     ($providers | to_entries[] | . as $e
+       | ((($prev.providers // {})[$e.key] // null) | if . == null then null else .status end) as $ps
+       | if ($e.value.status == "exhausted") and ($ps != "exhausted")
+         then {at: $now, kind: "exhausted", detail: ($e.key + ": " + $e.value.reason)}
+         elif ($ps == "exhausted") and ($e.value.status | IN("ok", "warning"))
+         then {at: $now, kind: "recovered", detail: ($e.key + ": " + $e.value.reason)}
+         else empty end),
+     (if (($prev.allowed_total // null) != $allowed_total)
+      then {at: $now, kind: "allowed_changed",
+            detail: ((($prev.allowed_total // "n/a") | tostring) + " -> " + ($allowed_total | tostring)
+                     + " (" + ((($providers[$bp] // null) | if . == null then "n/a" else .reason end)) + ")")}
+      else empty end) ]) as $events
+
+# ---- reignition candidates
+| ([ $stalled[] | . as $st
+     | (($st.provider // "")) as $pk
+     | (($providers[$pk] // null)) as $pv
+     | ((($pv | if . == null then null else .status end)) // "unknown") as $pst
+     | select($pst != "exhausted")
+     | select($now >= ($st.next_reignite_at // 0))
+     | (((($pv | if . == null then null else .binding_limit end))
+         // ((($pv | if . == null then [] else (.limits // []) end) | first | if . == null then null else .id end))
+         // "quota")) as $lid
+     | (((($pv | if . == null then [] else (.limits // []) end)
+          | map(select(.id == $lid)) | first | if . == null then null else .used end))
+        // ((($pv | if . == null then [] else (.limits // []) end) | map(.used) | max))
+        // 0) as $used
+     | {pane_id: $st.pane_id, provider: ($st.provider // "unknown"), limit: $lid,
+        text: ("mgr-guard: provider quota for " + ($st.provider // "unknown")
+               + " is available again (" + $lid + " at " + (($used | pct) | tostring) + "%)."
+               + " Your previous turn stopped on a rate limit (429)."
+               + " Nobody needs to answer anything — resume exactly where you stopped"
+               + " and continue under your existing instructions.")} ]) as $reignite
+
+| {now: $now, builder_provider: $bp, ceiling: $ceiling, providers: $providers,
+   allowed_total: $allowed_total, managers: $fill.out, dead: ($dead | map(.manager_id)),
+   stalled: $stalled, events: $events, reignite: $reignite}'
+
+# policy output + prompt results -> {state, toasts, log}
+JQ_FINALIZE='
+def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
+($policy.now) as $now
+| ($policy.stalled | map(
+    . as $s
+    | (($results | map(select(.pane_id == $s.pane_id)) | first) // null) as $r
+    | if $r == null then $s
+      elif $r.ok then (($s.attempts // 0) + 1) as $n
+        | $s + {attempts: $n, last_reignite_at: $now, next_reignite_at: ($now + backoff($n))}
+      else (($s.attempts // 0) + 1) as $n
+        | $s + {next_reignite_at: ($now + backoff($n))}
+      end)) as $stalled
+| ([ $results[] | select(.ok) | {at: $now, kind: "reignite",
+      detail: (.pane_id + " (" + .provider + ", " + .limit + ")")} ]) as $rev
+| (($policy.events) + $rev) as $new
+| {state: {version: 1, pid: $pid, tick_at: $now, interval_s: $interval,
+           builder_provider: $policy.builder_provider,
+           providers: $policy.providers,
+           allowed_total: $policy.allowed_total,
+           managers: ($policy.managers | map({key: .manager_id, value: .}) | from_entries),
+           stalled: $stalled,
+           events: ((($prev.events // []) + $new) | .[-50:])},
+   toasts: [ $new[] | select(.kind | IN("exhausted", "recovered", "allowed_changed", "reignite"))
+             | (.kind + ": " + .detail) ],
+   log: ("tick provider=" + $policy.builder_provider
+         + " status=" + ((($policy.providers[$policy.builder_provider] // null)
+                          | if . == null then "unknown" else .status end))
+         + " allowed=" + ($policy.allowed_total | tostring)
+         + " ceiling=" + ($policy.ceiling | tostring)
+         + " active=" + (((($policy.providers[$policy.builder_provider] // null)
+                           | if . == null then 0 else .active_builders end)) | tostring)
+         + " managers=" + (($policy.managers | length) | tostring)
+         + " stalled=" + (($stalled | length) | tostring)
+         + " reignited=" + (($rev | length) | tostring)
+         + " reason=" + ((($policy.providers[$policy.builder_provider] // null)
+                          | if . == null then "n/a" else .reason end)))}'
+
+# ---------------------------------------------------------------- inputs
+
+read_state() {
+  if [ -f "$STATEFILE" ]; then jq -c . "$STATEFILE" 2>/dev/null || printf '{}'
+  else printf '{}'; fi
+}
+
+builder_provider() {
+  local d=""
+  if command -v omp >/dev/null 2>&1; then
+    d=$(omp config list --json 2>/dev/null | jq -r '.modelRoles.value.default // ""' 2>/dev/null) || d=""
+  fi
+  d="${d%%/*}"
+  case "$d" in ''|null) d="anthropic";; esac
+  printf '%s' "$d"
+}
+
+agents_json() { # every agent herdr knows about, or [] when herdr is unusable
+  local a=""
+  if command -v herdr >/dev/null 2>&1; then
+    a=$(herdr agent list 2>/dev/null | jq -c '.result.agents // []' 2>/dev/null) || a=""
+  fi
+  case "$a" in ''|null) a='[]';; esac
+  printf '%s' "$a"
+}
+
+managers_json() {
+  local out="" f j
+  for f in "$MGRDIR"/*.json; do
+    [ -f "$f" ] || continue
+    j=$(jq -c 'select(type == "object" and (.manager_id | type) == "string")' "$f" 2>/dev/null) || continue
+    [ -n "$j" ] || continue
+    out+="$j"$'\n'
+  done
+  printf '%s' "$out" | jq -sc .
+}
+
+session_facts() { # session_facts <file> <now> -> {provider,model,stall}
+  local f="${1:-}" now="$2" size body
+  if [ -z "$f" ] || [ ! -f "$f" ]; then
+    jq -nc '{provider:null,model:null,stall:null}'; return
+  fi
+  size=$(wc -c <"$f" 2>/dev/null | tr -d ' ') || size=0
+  case "$size" in ''|*[!0-9]*) size=0;; esac
+  if [ "$size" -gt 65536 ]; then
+    body=$(tail -c 65536 "$f" 2>/dev/null | sed 1d) || body=""
+  else
+    body=$(cat "$f" 2>/dev/null) || body=""
+  fi
+  printf '%s\n' "$body" \
+    | jq -Rnc --arg re "$RATE_RE" --argjson now "$now" "$JQ_SESSION_FACTS" \
+    || jq -nc '{provider:null,model:null,stall:null}'
+}
+
+scan_agents() { # scan_agents <agents-json> <now> -> array of agent facts
+  local agents="$1" now="$2" a session facts out=""
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    session=$(jq -r '.agent_session.value // ""' <<<"$a")
+    facts=$(session_facts "$session" "$now")
+    out+=$(jq -c --argjson f "$facts" \
+      '{name:(.name // null), pane_id, tab_id:(.tab_id // null),
+        workspace_id:(.workspace_id // null), agent_status:(.agent_status // "unknown"),
+        session:(.agent_session.value // null),
+        provider:$f.provider, model:$f.model, stall:$f.stall}' <<<"$a")
+    out+=$'\n'
+  done < <(jq -c '.[] | select((.agent // "omp") == "omp")
+                       | select(((.name // "") | test("^(issue-|adopt-|manager)")))' <<<"$agents")
+  printf '%s' "$out" | jq -sc .
+}
+
+fetch_provider() { # fetch_provider <provider> <prev-state> -> normalized report
+  local p="$1" prev="$2" u="" rep=""
+  if command -v omp >/dev/null 2>&1; then
+    omp usage invalidate --provider "$p" >/dev/null 2>&1 || true
+    u=$(omp usage --json --provider "$p" 2>/dev/null) || u=""
+  fi
+  if [ -n "$u" ]; then
+    rep=$(jq -c --arg p "$p" '[.reports[]? | select(.provider == $p)] | first // empty' <<<"$u" 2>/dev/null) || rep=""
+  fi
+  if [ -n "$rep" ]; then
+    jq -c --arg p "$p" \
+      '{provider:$p, ok:true, fetched_at:(.fetchedAt // null),
+        limits:[.limits[]? | {id:(.id // "unknown"), label:(.label // .id // "unknown"),
+                              status:(.status // "unknown"),
+                              used:(.amount.usedFraction // 0),
+                              resets_at:(.window.resetsAt // null)}]}' <<<"$rep"
+  else
+    jq -nc --arg p "$p" --argjson prev "$prev" \
+      '(($prev.providers // {})[$p] // {}) as $pp
+       | {provider:$p, ok:false, fetched_at:($pp.fetched_at // null),
+          limits:[($pp.limits // [])[] | {id, label, status, used, resets_at}]}'
+  fi
+}
+
+prune_samples() { # prune_samples <cutoff-ms> -> samples array (and rewrites the file)
+  local keep
+  [ -f "$SAMPLES" ] || { printf '[]'; return; }
+  keep=$(jq -Rnc --argjson cut "$1" \
+    '[inputs | (fromjson? // empty) | select(type == "object" and ((.t // 0) >= $cut))]' \
+    "$SAMPLES" 2>/dev/null) || keep='[]'
+  jq -c '.[]' <<<"$keep" 2>/dev/null | atomic_write "$SAMPLES" || true
+  printf '%s' "$keep"
+}
+
+notify() { # notify <body>
+  [ "$NOTIFY" != 0 ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  herdr notification show "mgr-guard" --body "$1" --sound none >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------- stall
+
+cmd_stall() {
+  local f="${1:-}"
+  [ -n "$f" ] || die 2 "usage: mgr-guard stall <session.jsonl>"
+  [ -e "$f" ] || die 4 "session file not found: $f"
+  session_facts "$f" "$(now_ms)" | jq -c '.stall'
+}
+
+# ---------------------------------------------------------------- register
+
+cmd_register() {
+  local input="${1:-}"
+  [ -n "$input" ] || die 2 "usage: mgr-guard register '<json>'"
+  ensure_state_dir
+  local obj missing badnum mid now out
+  obj=$(jq -c 'select(type == "object")' <<<"$input" 2>/dev/null) || die 2 "register: argument is not valid JSON"
+  [ -n "$obj" ] || die 2 "register: argument must be a JSON object"
+  missing=$(jq -nr --argjson o "$obj" \
+    '["manager_id","workspace_id","pane_id","repo","primary","cap","in_flight","adopting","ready","demand"]
+     | map(select($o[.] == null)) | join(",")')
+  [ -z "$missing" ] || die 2 "register: missing keys: $missing"
+  badnum=$(jq -nr --argjson o "$obj" \
+    '["cap","in_flight","adopting","ready","demand"] | map(select(($o[.] | type) != "number")) | join(",")')
+  [ -z "$badnum" ] || die 2 "register: not numbers: $badnum"
+  mid=$(jq -r '.manager_id' <<<"$obj")
+  case "$mid" in
+    ''|*[!A-Za-z0-9_.:-]*) die 2 "register: manager_id must match [A-Za-z0-9_.:-]+ : $mid";;
+  esac
+  now=$(now_ms)
+  out=$(jq -c --argjson now "$now" '. + {seen_at:$now}' <<<"$obj")
+  printf '%s\n' "$out" | atomic_write "$MGRDIR/$mid.json" || die 1 "cannot write $MGRDIR/$mid.json"
+  printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------- tick
+
+cmd_tick() {
+  ensure_state_dir
+  local now prev bp agents panes facts providers p rep reports='[]' samples managers
+  now=$(now_ms)
+  prev=$(read_state)
+  bp=$(builder_provider)
+  agents=$(agents_json)
+  panes=$(jq -c '[.[] | .pane_id // empty]' <<<"$agents")
+  facts=$(scan_agents "$agents" "$now")
+  managers=$(managers_json)
+
+  providers=$(jq -r --arg bp "$bp" \
+    '([$bp] + [.[] | select(.stall != null) | (.stall.provider // empty)]) | unique | .[]' <<<"$facts")
+
+  for p in $providers; do
+    rep=$(fetch_provider "$p" "$prev")
+    reports=$(jq -c --argjson r "$rep" '. + [$r]' <<<"$reports")
+    if [ "$(jq -r '.ok' <<<"$rep")" = true ]; then
+      jq -c --argjson now "$now" \
+        '. as $r | $r.limits[] | {t:$now, provider:$r.provider, limit:.id,
+                                  used:.used, resets_at:.resets_at, status:.status}' <<<"$rep" \
+        >>"$SAMPLES" 2>/dev/null || warn "cannot append to $SAMPLES"
+    else
+      log warn "usage fetch failed for $p (degraded to unknown)"
+    fi
+  done
+
+  samples=$(prune_samples "$(( now - 86400000 ))")
+
+  local policy
+  policy=$(jq -nc \
+    --argjson now "$now" --arg bp "$bp" \
+    --argjson agents "$facts" --argjson panes "$panes" \
+    --argjson managers "$managers" --argjson prev "$prev" \
+    --argjson reports "$reports" --argjson samples "$samples" \
+    --argjson slope_window "$SLOPE_WINDOW_S" --argjson min_span "$MIN_SLOPE_SPAN_S" \
+    "$JQ_POLICY") || die 1 "policy evaluation failed"
+
+  # dead registrations go away
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    case "$id" in ''|*[!A-Za-z0-9_.:-]*) continue;; esac
+    rm -f "$MGRDIR/$id.json"
+    log info "manager_dropped $id"
+  done < <(jq -r '.dead[]? // empty' <<<"$policy")
+
+  # reignition
+  local results='[]' c pane text ok
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    pane=$(jq -r '.pane_id' <<<"$c")
+    text=$(jq -r '.text' <<<"$c")
+    ok=false
+    if command -v herdr >/dev/null 2>&1 && herdr agent prompt "$pane" "$text" >/dev/null 2>&1; then
+      ok=true
+      log info "reignite $pane ok"
+    else
+      log error "reignite $pane failed (herdr agent prompt)"
+    fi
+    results=$(jq -c --argjson c "$c" --argjson ok "$ok" '. + [$c + {ok:$ok}]' <<<"$results")
+  done < <(jq -c '.reignite[]? // empty' <<<"$policy")
+
+  local final pid
+  pid=$(live_pid); [ -n "$pid" ] || pid=null
+  final=$(jq -nc --argjson policy "$policy" --argjson results "$results" \
+    --argjson prev "$prev" --argjson interval "$INTERVAL_S" --argjson pid "$pid" \
+    "$JQ_FINALIZE") || die 1 "state assembly failed"
+
+  local state
+  state=$(jq -c '.state' <<<"$final")
+  printf '%s\n' "$state" | atomic_write "$STATEFILE" || die 1 "cannot write $STATEFILE"
+
+  log info "$(jq -r '.log' <<<"$final")"
+  local t
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    notify "$t"
+  done < <(jq -r '.toasts[]? // empty' <<<"$final")
+
+  printf '%s\n' "$state"
+}
+
+# ---------------------------------------------------------------- run / start / stop
+
+guard_exit() {
+  rm -f "$PIDFILE"
+  log info "stopped (signal)"
+  exit 0
+}
+
+cmd_run() {
+  ensure_state_dir
+  printf '%s\n' "$$" | atomic_write "$PIDFILE" || die 1 "cannot write $PIDFILE"
+  trap guard_exit TERM INT
+  log info "started pid=$$ interval=${INTERVAL_S}s state_dir=$STATE_DIR"
+  local last_live nlive nowsec
+  last_live=$(( $(now_ms) / 1000 ))
+  while :; do
+    # subshell: a `die` inside the tick must not take the daemon down with it
+    ( cmd_tick ) >/dev/null 2>>"$LOGFILE" || log error "tick failed"
+    nlive=$(jq -r '[.managers[]? | select(.live)] | length' "$STATEFILE" 2>/dev/null || printf '0')
+    case "$nlive" in ''|*[!0-9]*) nlive=0;; esac
+    nowsec=$(( $(now_ms) / 1000 ))
+    if [ "$nlive" -gt 0 ]; then
+      last_live=$nowsec
+    elif [ $(( nowsec - last_live )) -ge "$IDLE_EXIT_S" ]; then
+      log info "idle-exit after ${IDLE_EXIT_S}s with no live manager"
+      rm -f "$PIDFILE"
+      exit 0
+    fi
+    sleep "$INTERVAL_S" &
+    wait $! || true
+  done
+}
+
+cmd_start() {
+  local interval=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) interval="${2:-}"; shift 2;;
+      *) die 2 "usage: mgr-guard start [--interval S]";;
+    esac
+  done
+  if [ -n "$interval" ]; then
+    case "$interval" in ''|*[!0-9]*) die 2 "interval must be a positive integer: $interval";; esac
+    [ "$interval" -gt 0 ] || die 2 "interval must be a positive integer: $interval"
+    INTERVAL_S="$interval"
+  fi
+  ensure_state_dir
+
+  local pid
+  pid=$(live_pid)
+  if [ -n "$pid" ]; then
+    jq -nc --argjson pid "$pid" --arg dir "$STATE_DIR" \
+      '{running:true, pid:$pid, started:false, state_dir:$dir}'
+    return 0
+  fi
+
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    # a stale lock (no live pid, older than 60 s) is ours to clear
+    local age=0 mt
+    mt=$(stat -f %m "$LOCKDIR" 2>/dev/null || printf '0')
+    age=$(( $(date +%s) - mt ))
+    if [ "$age" -ge 60 ]; then
+      rmdir "$LOCKDIR" 2>/dev/null || true
+      mkdir "$LOCKDIR" 2>/dev/null || die 3 "another mgr-guard start is in progress ($LOCKDIR)"
+    else
+      die 3 "another mgr-guard start is in progress ($LOCKDIR)"
+    fi
+  fi
+
+  local newpid=""
+  MGR_GUARD_INTERVAL="$INTERVAL_S" nohup "$SELF" run >>"$LOGFILE" 2>&1 &
+  newpid=$!
+  disown 2>/dev/null || true
+  printf '%s\n' "$newpid" | atomic_write "$PIDFILE" || warn "cannot write $PIDFILE"
+  rmdir "$LOCKDIR" 2>/dev/null || true
+
+  sleep 0.3
+  local running=false
+  kill -0 "$newpid" 2>/dev/null && running=true
+  jq -nc --argjson pid "$newpid" --argjson running "$running" --arg dir "$STATE_DIR" \
+    '{running:$running, pid:$pid, started:true, state_dir:$dir}'
+}
+
+cmd_stop() {
+  local pid
+  pid=$(live_pid)
+  if [ -z "$pid" ]; then
+    rm -f "$PIDFILE"
+    jq -nc '{stopped:false, pid:null}'
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  local i
+  for i in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 0.2
+  fi
+  rm -f "$PIDFILE"
+  local stopped=true
+  kill -0 "$pid" 2>/dev/null && stopped=false
+  log info "stopped pid=$pid"
+  jq -nc --argjson pid "$pid" --argjson stopped "$stopped" '{stopped:$stopped, pid:$pid}'
+}
+
+cmd_status() {
+  local st pid guard="stopped" iv now tick
+  st=$(read_state)
+  pid=$(pidfile_pid)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    iv=$(jq -r '.interval_s // empty' <<<"$st" 2>/dev/null || printf '')
+    iv=$(int_or "$iv" "$INTERVAL_S")
+    tick=$(jq -r '.tick_at // 0' <<<"$st" 2>/dev/null || printf '0')
+    case "$tick" in ''|*[!0-9]*) tick=0;; esac
+    now=$(now_ms)
+    if [ "$tick" -gt 0 ] && [ $(( now - tick )) -le $(( iv * 5 * 1000 )) ]; then
+      guard="running"
+    else
+      guard="stale"
+    fi
+  else
+    pid=""
+  fi
+  jq -nc --argjson st "$st" --arg g "$guard" --arg pid "$pid" \
+    '$st + {guard:$g, pid:(if $pid == "" then null else ($pid | tonumber) end)}'
+}
+
+# ---------------------------------------------------------------- usage
+
+usage() {
+  cat <<'EOF'
+mgr-guard — deterministic quota guard for herdr-hosted omp builders
+
+  mgr-guard start [--interval S]      daemonize the tick loop (idempotent)
+  mgr-guard stop                      SIGTERM the daemon, clear guard.pid
+  mgr-guard status                    state.json + guard/pid (always exit 0)
+  mgr-guard tick                      run one tick in the foreground, print state
+  mgr-guard run                       foreground tick loop (what start daemonizes)
+  mgr-guard register '<json>'         upsert managers/<manager_id>.json with seen_at
+  mgr-guard stall <session.jsonl>     stall object for one omp session, or null
+
+Env: MGR_STATE_DIR MGR_GUARD_INTERVAL MGR_GUARD_SLOPE_WINDOW_S
+     MGR_GUARD_MIN_SLOPE_SPAN_S MGR_GUARD_IDLE_EXIT_S MGR_GUARD_NOTIFY
+EOF
+}
+
+# ---------------------------------------------------------------- dispatch
+
+main() {
+  [ $# -gt 0 ] || { usage; exit 0; }
+  local sub="$1"; shift
+  case "$sub" in
+    start)          cmd_start "$@";;
+    stop)           cmd_stop "$@";;
+    status)         cmd_status "$@";;
+    tick)           cmd_tick "$@";;
+    run)            cmd_run "$@";;
+    register)       cmd_register "$@";;
+    stall)          cmd_stall "$@";;
+    -h|--help|help) usage; exit 0;;
+    *) die 2 "unknown subcommand: $sub (try: mgr-guard --help)";;
+  esac
+}
+
+main "$@"

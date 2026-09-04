@@ -174,6 +174,76 @@ tracked_missing_issues() { # tracked_missing_issues <open-issues-json> <agents-j
   printf '%s' "$out" | jq -sc .
 }
 
+# ---------------------------------------------------------------- quota guard
+
+# The deterministic quota daemon lives next to this script; MGR_GUARD_BIN
+# overrides it (tests point it at a fake).
+guard_bin="${MGR_GUARD_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mgr-guard}"
+
+# `mgr-guard status` (state.json + {guard,pid}); a missing or failing binary is
+# indistinguishable from a stopped guard, and a stopped guard throttles nothing.
+guard_state() {
+  [ -n "${MGR_GUARD_CACHE:-}" ] && { printf '%s' "$MGR_GUARD_CACHE"; return; }
+  local out=""
+  if [ -x "$guard_bin" ]; then
+    out=$("$guard_bin" status 2>/dev/null) || out=""
+  fi
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$out" || out='{"guard":"stopped"}'
+  MGR_GUARD_CACHE=$(jq -c '. + {guard:(.guard // "stopped")}' <<<"$out")
+  printf '%s' "$MGR_GUARD_CACHE"
+}
+
+guard_stall() { # guard_stall <session.jsonl> -> stall object, or nothing
+  local path="${1:-}" out=""
+  [ -n "$path" ] || return 0
+  [ -x "$guard_bin" ] || return 0
+  out=$("$guard_bin" stall "$path" 2>/dev/null) || return 0
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$out" || return 0
+  jq -c . <<<"$out"
+}
+
+# One registration per board call: cheap (the guard only writes one small file)
+# and idempotent — it refreshes seen_at and the demand numbers, nothing else.
+# `mgr-guard register` rejects a null pane_id, so a pane-less shell just skips.
+guard_heartbeat() { # guard_heartbeat <board-json>
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || return 0
+  [ -n "${HERDR_PANE_ID:-}" ] || return 0
+  [ -x "$guard_bin" ] || return 0
+  local reg
+  reg=$(jq -c --arg ws "$HERDR_WORKSPACE_ID" --arg pane "$HERDR_PANE_ID" '
+    (.in_flight|length) as $if | (.adopting|length) as $ad | (.ready|length) as $rd |
+    {manager_id:("ws-" + $ws), workspace_id:$ws, pane_id:$pane,
+     repo:.repo, primary:.primary, cap:.cap,
+     in_flight:$if, adopting:$ad, ready:$rd,
+     demand:([.cap, ($if + $ad + $rd)] | min)}' <<<"$1") \
+    || { warn "could not build the mgr-guard registration"; return 0; }
+  "$guard_bin" register "$reg" >/dev/null 2>&1 || warn "mgr-guard register failed"
+}
+
+# the `mgr wait` answer for a builder that is dead on a provider rate limit
+quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
+  local gst
+  gst=$(guard_state)
+  jq -nc --arg n "$1" --arg pane "$2" --argjson stall "$3" --argjson g "$gst" '
+    ($stall.provider // null) as $p |
+    (if $p == null then null else ($g.providers[$p] // null) end) as $pv |
+    (($pv.recovers_at // ([($pv.limits // [])[] | .resets_at] | .[0])) // null) as $resets |
+    {number:(if $n == "" then null else ($n|tonumber) end), pane_id:$pane,
+     agent_status:"quota-stalled",
+     stall:($stall + {resets_at:$resets, guard:($g.guard // "stopped")}),
+     report:null}'
+}
+
+cmd_guard() {
+  local sub="${1:-}"
+  case "$sub" in
+    start|stop|status) ;;
+    *) die 2 "usage: mgr guard <start|stop|status>";;
+  esac
+  [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
+  exec "$guard_bin" "$@"
+}
+
 # ---------------------------------------------------------------- board
 
 cmd_board() {
@@ -188,18 +258,20 @@ cmd_board() {
 
   # resolved before the jq call: `die` inside a command substitution would only
   # kill its own subshell, so each of these must be its own simple command.
-  local b_repo b_primary b_issues b_agents b_extra
+  local b_repo b_primary b_issues b_agents b_extra b_guard board
   b_repo=$(repo)
   b_primary=$(primary)
   b_issues=$(open_issues)
   b_agents=$(ws_agents)
   b_extra=$(tracked_missing_issues "$b_issues" "$b_agents")
+  b_guard=$(guard_state)
 
-  jq -n \
+  board=$(jq -n \
     --argjson issues "$b_issues" \
     --argjson extra "$b_extra" \
     --argjson ag "$b_agents" \
     --argjson cap "$cap" \
+    --argjson guard "$b_guard" \
     --arg repo "$b_repo" \
     --arg primary "$b_primary" \
     --arg ws "${HERDR_WORKSPACE_ID:-}" \
@@ -251,16 +323,43 @@ cmd_board() {
                  title:([$I[] | select(.number==$n) | .title][0] // null),
                  reason:"agent-without-label"})
      ] | unique_by([.number,.reason]) | sort_by(.number)) as $orphans |
+    ($guard.guard // "stopped") as $gs |
+    ($guard.builder_provider // null) as $prov |
+    (if $prov == null then null else ($guard.providers[$prov] // null) end) as $pv |
+    ($pv.limits // []) as $lims |
+    ((if ($pv.binding_limit // null) == null then null
+      else ([$lims[] | select(.id == $pv.binding_limit)] | .[0]) end)
+     // ($lims | sort_by(.used // 0) | last)) as $bl |
+    ($guard.managers[("ws-" + $ws)].allotment // null) as $allot |
+    # no allotment yet (registered after the last tick): the global verdict is the ceiling
+    (if $gs == "running" then ([$cap, ($allot // $guard.allowed_total // $cap)] | min) else $cap end) as $capeff |
+    ([$guard.stalled[]? | select(.workspace_id == $ws)
+            | select((.name // "") | test("^issue-[0-9]+$"))
+            | ((.name | capture("^issue-(?<n>[0-9]+)$").n) | tonumber)] | unique) as $qstalled |
     {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
-     cap:$cap,
-     slots_free:([0, ($cap - ($inflight|length) - ($adopting|length))] | max),
-     in_flight:$inflight, awaiting_approval:$awaiting,
+     cap:$cap, cap_effective:$capeff,
+     slots_free:([0, ($capeff - ($inflight|length) - ($adopting|length))] | max),
+     in_flight:[$inflight[] | .number as $rn
+                | . + {quota_stalled: (($qstalled | index($rn)) != null)}],
+     awaiting_approval:$awaiting,
      ready:$ready, blocked:$blocked, orphans:$orphans,
-     adopting:$adopting, unmanaged:$unmanaged}'
-}
+     adopting:$adopting, unmanaged:$unmanaged,
+     quota:{guard:$gs, provider:$prov, status:($pv.status // null),
+            used:($bl.used // null), resets_at:($bl.resets_at // null),
+            burn_per_hour:($bl.burn_per_hour // null),
+            projected_at_reset:($bl.projected_at_reset // null),
+            allowed_total:($pv.allowed_total // $guard.allowed_total // null),
+            allotment:$allot, reason:($pv.reason // null),
+            managers:([($guard.managers // {}) | to_entries[]
+                       | {manager_id:(.value.manager_id // .key), repo:(.value.repo // null),
+                          cap:(.value.cap // null), in_flight:(.value.in_flight // null),
+                          allotment:(.value.allotment // null), live:(.value.live // false)}]
+                      | sort_by(.manager_id)),
+            stalled:$qstalled}}')
 
-slots_free_now() { # slots_free_now <cap>
-  cmd_board --cap "$1" | jq -r '.slots_free'
+  # the board JSON is the only thing on stdout; the heartbeat is silent
+  printf '%s\n' "$board"
+  guard_heartbeat "$board"
 }
 
 # ---------------------------------------------------------------- launch
@@ -292,9 +391,16 @@ cmd_launch() {
 
   [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
 
-  local sf
-  sf=$(slots_free_now "$cap")
-  [ "$sf" -gt 0 ] || die 3 "no free slots (cap=$cap)"
+  local bd sf ce
+  bd=$(cmd_board --cap "$cap")
+  sf=$(jq -r '.slots_free' <<<"$bd")
+  if [ "$sf" -le 0 ]; then
+    ce=$(jq -r '.cap_effective' <<<"$bd")
+    if [ "$ce" -lt "$cap" ]; then
+      die 3 "no free slots (cap=$cap, cap_effective=$ce, quota: $(jq -r '.quota.reason // "throttled by mgr-guard"' <<<"$bd"))"
+    fi
+    die 3 "no free slots (cap=$cap)"
+  fi
 
   title=$(jq -r '.title' <<<"$ij")
   policy=$(policy_of "$ij")
@@ -385,9 +491,11 @@ cmd_adopt() {
     adopt-*) die 3 "agent $name on $pane is already adopted (self-registration pending)";;
   esac
 
-  local counts over_cap
-  counts=$(cmd_board --cap "$cap" | jq -r '(.in_flight|length) + (.adopting|length)')
-  if [ "$counts" -ge "$cap" ]; then over_cap=true; else over_cap=false; fi
+  local bd counts cap_eff over_cap
+  bd=$(cmd_board --cap "$cap")
+  counts=$(jq -r '(.in_flight|length) + (.adopting|length)' <<<"$bd")
+  cap_eff=$(jq -r '.cap_effective' <<<"$bd")
+  if [ "$counts" -ge "$cap_eff" ]; then over_cap=true; else over_cap=false; fi
 
   local pri rp; pri=$(primary); rp=$(repo)
   local br_disp="(none)" br_cmt="none"
@@ -528,15 +636,38 @@ cmd_wait() {
     ''|*[!0-9]*) target="$arg";;
     *) n="$arg"; target="issue-$arg";;
   esac
-  herdr agent get "$target" >/dev/null 2>&1 || die 4 "agent target $target is not live"
+
+  local got status name pane sess stall
+  got=$(herdr agent get "$target" 2>/dev/null) || die 4 "agent target $target is not live"
+
+  # (a) a builder already dead on a rate limit never settles on its own: with the
+  # guard running, wait for its reignition first; without a guard, say so and stop.
+  status=$(jq -r '.result.agent.agent_status // "unknown"' <<<"$got")
+  sess=$(jq -r '.result.agent.agent_session.value // empty' <<<"$got")
+  stall=""
+  if [ "$status" != working ]; then stall=$(guard_stall "$sess" || true); fi
+  if [ -n "$stall" ]; then
+    if [ "$(guard_state | jq -r '.guard')" = running ]; then
+      herdr agent wait "$target" --until working >/dev/null 2>&1 || true
+    else
+      pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
+      name=$(jq -r '.result.agent.name // ""' <<<"$got")
+      if [ -z "$n" ]; then
+        case "$name" in issue-*) n="${name#issue-}";; esac
+        case "$n" in ''|*[!0-9]*) n="";; esac
+      fi
+      quota_stalled_json "$n" "$pane" "$stall"
+      return 0
+    fi
+  fi
 
   herdr agent wait "$target" >/dev/null 2>&1 || true
 
-  local got status name pane
   got=$(herdr agent get "$target" 2>/dev/null) || die 4 "agent target $target is not live"
   status=$(jq -r '.result.agent.agent_status // "unknown"' <<<"$got")
   name=$(jq -r '.result.agent.name // ""' <<<"$got")
   pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
+  sess=$(jq -r '.result.agent.agent_session.value // empty' <<<"$got")
   if [ -z "$n" ]; then
     case "$name" in issue-*) n="${name#issue-}";; esac
     case "$n" in ''|*[!0-9]*) n="";; esac
@@ -549,6 +680,15 @@ cmd_wait() {
       ensure_labels
       gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
         || warn "could not swap labels on #$n"
+    fi
+  fi
+
+  # (b) it settled with no fresh report because it died on a rate limit again
+  if [ "$report" = null ] && [ "$status" != working ]; then
+    stall=$(guard_stall "$sess" || true)
+    if [ -n "$stall" ]; then
+      quota_stalled_json "$n" "$pane" "$stall"
+      return 0
     fi
   fi
 
@@ -670,7 +810,7 @@ mgr — manager CLI for herdr-hosted omp builders
 
   mgr labels                          ensure the mgr:* labels exist
   mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
-                                      blocked / orphans / adopting / unmanaged
+                                      blocked / orphans / adopting / unmanaged / quota
   mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N
   mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
                                       without N it self-registers via `mgr bind`)
@@ -678,6 +818,12 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr wait <N|pane_id>                block until the builder settles; report its status
   mgr prompt <N> <text...>            send text to builder issue-N
   mgr retire <N> [--close]            close tab, remove worktree/branch, clear labels
+  mgr guard <start|stop|status>       the deterministic quota-guard daemon: start is
+                                      idempotent, status is cheap (files + kill -0)
+
+env: MGR_CAP        default concurrency cap
+     MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
+     MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
 EOF
 }
 
@@ -696,6 +842,7 @@ main() {
     wait)          cmd_wait "$@";;
     prompt)        cmd_prompt "$@";;
     retire)        cmd_retire "$@";;
+    guard)         cmd_guard "$@";;
     _parse-report) cmd_parse_report "$@";;
     -h|--help|help) usage; exit 0;;
     *) die 2 "unknown subcommand: $sub (try: mgr --help)";;

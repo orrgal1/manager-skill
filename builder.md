@@ -217,6 +217,14 @@ Push your branch first so nothing is lost, then report and stop:
 
 Never leave the issue silent. A builder that stops without a report looks like a hang.
 
+### Rate-limit stalls
+
+A prompt that starts with `mgr-guard:` is not from the manager or the operator. Your previous turn
+died on a provider rate limit (429) and a daemon re-prompted you because the quota is back. Nobody
+is asking you anything and nothing about your issue changed: resume exactly where you stopped,
+under this contract. A rate-limit stall is not a failure — do not restart your work from the top
+and do not post a `manager-report` for it.
+
 ## 13. Report protocol
 
 Your **last** command before you stop, every time, in every branch above:

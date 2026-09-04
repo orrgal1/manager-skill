@@ -21,6 +21,9 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 - **Adoption.** Opened after other tabs are already working? The manager adopts them: a tab whose
   branch names an issue is bound to it; a tab with no issue pauses, writes its own issue, binds,
   and continues under the builder contract.
+- **A quota guard.** A plain daemon — not an agent — tracks provider usage, dials concurrency down
+  to what fits before the window resets, and re-prompts sessions whose turn died on a rate limit,
+  the manager's own included.
 - **Issue hygiene** on every request: dedupe, union overlapping asks, split multi-deliverable
   requests, wire dependencies.
 
@@ -59,6 +62,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
 | `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` — JSON out, exit codes `0/1/2/3/4` |
+| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` — the quota daemon, same JSON and exit codes |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager` |
 
 ## Protocol in one screen
@@ -66,6 +70,8 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 ```
 operator ──▶ manager ──gh issue create──▶ GitHub issue #N
                 │
+                ├─ mgr guard start ──▶ mgr-guard daemon ──omp usage──▶ allowed_total, cap_effective
+                │                         └──herdr agent prompt "mgr-guard: …"──▶ stalled session
                 ├─ mgr launch N ──▶ worktree + herdr tab + builder + brief
                 │                         │
                 ├─ mgr wait N (background) │ builds · self-reviews · PR
@@ -74,6 +80,32 @@ operator ──▶ manager ──gh issue create──▶ GitHub issue #N
                 ◀─────────────────────────┘
                 └─ mgr retire N --close ──▶ mgr board ──▶ launch next ready issue
 ```
+
+## Quota guard
+
+Builders and the manager are all agent sessions on one provider quota. When it runs out a turn ends
+on a 429 and the pane just sits there — and the manager cannot be what notices, because it is
+stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
+
+- **Trajectory.** Every tick it reads `omp usage --json`, appends a sample per limit and fits a
+  burn rate over the recent window: `projected_at_reset = used + burn × hours_to_reset`.
+- **Dial-back.** A limit projected past 100% shrinks `allowed_total` (never below 1); an exhausted
+  one sets it to 0 until the window resets. `allowed_total` is water-filled over the live managers
+  by demand into a per-manager `allotment`, and `mgr board` reports
+  `cap_effective = min(cap, allotment)`. `launch` and `adopt` obey it; `slots_free` counts against
+  it. Guard down or stale → no throttle at all.
+- **Stall detection.** For every `issue-*`, `adopt-*` and `manager*` agent that is not working, the
+  guard reads the tail of the omp session JSONL: a last assistant message that stopped on an error
+  with a 429 / rate-limit / quota-exhausted body is a stall.
+- **Reignition.** Once the provider is no longer exhausted it runs
+  `herdr agent prompt <pane> "mgr-guard: …"`, backing off per attempt. Managers are reignited
+  exactly like builders — that is what breaks the deadlock, and no agent is involved.
+- **Multi-manager ledger.** `~/.local/state/mgr-guard` (`MGR_STATE_DIR`) holds `guard.pid`,
+  `guard.log`, `state.json`, `samples.jsonl` and one `managers/<id>.json` per manager, heartbeated
+  by `mgr board`. One daemon serves every manager on the machine.
+
+`mgr guard start` is idempotent, `mgr guard status` prints the verdict, and the daemon exits by
+itself once no manager has been seen for 30 minutes.
 
 ## License
 

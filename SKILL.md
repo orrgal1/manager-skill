@@ -1,6 +1,6 @@
 ---
 name: manager
-description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows ~/.claude/skills/manager/builder.md instead."
+description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs', 'quota status'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows ~/.claude/skills/manager/builder.md instead."
 ---
 
 # Manager
@@ -37,11 +37,16 @@ Any of these fails: say exactly what is missing and stop. Do not improvise a boa
 herdr tab rename "$HERDR_TAB_ID" manager
 herdr agent rename "$HERDR_PANE_ID" manager
 $MGR labels
+$MGR guard start
 $MGR board
 ```
 
 Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `blocked`,
-`orphans`, `adopting`, `unmanaged`, and `cap` / `slots_free`.
+`orphans`, `adopting`, `unmanaged`, `cap` / `cap_effective` / `slots_free`, and `quota`
+(guard, provider, used, resets_at, allowed_total, allotment, stalled).
+
+`guard start` is idempotent: one quota-guard daemon serves every manager on the machine, so you
+either start it or attach to the one another manager already started.
 
 Orphans need a decision, so raise them rather than fixing them silently:
 
@@ -160,7 +165,12 @@ $MGR wait <N|pane_id>
 Run it as a **background** bash job (`async: true`, `timeout: 0`); it blocks until the builder goes
 idle and the result is delivered to you. Never run it in the foreground. One wait per builder.
 
-On delivery, `{"number","pane_id","agent_status","report"}`:
+On delivery, `{"number","pane_id","agent_status","report"}` — plus `stall` when the turn died on a
+rate limit. Read `agent_status` before `report`:
+
+| `agent_status` | Do |
+|---|---|
+| `quota-stalled` | Relay `stall` to the operator: `provider`, `error`, and when the window resets (`resets_at`). Do **not** prompt it, do **not** retire it — the work is intact. If `stall.guard` is `stopped`, run `$MGR guard start`. Then `$MGR wait N` again in the background: the guard re-prompts the builder once the quota is back, and that wait returns the real report. |
 
 **`number` is null** — an adoptee idled before binding. Read what it said, answer, wait again:
 
@@ -178,10 +188,11 @@ Otherwise branch on `report.status`:
 | `awaiting-approval` | Give the operator the PR URL and the builder's own summary (its last non-report issue comment). Do **not** retire — the tab stays alive for the fixes. The slot frees itself. |
 | `blocked` / `failed` | Relay `reason` verbatim, keep the tab, ask the operator how to proceed: `$MGR prompt N "<answer>"` + wait again, or `$MGR retire N`. Never guess the answer for them. |
 
-`report` is `null` — the builder stopped without reporting, which almost always means it asked a
-question. Same as the unbound case, addressed by issue: `herdr agent read issue-N --source
-recent-unwrapped --lines 60`, relay it, answer with `$MGR prompt N "…"`, wait again.
-`agent_status: blocked` gets the same treatment.
+`report` is `null` — check `agent_status` first: `quota-stalled` is not a question, it is the row
+above, and prompting it only buys another 429. Otherwise the builder stopped without reporting,
+which almost always means it asked a question. Same as the unbound case, addressed by issue:
+`herdr agent read issue-N --source recent-unwrapped --lines 60`, relay it, answer with
+`$MGR prompt N "…"`, wait again. `agent_status: blocked` gets the same treatment.
 
 Trust the report, not the idle state.
 
@@ -192,8 +203,9 @@ Trust the report, not the idle state.
 | approve #N | `$MGR prompt N "Approved. Land it now per the Landing section of builder.md."` then wait |
 | request changes on #N | `$MGR prompt N "Changes requested: <verbatim feedback>"` then wait |
 | cancel #N | `herdr agent send-keys issue-N ctrl+c`, then `$MGR retire N` — add `--close` only if the work is dropped, not deferred |
-| set the cap to N | remember N; pass `--cap N` to `board` and `launch` from now on |
+| set the cap to N | remember N; pass `--cap N` to `board` and `launch` from now on. `cap_effective` can still be lower when the guard throttles — report that instead of raising the cap |
 | status / what's on the board | `$MGR board`, reported as a short table |
+| quota status | `$MGR guard status`, reported as a short table: providers, managers, allotments, stalled |
 | dedupe the issues | Intake (a) over the whole open list |
 | adopt the other tabs | **Adoption** |
 | launch the next one | `$MGR board`, then `$MGR launch` the lowest `ready` number |
@@ -214,6 +226,13 @@ Trust the report, not the idle state.
 - `retire` tears down the tab and worktree from the live `issue-N` agent. If the tab is already
   gone it only clears the labels and warns — that is the normal answer to a `label-without-agent`
   orphan, not a failure.
+- The quota guard is a deterministic daemon, not an agent, and it is shared by every manager on
+  this machine. Start it; **never `$MGR guard stop`** — another manager may depend on it.
+- Launch never exceeds `cap_effective` — `mgr` enforces that. When it is below `cap`, quote the
+  `quota` reason to the operator rather than working around it.
+- Never re-prompt a quota-stalled builder yourself. The guard reignites it, with backoff. Your own
+  session runs on the same quota and can stall too; the guard reignites you as well, so a
+  `mgr-guard:` prompt in your pane means resume where you stopped.
 - When you have nothing to launch and nothing to answer, say so and stop. Do not invent work.
 
 ## 8. Reference
@@ -230,9 +249,27 @@ Trust the report, not the idle state.
 | `$MGR wait <N\|pane_id>` | block until idle, return the parsed `manager-report` |
 | `$MGR prompt <N> <text…>` | send text to builder `issue-N` |
 | `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue |
+| `$MGR guard start [--interval S]` | start the quota-guard daemon; idempotent, shared by all managers |
+| `$MGR guard stop` | stop it — read the Rules before you ever do |
+| `$MGR guard status` | the guard's whole verdict: providers, allowed_total, managers, allotments, stalled |
 
 Exit codes: `0` ok · `1` unexpected · `2` usage · `3` refused / invalid state · `4` not found.
 Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
+
+### Board fields
+
+| Field | Meaning |
+|---|---|
+| `cap` | the cap you set (default 3) |
+| `cap_effective` | `min(cap, quota.allotment)` while the guard runs, otherwise `cap`; `slots_free` counts against it |
+| `quota.guard` | `running` \| `stale` \| `stopped` — nothing is throttled unless it is `running` |
+| `quota.provider` `status` `used` `resets_at` | the builders' provider, its limit status, used fraction, window reset (ms) |
+| `quota.burn_per_hour` `projected_at_reset` | measured burn rate and where usage lands by the reset |
+| `quota.allowed_total` `allotment` | builders the guard allows machine-wide · this manager's share |
+| `quota.reason` | why, in words — quote it to the operator |
+| `quota.managers` | every live manager: `manager_id`, `repo`, `cap`, `in_flight`, `allotment`, `live` |
+| `quota.stalled` | issue numbers stalled on a rate limit in this workspace |
+| `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
 
 ### Labels
 
@@ -253,3 +290,13 @@ Agent `issue-<N>` · branch `issue-<N>-<slug>` · worktree `<primary>-issue-<N>-
 `#<N> <slug>`. An adopted session keeps its own cwd and branch; only its agent name and tab label
 are normalised. Before it binds, its provisional agent name is `adopt-<pane-id>` with `:` replaced
 by `-`, e.g. `adopt-w26-p3`.
+
+### Environment
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MGR_STATE_DIR` | `~/.local/state/mgr-guard` | the guard's ledger: pid, log, `state.json`, manager registrations |
+| `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |
+| `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
+| `MGR_GUARD_IDLE_EXIT_S` | `1800` | the guard exits after this long with no live manager |
+| `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's toasts |
