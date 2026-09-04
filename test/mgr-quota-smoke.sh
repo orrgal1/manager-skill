@@ -401,6 +401,71 @@ check 'parked on the resume' 1 \
 check 'then waited for the settle' 1 \
   "$(grep -cx 'herdr agent wait issue-49' "$MGR_TEST_LOG")"
 
+# --------------------------------------------------- 11. self-location
+
+printf '\n# 11. self-location: paths, version, and the guard next to the real script\n'
+root=$(cd "$here/.." && pwd)
+check 'version matches the checkout package.json' \
+  "$(jq -c '{version}' "$root/package.json")" "$("$MGR" --version)"
+check 'usage lists paths' 1 "$("$MGR" --help | grep -c 'mgr paths')"
+check 'usage lists --version' 1 "$("$MGR" --help | grep -c 'mgr --version')"
+
+# the brief the builder gets must carry resolved paths, never a hardcoded
+# ~/.claude/skills/manager/... (the fakes never reach `herdr agent prompt`)
+check 'no hardcoded skill path in mgr' 0 "$(grep -c 'skills/manager' "$MGR" || true)"
+check 'briefs use the resolved builder.md' 3 \
+  "$(grep -c '^ *brief=.*\$MGR_BUILDER_MD' "$MGR" || true)"
+check 'briefs use the resolved mgr' 3 \
+  "$(grep -c '^ *brief=.*\$MGR_SELF' "$MGR" || true)"
+
+# a published package reached through a node_modules/.bin symlink
+pkg="$tmp/pkg"
+mkdir -p "$pkg/bin" "$tmp/nm/.bin"
+cp "$MGR" "$pkg/bin/mgr"
+cp "$bin/mgr-guard" "$pkg/bin/mgr-guard"       # the fake guard, as shipped next to mgr
+cp "$root/SKILL.md" "$root/builder.md" "$pkg/"
+printf '{"version":"9.9.9"}' >"$pkg/package.json"
+link="$tmp/nm/.bin/mgr"
+ln -s "$pkg/bin/mgr" "$link"
+real_pkg=$(readlink -f "$pkg")
+
+out=$("$link" paths); rc=$?
+check 'paths through a symlink exits 0'   0 "$rc"
+check 'paths root'       "$real_pkg"            "$(jq -r '.root' <<<"$out")"
+check 'paths skill_md'   "$real_pkg/SKILL.md"   "$(jq -r '.skill_md' <<<"$out")"
+check 'paths builder_md' "$real_pkg/builder.md" "$(jq -r '.builder_md' <<<"$out")"
+check 'paths mgr'        "$real_pkg/bin/mgr"    "$(jq -r '.mgr' <<<"$out")"
+check 'version through a symlink reads the package root' '{"version":"9.9.9"}' \
+  "$("$link" --version)"
+
+# paths/version answer from the checkout alone: only jq (plus coreutils) on PATH
+mini="$tmp/mini"; mkdir -p "$mini"
+for c in bash jq readlink dirname; do ln -s "$(command -v "$c")" "$mini/$c"; done
+check 'restricted PATH really has no gh' '' "$(PATH="$mini" command -v gh || true)"
+check 'restricted PATH really has no herdr' '' "$(PATH="$mini" command -v herdr || true)"
+check 'restricted PATH really has no git' '' "$(PATH="$mini" command -v git || true)"
+out=$(PATH="$mini" "$link" paths); rc=$?
+check 'paths without gh/herdr/git exits 0' 0 "$rc"
+check 'paths without gh/herdr/git root' "$real_pkg" "$(jq -r '.root' <<<"$out")"
+check 'version without gh/herdr/git' '{"version":"9.9.9"}' \
+  "$(PATH="$mini" "$link" --version)"
+
+# a checkout without package.json cannot answer --version
+mkdir -p "$tmp/nopkg/bin"
+cp "$MGR" "$tmp/nopkg/bin/mgr"
+err=$("$tmp/nopkg/bin/mgr" --version 2>&1 >/dev/null); rc=$?
+check 'version without package.json exits 1' 1 "$rc"
+check 'version without package.json explains why' true \
+  "$(jq -r '.error.message | startswith("package.json not found at")' <<<"$err")"
+
+# guard_bin defaults next to the REAL script, not next to the symlink
+export MGR_TEST_GUARD="$fix/guard-running.json"
+check 'guard default follows the symlink' '{"running":true,"pid":4242}' \
+  "$(env -u MGR_GUARD_BIN "$link" guard start)"
+out=$(env -u MGR_GUARD_BIN "$link" board --cap 2)
+check 'board finds the guard next to the real script' running \
+  "$(jq -r '.quota.guard' <<<"$out")"
+
 
 printf '\n'
 if [ "$fails" -eq 0 ]; then printf 'all checks passed\n'; exit 0; fi

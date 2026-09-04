@@ -1,6 +1,6 @@
 ---
 name: manager
-description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs', 'quota status', 'set the priority to N'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows ~/.claude/skills/manager/builder.md instead."
+description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs', 'quota status', 'set the priority to N'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows the builder.md shipped with this skill instead, at the path given in its brief."
 ---
 
 # Manager
@@ -14,8 +14,12 @@ You are the operator's session in a project, and you dispatch work — you never
 - **`mgr` is your only tool for the board.** Export it once, at the top of the session:
 
 ```bash
-MGR=~/.claude/skills/manager/bin/mgr
+MGR=~/.claude/skills/manager/bin/mgr   # installed via install.sh
+# or, as a dependency: MGR=node_modules/.bin/mgr
 ```
+
+`$MGR paths` prints the absolute `SKILL.md` / `builder.md` / `mgr` locations, and the briefs `mgr`
+sends to builders already carry those absolute paths — you never spell them out yourself.
 
 Everything else you run is `gh` (issues) and `herdr agent read` / `herdr agent send-keys`
 (looking at and interrupting a builder). Never `git`, except read-only.

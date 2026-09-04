@@ -46,8 +46,20 @@ git clone https://github.com/orrgal1/manager-skill ~/code/manager-skill
 ~/code/manager-skill/install.sh          # symlinks ~/.claude/skills/manager -> the clone
 ```
 
-The briefs handed to builders reference `~/.claude/skills/manager/…` by absolute path, so
-keep the symlink there (or pass a different target to `install.sh` and adjust `SKILL.md`).
+`mgr` resolves `builder.md` and its own path from its real location (symlinks followed), so the
+briefs work from the symlink or from `node_modules`.
+
+## As a dependency
+
+```sh
+pnpm add github:orrgal1/manager-skill     # or: npm install github:orrgal1/manager-skill
+node_modules/.bin/mgr paths               # {"root","skill_md","builder_md","mgr"} — absolute
+node_modules/.bin/mgr --version           # {"version":"…"}
+```
+
+The runtime dependencies are unchanged: `bash`, `git`, `gh`, `jq` and [herdr](https://herdr.dev)
+still have to be on `PATH`. To start a manager from a consumer repo, prompt a session with
+*"Read `<skill_md>` and act as the manager"*.
 
 ## Use
 
@@ -68,9 +80,10 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
-| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `priority` |
+| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `priority` · `paths` · `--version` |
 | `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` · `priority` — the quota daemon |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager` |
+| `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |
 | `test/run.sh` | The hermetic test suite |
 
 Both binaries print JSON on stdout and `{"error":{"code":N,"message":"…"}}` on stderr, and

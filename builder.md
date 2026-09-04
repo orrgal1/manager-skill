@@ -55,9 +55,9 @@ Only for the third opener above.
    ```
    Acceptance is a checkbox list of what *done* looks like — the manager will hold you to it.
    Include `Blocked by:` only if something open genuinely blocks you.
-3. Bind, from this session:
+3. Bind, from this session (`<mgr>` is the absolute `mgr` path from your brief):
    ```bash
-   ~/.claude/skills/manager/bin/mgr bind <N>
+   <mgr> bind <N>
    ```
    Exit 0 is required before you touch code again. Exit 3 → read the message: usually another live
    session already owns that issue, or the issue is not open. Resolve it (bind to the right number)

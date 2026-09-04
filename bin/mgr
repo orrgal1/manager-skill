@@ -52,6 +52,18 @@ cap_of() { # cap_of <explicit-or-empty>
   printf '%s' "$c"
 }
 
+# ------------------------------------------------------------- self-location
+
+# Everything this CLI needs to hand a builder (SKILL.md, builder.md, its own
+# path) lives in the checkout above bin/. `readlink -f` follows symlinks so an
+# install.sh symlink in ~/.claude/skills and a `node_modules/.bin/mgr` link
+# both resolve back to the real checkout rather than the link's directory.
+MGR_SELF=$(readlink -f "$0" 2>/dev/null || true)
+[ -n "$MGR_SELF" ] || die 1 "cannot resolve own location: $0"
+MGR_ROOT=$(dirname "$(dirname "$MGR_SELF")")
+MGR_SKILL_MD="$MGR_ROOT/SKILL.md"
+MGR_BUILDER_MD="$MGR_ROOT/builder.md"
+
 # ---------------------------------------------------------------- github
 
 ensure_labels() {
@@ -176,9 +188,9 @@ tracked_missing_issues() { # tracked_missing_issues <open-issues-json> <agents-j
 
 # ---------------------------------------------------------------- quota guard
 
-# The deterministic quota daemon lives next to this script; MGR_GUARD_BIN
-# overrides it (tests point it at a fake).
-guard_bin="${MGR_GUARD_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mgr-guard}"
+# The deterministic quota daemon lives next to the real script (not next to a
+# symlink to it); MGR_GUARD_BIN overrides it (tests point it at a fake).
+guard_bin="${MGR_GUARD_BIN:-$(dirname "$MGR_SELF")/mgr-guard}"
 
 # `mgr-guard status` (state.json + {guard,pid}); a missing or failing binary is
 # indistinguishable from a stopped guard, and a stopped guard throttles nothing.
@@ -481,7 +493,7 @@ cmd_launch() {
   $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
 
   local brief
-  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Read ~/.claude/skills/manager/builder.md now and follow it exactly; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Begin with: gh issue view $n --comments"
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
 
@@ -564,7 +576,7 @@ cmd_adopt() {
       || warn "gh issue comment #$n failed"
 
     local brief
-    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Read ~/.claude/skills/manager/builder.md now and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
     jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
@@ -579,7 +591,7 @@ cmd_adopt() {
     newname="adopt-$(sanitize_pane "$pane")"
     herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
     local brief
-    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"), then run ~/.claude/skills/manager/bin/mgr bind <new issue number> from this session, then read ~/.claude/skills/manager/builder.md and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Resume your work only after bind succeeds."
+    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"), then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Resume your work only after bind succeeds."
     herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
 
     jq -nc --arg agent "$newname" --arg tab "$tab" --arg pane "$pane" \
@@ -841,6 +853,23 @@ cmd_labels() {
   jq -nc '{labels:["mgr:in-flight","mgr:awaiting-approval","mgr:manual-approve"]}'
 }
 
+# ------------------------------------------------------------ version / paths
+
+# Both answer from the checkout alone: only jq is needed, no gh/herdr/git.
+cmd_version() {
+  local pkg="$MGR_ROOT/package.json" out
+  [ -f "$pkg" ] || die 1 "package.json not found at $MGR_ROOT"
+  out=$(jq -ce '{version} | select(.version | strings | length > 0)' "$pkg" 2>/dev/null) \
+    || die 1 "no version in $pkg"
+  printf '%s\n' "$out"
+}
+
+cmd_paths() {
+  jq -nc --arg root "$MGR_ROOT" --arg skill_md "$MGR_SKILL_MD" \
+    --arg builder_md "$MGR_BUILDER_MD" --arg mgr "$MGR_SELF" \
+    '{root:$root,skill_md:$skill_md,builder_md:$builder_md,mgr:$mgr}'
+}
+
 # ---------------------------------------------------------------- usage
 
 usage() {
@@ -861,6 +890,9 @@ mgr — manager CLI for herdr-hosted omp builders
                                       idempotent, status is cheap (files + kill -0)
   mgr priority [N|--clear]            show/set this repo's quota priority (machine-wide,
                                       default 5, higher wins; 0 pauses the project)
+  mgr paths                           absolute paths of root/SKILL.md/builder.md/mgr,
+                                      resolved from this script's real location
+  mgr --version                       this checkout's package.json version
 
 env: MGR_CAP        default concurrency cap
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
@@ -873,8 +905,16 @@ EOF
 
 main() {
   [ $# -gt 0 ] || { usage; exit 0; }
-  need_deps
   local sub="$1"; shift
+  # these answer from the checkout alone, so they must not require gh/herdr/git
+  case "$sub" in
+    -h|--help|help) usage; exit 0;;
+    --version|version|paths)
+      command -v jq >/dev/null 2>&1 || die 1 "missing dependency: jq"
+      if [ "$sub" = paths ]; then cmd_paths; else cmd_version; fi
+      return;;
+  esac
+  need_deps
   case "$sub" in
     labels)        cmd_labels "$@";;
     board)         cmd_board "$@";;
@@ -887,7 +927,6 @@ main() {
     guard)         cmd_guard "$@";;
     priority)      cmd_priority "$@";;
     _parse-report) cmd_parse_report "$@";;
-    -h|--help|help) usage; exit 0;;
     *) die 2 "unknown subcommand: $sub (try: mgr --help)";;
   esac
 }
