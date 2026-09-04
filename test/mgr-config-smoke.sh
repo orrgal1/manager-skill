@@ -230,6 +230,10 @@ err=$("$MGR" config set env NOEQ 2>&1 >/dev/null); rc=$?
 check 'env without = exit' 2 "$rc"
 check 'env without = message' 'env value must be KEY=VALUE: NOEQ' \
   "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" config add omp-arg '' 2>&1 >/dev/null); rc=$?
+check 'empty omp-arg exit' 2 "$rc"
+check 'empty omp-arg message' 'omp-arg must not be empty' \
+  "$(jq -r '.error.message' <<<"$err")"
 err=$("$MGR" config set cap x 2>&1 >/dev/null); rc=$?
 check 'non-numeric cap exit' 2 "$rc"
 check 'non-numeric cap message' 'cap must be a non-negative integer: x' \

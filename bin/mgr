@@ -74,6 +74,7 @@ cfg_check_value() { # cfg_check_value <key> <value>
       case "$k" in
         ''|[0-9]*|*[!A-Za-z0-9_]*) die 2 "env value must be KEY=VALUE: $2";;
       esac;;
+    omp-arg) [ -n "$2" ] || die 2 "omp-arg must not be empty";;
     cap) case "$2" in ''|*[!0-9]*) die 2 "cap must be a non-negative integer: $2";; esac;;
   esac
 }
@@ -454,14 +455,14 @@ cmd_config() {
 # `herdr agent list` carries no tab label, so the label lives in `herdr tab
 # list` and is joined to the live agents by tab_id. No manager tab, no agent on
 # it, or an unusable tab list all mean "no manager" — the board still answers.
-manager_json() { # manager_json -> {pane_id,tab_id,agent,cwd} or null
+manager_json() { # manager_json <agents-json> -> {pane_id,tab_id,agent,cwd} or null
   local tabs ids
   tabs=$(herdr tab list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null) \
     || { warn "herdr tab list failed"; printf 'null'; return; }
   ids=$(jq -c '[.result.tabs[]? | select(.label == "manager") | .tab_id] | sort' \
     <<<"$tabs" 2>/dev/null) \
     || { warn "herdr tab list failed"; printf 'null'; return; }
-  jq -nc --argjson ids "$ids" --argjson ag "$(ws_agents)" \
+  jq -nc --argjson ids "$ids" --argjson ag "$1" \
     '[$ids[] as $t | $ag[] | select(.tab_id == $t)
       | {pane_id, tab_id, agent:.name, cwd}] | .[0] // null'
 }
@@ -486,7 +487,7 @@ cmd_board() {
   b_extra=$(tracked_missing_issues "$b_issues" "$b_agents")
   b_guard=$(guard_state)
   b_config=$(config_json "$cap")
-  b_manager=$(manager_json)
+  b_manager=$(manager_json "$b_agents")
 
   board=$(jq -n \
     --argjson issues "$b_issues" \
