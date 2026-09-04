@@ -297,14 +297,18 @@ def held: ((.cause // "") | IN("paused", "operator-paused"));
 # ---- (cap 0, or an entry in paused.json) has to get past that floor of one, so it lands on
 # ---- demand_effective and not on derived_cap: the ceiling formula stays exactly as it was, the
 # ---- demand it caps goes to zero, and the water-filling below then hands out an allotment of 0.
-| ([$live1[] | .priority] | max) as $top_priority
-| ([$live1[] | select(.priority == $top_priority) | (.cap // 0)] | max) as $top_cap
+# ---- A paused project also drops out of the top-tier scale: its registered cap is 0, and letting
+# ---- that be top_cap would floor every other project at one slot for no reason.
+| ($live1 | map(. + {paused_by_operator:
+    (($paused[(.repo // "")] // false) or ((.cap // 0) == 0))})) as $live1
+| ([$live1[] | select(.paused_by_operator | not) | .priority] | max) as $top_priority
+| ([$live1[] | select(.paused_by_operator | not) | select(.priority == $top_priority) | (.cap // 0)] | max) as $top_cap
 | ($live1 | map(. as $m
     | (if ($top_priority // 0) <= 0 or $m.priority <= 0 then 1
        else ([1, (($top_cap * $m.priority / $top_priority) | floor)] | max) end) as $dc
-    | (($paused[($m.repo // "")] // false) or (($m.cap // 0) == 0)) as $op
-    | $m + {derived_cap: $dc, paused_by_operator: $op,
-            demand_effective: (if $op then 0 else ([($m.demand // 0), $dc] | min) end)})) as $live
+    | $m + {derived_cap: $dc,
+            demand_effective: (if $m.paused_by_operator then 0
+                               else ([($m.demand // 0), $dc] | min) end)})) as $live
 | ((([$live[] | .demand_effective] | add) // 0)) as $demand_total
 | ($allowed_total < $demand_total) as $constrained
 

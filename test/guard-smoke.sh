@@ -908,6 +908,31 @@ else
   fail "(p5) quota resume text: $(grep '^wG:p3' "$FAKE_PROMPTS" | cut -f2)"
 fi
 
+# ---- (p6) regression: pausing the top-priority project must not shrink everyone else.
+# acme/a (priority 10) is paused, so its cap-0 registration must drop out of the
+# top-tier scale: acme/b (priority 5, cap 3) is then the top and keeps its whole cap
+SD_OP6="$TMP/s-op6"
+agents_file "$TMP/agents-op6.json" \
+  "$(mk_agent manager-wA wA:p1 wA idle '')" \
+  "$(mk_agent manager-wB wB:p1 wB idle '')" \
+  "$(mk_agent issue-1 wB:p2 wB working '')"
+export FAKE_AGENTS="$TMP/agents-op6.json"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+MGR_STATE_DIR="$SD_OP6" "$GUARD" priority acme/a 10 >/dev/null
+MGR_STATE_DIR="$SD_OP6" "$GUARD" pause acme/a >/dev/null
+reg "$SD_OP6" "$T0" ws-wA wA wA:p1 0 0 0 0 0 acme/a >/dev/null
+reg "$SD_OP6" "$T0" ws-wB wB wB:p1 3 1 0 2 3 acme/b >/dev/null
+arm "$SD_OP6" "$T0" 0.25 0.25
+ST_OP6="$(MGR_STATE_DIR="$SD_OP6" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(p6) the paused top project sets no scale" "$ST_OP6" \
+  '.top_priority == 5 and .top_cap == 3 and .constrained == false'
+assert_jq "(p6) the unpaused project keeps its whole cap" "$ST_OP6" \
+  '(.managers["ws-wB"] | .derived_cap == 3 and .demand_effective == 3 and .allotment == 3
+    and .paused_by_operator == false)'
+assert_jq "(p6) the paused project is still at 0" "$ST_OP6" \
+  '(.managers["ws-wA"] | .allotment == 0 and .paused_by_operator == true)'
+assert_eq "(p6) nothing of wB is interrupted" "" "$(cat "$FAKE_KEYS")"
+
 printf '\n== (o) jittered resets_at: every in-window sample is fitted ==\n'
 # fit_window <samples.jsonl> <limit> <resets-at> <tolerance-ms> -> "<count> <slope>",
 # the guard's least-squares fit recomputed from the fixture it was handed
