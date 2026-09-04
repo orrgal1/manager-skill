@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # End-to-end: real bin/mgr + real bin/mgr-guard, fake omp/herdr/gh.
-# Scenario: two managers, one builder dead on a 429, provider exhausted ->
+# Scenario A: two managers, one builder dead on a 429, provider exhausted ->
 # recovered; the guard throttles, then reignites; mgr board/launch/wait
-# reflect the guard's verdict. Exit non-zero on any failed assertion.
+# reflect the guard's verdict (including waiting *through* a quota hold).
+# Scenario B (issue #4): the live incident — a 7-day limit whose resets_at
+# jitters by milliseconds, six seeded samples plus a 1% step, two managers at
+# different priorities. The burn is fitted over the whole window, the
+# projection only constrains after MGR_GUARD_CONFIRM_TICKS ticks, no working
+# builder is esc-interrupted until the provider itself goes hard, and recovery
+# restores the ceiling on the same tick and resumes within the 60 s cooldown.
+# Exit non-zero on any failed assertion.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T=$(mktemp -d)
 cleanup() { rm -rf "$T"; if [ -n "${GUARD_FAKE_PID:-}" ]; then kill "$GUARD_FAKE_PID" 2>/dev/null || true; fi; }
 trap cleanup EXIT
 export MGR_STATE_DIR="$T/state" MGR_GUARD_NOTIFY=0 MGR_GUARD_MIN_SLOPE_SPAN_S=1
+export MGR_GUARD_CONFIRM_TICKS=1   # scenario A constrains on a single over-1 tick
 FAKE="$T/bin"; mkdir -p "$FAKE"
 fail=0
 ok()   { printf 'ok   %s\n' "$1"; }
 bad()  { printf 'FAIL %s\n' "$1"; fail=1; }
 is()   { if [ "$2" = "$3" ]; then ok "$1 = $2"; else bad "$1: got '$2' want '$3'"; fi; }
+ge()   { if [ "$2" -ge "$3" ]; then ok "$1 = $2 (>= $3)"; else bad "$1: got '$2' want >= $3"; fi; }
+lines() { if [ -f "$1" ]; then wc -l <"$1" | tr -d ' '; else echo 0; fi; }
 
 # `mgr` treats the guard as running when guard.pid holds a live pid (kill -0), so
 # the fixture pins a real process there. It must outlive the assertions in the
@@ -22,7 +32,10 @@ is()   { if [ "$2" = "$3" ]; then ok "$1 = $2"; else bad "$1: got '$2' want '$3'
 GUARD_FAKE_PID=""
 guard_alive() {
   mkdir -p "$MGR_STATE_DIR"
-  sleep 600 & GUARD_FAKE_PID=$!
+  guard_gone
+  # the placeholder must not inherit the script's stdout: a caller piping this
+  # test into `tail` would otherwise wait for the sleep to finish
+  sleep 600 >/dev/null 2>&1 & GUARD_FAKE_PID=$!
   printf '%s\n' "$GUARD_FAKE_PID" >"$MGR_STATE_DIR/guard.pid"
 }
 guard_gone() {
@@ -69,7 +82,11 @@ cat >"$FAKE/herdr" <<EOF
 case "\$1 \$2" in
   "agent list") cat "$AGENTS";;
   "agent get") jq -c --arg t "\$3" '{result:{agent:(.result.agents[] | select(.name==\$t or .pane_id==\$t))}}' "$AGENTS";;
-  "agent wait") printf '%s %s\n' "\$3" "\${4:-settle} \${5:-}" >>"$T/waits.log"; exit 0;;
+  # a wait "--until working" is how the guard's revival is awaited; the hook file
+  # lets a test make that revival actually happen (reignition, a lifted hold)
+  "agent wait") printf '%s %s\n' "\$3" "\${4:-settle} \${5:-}" >>"$T/waits.log"
+    if [ "\${4:-}" = --until ] && [ -x "$T/on-resume.sh" ]; then "$T/on-resume.sh" || true; fi
+    exit 0;;
   "agent prompt") printf '%s\t%s\n' "\$3" "\$4" >>"$T/prompts.log"; printf '{}\n';;
   "agent send-keys") printf '%s %s\n' "\$3" "\$4" >>"$T/keys.log"; printf '{}\n';;
   "notification show") exit 0;;
@@ -79,8 +96,14 @@ EOF
 cat >"$FAKE/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "repo view") printf 'acme/proj\n';;
-  "issue list") printf '%s\n' '[{"number":49,"title":"Add progress tracking","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":50,"title":"Wait screen","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":51,"title":"Next thing","labels":[],"body":""},{"number":52,"title":"Another","labels":[],"body":""}]';;
+  "repo view") case "${HERDR_WORKSPACE_ID:-}" in
+      w9) printf 'acme/shape\n';;
+      *)  printf 'acme/proj\n';;
+    esac;;
+  "issue list") case "${HERDR_WORKSPACE_ID:-}" in
+      w9) printf '%s\n' '[{"number":2,"title":"Bubble layout","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":4,"title":"Canvas zoom","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":9,"title":"Survey pass","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":51,"title":"Next thing","labels":[],"body":""}]';;
+      *)  printf '%s\n' '[{"number":49,"title":"Add progress tracking","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":50,"title":"Wait screen","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":51,"title":"Next thing","labels":[],"body":""},{"number":52,"title":"Another","labels":[],"body":""}]';;
+    esac;;
   "issue view") case "$3" in 51) printf '%s\n' '{"number":51,"title":"Next thing","state":"OPEN","labels":[],"body":""}';; *) printf '';; esac;;
   "label create"|"issue edit"|"issue comment") exit 0;;
   *) exit 1;;
@@ -171,15 +194,36 @@ case "$(jq -r '.providers.anthropic.reason' <<<"$st")" in "projected 1.9 > 1 on 
 # water-filling, 1 slot: w9 (demand 2) is served first with share floor(1/2)=0, w3 (demand 3) takes the slot
 is "ws-w3 allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 1
 is "ws-w9 allotment" "$(jq -r '.managers["ws-w9"].allotment' <<<"$st")" 0
+# the constraint itself is a projection (status ok), but the provider still counts
+# as hard here: issue-49 sits on a 429 for anthropic, which is a level-2 trigger
+# on its own. Nothing is interrupted anyway -- issue-50 is inside w3's allotment
+# of 1, so there is no over-allotment builder to esc
+is "provider hard (429 stall on anthropic)" "$(jq -r '.providers.anthropic.hard' <<<"$st")" true
+is "provider status" "$(jq -r '.providers.anthropic.status' <<<"$st")" ok
+is "nobody is over-allotment, so no esc" "$(lines "$T/keys.log")" 0
 
-echo "# 7. mgr wait on the stalled builder with the guard running parks until working"
+echo "# 7. mgr wait --no-quota-block on the stalled builder parks once, then reports the hold"
 guard_alive
-out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 49)
+out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 49 --no-quota-block)
 is "wait status (settled, still stalled)" "$(jq -r '.agent_status' <<<"$out")" quota-stalled
 is "stall.provider" "$(jq -r '.stall.provider' <<<"$out")" anthropic
 is "stall.guard" "$(jq -r '.stall.guard' <<<"$out")" running
 is "waited --until working first" "$(head -1 "$T/waits.log")" "issue-49 --until working"
 guard_gone
+
+echo "# 7b. default mgr wait rides the 429 hold out until the guard reignites the builder"
+cp "$SESS" "$T/sess49.bak"; : >"$T/waits.log"
+# what a reignited builder looks like: the 429 turn is replaced by a clean one
+printf '%s\n' '#!/usr/bin/env bash' "cp \"$SESS_OK\" \"$SESS\"" >"$T/on-resume.sh"
+chmod +x "$T/on-resume.sh"
+guard_alive
+out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 49)
+guard_gone
+rm -f "$T/on-resume.sh"; cp "$T/sess49.bak" "$SESS"
+is "wait returns the ordinary shape" "$(jq -r '.agent_status' <<<"$out")" blocked
+is "no stall key" "$(jq -r 'has("stall")' <<<"$out")" false
+is "report" "$(jq -r '.report' <<<"$out")" null
+is "parked, then settled" "$(sed 's/[[:space:]]*$//' "$T/waits.log" | tr '\n' '|')" "issue-49 --until working|issue-49 settle|"
 
 echo "# 8. guard stopped: wait returns immediately with guard=stopped; board does not throttle"
 rm -f "$MGR_STATE_DIR/guard.pid"; : >"$T/waits.log"
@@ -202,7 +246,11 @@ MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" board --cap 3 >/dev/null
 guard_gone
 "$ROOT/bin/mgr-guard" register '{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1","repo":"acme/shape","primary":"/s","cap":3,"in_flight":1,"adopting":0,"ready":1,"demand":2}' >/dev/null
 # keep the projection binding: same rising samples, allowed_total stays 1 (active builders: issue-50 + issue-12 = 2 -> floor(2*0.25)=0 -> max 1)
+# the 5h limit now reports `warning`, which is what makes the provider "hard" --
+# only then does the guard esc a builder that is still working
+usage_file warning 0.7 "$R2" >"$FAKE_USAGE"
 st=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr-guard" tick)
+is "provider hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" true
 is "constrained" "$(jq -r '.constrained' <<<"$st")" true
 is "allowed_total" "$(jq -r '.allowed_total' <<<"$st")" 1
 is "w9 (prio 8) allotment" "$(jq -r '.managers["ws-w9"].allotment' <<<"$st")" 1
@@ -225,26 +273,270 @@ is "quota.stalled (429 only)" "$(jq -c '.quota.stalled' <<<"$bd")" '[49]'
 is "in_flight 50 quota_paused" "$(jq -r '.in_flight[] | select(.number==50) | .quota_paused' <<<"$bd")" true
 is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 0
 : >"$T/waits.log"
-out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50)
+out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50 --no-quota-block)
 is "wait status" "$(jq -r '.agent_status' <<<"$out")" quota-paused
 is "stall.cause" "$(jq -r '.stall.cause' <<<"$out")" paused
 is "parked --until working first" "$(head -1 "$T/waits.log")" "issue-50 --until working"
 guard_gone
 
-echo "# 11. quota back: w3 gets room again and issue-50 is resumed after the cooldown"
-: >"$MGR_STATE_DIR/samples.jsonl"; usage_file ok 0.1 "$R2" >"$FAKE_USAGE"; : >"$T/prompts.log"
-st=$(MGR_GUARD_NOW_MS=$((NOW2 + 60000)) "$ROOT/bin/mgr-guard" tick)   # inside the 300s cooldown
+echo "# 10b. default mgr wait rides the hold out until the guard lifts the pause"
+cp "$MGR_STATE_DIR/state.json" "$T/state.bak"; : >"$T/waits.log"
+# what the guard's resume does to its ledger: the paused entry for that pane goes
+printf '%s\n' '#!/usr/bin/env bash' \
+  "jq -c '.stalled |= map(select((.pane_id != \"w3:p3\") or (.cause != \"paused\")))' \"\$MGR_STATE_DIR/state.json\" >\"$T/state.new\" && mv \"$T/state.new\" \"\$MGR_STATE_DIR/state.json\"" \
+  >"$T/on-resume.sh"
+chmod +x "$T/on-resume.sh"
+guard_alive
+out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50)
+guard_gone
+rm -f "$T/on-resume.sh"; cp "$T/state.bak" "$MGR_STATE_DIR/state.json"
+is "wait returns the ordinary shape" "$(jq -r '.agent_status' <<<"$out")" idle
+is "no stall key" "$(jq -r 'has("stall")' <<<"$out")" false
+is "report" "$(jq -r '.report' <<<"$out")" null
+is "parked, then settled" "$(sed 's/[[:space:]]*$//' "$T/waits.log" | tr '\n' '|')" "issue-50 --until working|issue-50 settle|"
+
+echo "# 11. quota back: no resume inside the 60s no_room_at cooldown, then issue-50 resumes"
+: >"$MGR_STATE_DIR/samples.jsonl"; usage_file ok 0.1 "$R2" >"$FAKE_USAGE"
+: >"$T/prompts.log"; : >"$T/keys.log"
+# the cooldown is counted from the last tick w3 had no room, which is the tick of step 9
+is "no_room_at ws-w3 is the constrained tick" "$(jq -r '.managers["ws-w3"].no_room_at' "$MGR_STATE_DIR/state.json")" "$NOW2"
+# the 429 backoff is the guard's own bookkeeping (issue-49 was reignited at NOW1),
+# so what the recovery tick may do about issue-49 is read out of the state first
+nra=$(jq -r '[.stalled[] | select(.name=="issue-49") | .next_reignite_at] | first' "$MGR_STATE_DIR/state.json")
+st=$(MGR_GUARD_NOW_MS=$((NOW2 + 30000)) "$ROOT/bin/mgr-guard" tick)   # 30s < 60s cooldown
 is "constrained now false" "$(jq -r '.constrained' <<<"$st")" false
 is "w3 allotment" "$(jq -r '.managers["ws-w3"].allotment' <<<"$st")" 3
-# w3 has room again, so the 429-stalled issue-49 (w3:p2) is reignited now; the paused issue-50 waits out the cooldown
-is "429 reignite now that w3 has room" "$(cut -f1 "$T/prompts.log")" w3:p2
-is "no resume inside cooldown" "$(cut -f1 "$T/prompts.log" | { grep -c 'w3:p3' || true; })" 0
-st=$(MGR_GUARD_NOW_MS=$((NOW2 + 400000)) "$ROOT/bin/mgr-guard" tick)
+is "allowed_total back to the ceiling" "$(jq -r '.allowed_total' <<<"$st")" 6
+p2=$(awk -F'\t' '$1=="w3:p2"' "$T/prompts.log" | wc -l | tr -d ' ')
+if [ "$nra" != null ] && [ "$((NOW2 + 30000))" -ge "$nra" ]; then
+  # w3's allotment (3) now exceeds its working builders (0), so the 429 entry is due
+  is "429 reignite fires once its backoff is due" "$p2" 1
+else
+  is "429 reignite still inside its backoff" "$p2" 0
+fi
+is "no resume inside the cooldown" "$(awk -F'\t' '$1=="w3:p3"' "$T/prompts.log" | wc -l | tr -d ' ')" 0
+is "paused entry survives the cooldown" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 1
+is "no_room_at unchanged" "$(jq -r '.managers["ws-w3"].no_room_at' <<<"$st")" "$NOW2"
+is "no esc re-send once there is room" "$(lines "$T/keys.log")" 0
+st=$(MGR_GUARD_NOW_MS=$((NOW2 + 61000)) "$ROOT/bin/mgr-guard" tick)   # 61s > 60s cooldown
 resume=$(awk -F'\t' '$1=="w3:p3"{print $2}' "$T/prompts.log")
 is "resume prompt sent once" "$(awk -F'\t' '$1=="w3:p3"' "$T/prompts.log" | wc -l | tr -d ' ')" 1
 case "$resume" in "mgr-guard: this project's quota allotment is back (priority 2, allotment 3)."*) ok "resume text";; *) bad "resume text: $resume";; esac
+# esc_sent was 1, so the resume names the interruption rather than a turn-boundary hold
+case "$resume" in *"interrupted your previous turn"*) ok "resume text names the interrupt";; *) bad "resume text: $resume";; esac
 is "paused entry removed" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 0
 is "resumed event" "$(jq -r '[.events[] | select(.kind=="resumed")] | length' <<<"$st")" 1
 is "w3 no longer paused" "$(jq -r '.managers["ws-w3"].paused' <<<"$st")" false
+is "still no esc after recovery" "$(lines "$T/keys.log")" 0
+
+# ---------------------------------------------------------------------------
+# Scenario B: the issue #4 incident, replayed end to end. Its own state dir,
+# its own agents, its own clock, and the shipped defaults for the two knobs the
+# incident hinged on (3 confirmations, 60 s resume cooldown).
+echo "# 12. incident fixture: acme/shape (prio 5, three working builders) vs acme/lore (prio 10)"
+export MGR_STATE_DIR="$T/state2"
+export HERDR_WORKSPACE_ID=w9 HERDR_PANE_ID=w9:p1 HERDR_TAB_ID=w9:t1
+mkdir -p "$MGR_STATE_DIR/managers"
+: >"$MGR_STATE_DIR/samples.jsonl"; : >"$T/prompts.log"; : >"$T/keys.log"
+I0=1788529271000
+FRESET=$((I0 + 585000000))   # the 7d window resets in 162.5h, as in the incident
+H5=$((I0 + 14400000))        # the 5h window resets in 4h
+usage_fable() { # usage_fable <5h-status> <7d-used> <resets_at-jitter-ms>
+  jq -nc --arg s "$1" --argjson u "$2" --argjson j "$3" --argjson h5 "$H5" --argjson fr "$FRESET" \
+    '{generatedAt:0,reports:[{provider:"anthropic",fetchedAt:0,
+      limits:[{id:"anthropic:5h",label:"Claude 5 Hour",status:$s,window:{resetsAt:$h5},amount:{usedFraction:0.23}},
+              {id:"anthropic:7d:fable",label:"Fable Weekly",status:"ok",window:{resetsAt:($fr+$j)},
+               amount:{usedFraction:$u}}]}]}'
+}
+fable_sample() { # fable_sample <t> <used> <resets_at-jitter-ms>
+  jq -nc --argjson t "$1" --argjson u "$2" --argjson r "$((FRESET + $3))" \
+    '{t:$t,provider:"anthropic",limit:"anthropic:7d:fable",used:$u,resets_at:$r,status:"ok"}'
+}
+# every tick of this scenario keeps the shipped confirmation/cooldown defaults
+itick() { # itick <now> <5h-status> <7d-used> <resets_at-jitter-ms>
+  usage_fable "$2" "$3" "$4" >"$FAKE_USAGE"
+  MGR_GUARD_NOW_MS="$1" MGR_GUARD_CONFIRM_TICKS=3 MGR_GUARD_RESUME_COOLDOWN_S=60 \
+    "$ROOT/bin/mgr-guard" tick
+}
+FQ='.providers.anthropic.limits[] | select(.id=="anthropic:7d:fable")'
+# the same least-squares fit over the same in-window rows, rounded the same way:
+# if the guard ever goes back to matching resets_at exactly, these diverge
+fit_slope() { # fit_slope <limit-resets_at> <now>
+  jq -Rnc --argjson L "$1" --argjson now "$2" '
+    [inputs | (fromjson? // empty)
+     | select((.provider == "anthropic") and (.limit == "anthropic:7d:fable"))
+     | select((((.resets_at - $L)) | if . < 0 then (0 - .) else . end) <= 120000)
+     | select(.t >= ($now - 1800000))] | sort_by(.t)
+    | length as $n
+    | ([.[] | .t / 3600000]) as $xs | ([.[] | .used]) as $ys
+    | (($xs | add) / $n) as $mx | (($ys | add) / $n) as $my
+    | ([range(0; $n) | ($xs[.] - $mx) * ($ys[.] - $my)] | add) as $sxy
+    | ([$xs[] | (. - $mx) * (. - $mx)] | add) as $sxx
+    | (($sxy / $sxx) * 100 | round) / 100' "$MGR_STATE_DIR/samples.jsonl"
+}
+# the incident's own rows: 0.22 -> 0.24 over 1045s, each with its own jittered
+# resets_at. The first row's +402 is repeated by tick 1's report on purpose: that
+# is the ms collision the old exact-equality filter fitted on, two points giving
+# 0.07/h off a 1065 s gap instead of 0.05/h off the whole window
+{ fable_sample $((I0 - 1065000)) 0.22 402
+  fable_sample $((I0 - 1024000)) 0.23 -376
+  fable_sample $((I0 - 963000))  0.23 338
+  fable_sample $((I0 - 589000))  0.23 43
+  fable_sample $((I0 - 521000))  0.24 -219
+  fable_sample $((I0 - 20000))   0.24 282; } >>"$MGR_STATE_DIR/samples.jsonl"
+jq -nc --arg s "$SESS_OK" '{result:{agents:[
+  {name:"manager-shape",pane_id:"w9:p1",tab_id:"w9:t1",workspace_id:"w9",cwd:"/s",agent:"omp",agent_status:"idle"},
+  {name:"issue-2",pane_id:"w9:p2",tab_id:"w9:t2",workspace_id:"w9",cwd:"/s-issue-2-a",agent:"omp",agent_status:"working",agent_session:{value:$s}},
+  {name:"issue-4",pane_id:"w9:p3",tab_id:"w9:t3",workspace_id:"w9",cwd:"/s-issue-4-b",agent:"omp",agent_status:"working",agent_session:{value:$s}},
+  {name:"issue-9",pane_id:"w9:p4",tab_id:"w9:t4",workspace_id:"w9",cwd:"/s-issue-9-c",agent:"omp",agent_status:"working",agent_session:{value:$s}},
+  {name:"manager-lore",pane_id:"w7:p1",tab_id:"w7:t1",workspace_id:"w7",cwd:"/l",agent:"omp",agent_status:"idle"},
+  {name:"issue-77",pane_id:"w7:p2",tab_id:"w7:t2",workspace_id:"w7",cwd:"/l-issue-77-d",agent:"omp",agent_status:"working",agent_session:{value:$s}}]}}' >"$AGENTS"
+MGR_GUARD_NOW_MS=$I0 "$ROOT/bin/mgr-guard" register '{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1","repo":"acme/shape","primary":"/s","cap":3,"in_flight":3,"adopting":0,"ready":1,"demand":3}' >/dev/null
+MGR_GUARD_NOW_MS=$I0 "$ROOT/bin/mgr-guard" register '{"manager_id":"ws-w7","workspace_id":"w7","pane_id":"w7:p1","repo":"acme/lore","primary":"/l","cap":3,"in_flight":1,"adopting":0,"ready":2,"demand":3}' >/dev/null
+"$ROOT/bin/mgr-guard" priority acme/shape 5 >/dev/null
+"$ROOT/bin/mgr-guard" priority acme/lore 10 >/dev/null
+is "shape priority" "$(jq -r '."acme/shape"' "$MGR_STATE_DIR/priorities.json")" 5
+is "lore priority" "$(jq -r '."acme/lore"' "$MGR_STATE_DIR/priorities.json")" 10
+
+echo "# 13. tick 1: the whole jittered window is fitted, and the projection only watches"
+st=$(itick $I0 ok 0.24 402)
+sc=$(jq -r "$FQ | .sample_count" <<<"$st")
+ge "sample_count (every in-window row)" "$sc" 7
+is "not the two-point ms-collision artifact" "$(jq -n --argjson n "$sc" '$n > 2')" true
+burn=$(jq -r "$FQ | .burn_per_hour" <<<"$st")
+is "burn_per_hour > 0" "$(jq -n --argjson b "$burn" '$b > 0')" true
+is "burn_per_hour is the least-squares slope of those rows" \
+  "$burn" "$(fit_slope "$(jq -r "$FQ | .resets_at" <<<"$st")" "$I0")"
+is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 1
+is "allowed_total stays at the ceiling" "$(jq -r '.allowed_total' <<<"$st")" 6
+is "constrained" "$(jq -r '.constrained' <<<"$st")" false
+reason=$(jq -r '.providers.anthropic.reason' <<<"$st")
+case "$reason" in "ok (watching: anthropic:7d:fable projected"*) ok "reason watches without acting";;
+  *) bad "reason: $reason";; esac
+is "provider not hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" false
+is "no esc" "$(lines "$T/keys.log")" 0
+is "no paused entries" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 0
+guard_alive
+bd=$(MGR_GUARD_NOW_MS=$I0 "$ROOT/bin/mgr" board --cap 3)
+is "cap_effective untouched" "$(jq -r '.cap_effective' <<<"$bd")" 3
+is "shape allotment" "$(jq -r '.quota.allotment' <<<"$bd")" 3
+set +e
+err=$(MGR_GUARD_NOW_MS=$I0 "$ROOT/bin/mgr" launch 51 --cap 3 2>&1 >/dev/null); rc=$?
+set -e
+guard_gone
+is "launch exit" "$rc" 3
+# three in flight against cap 3 leaves no slot anyway -- but the refusal is the
+# plain cap one, not a quota one: cap_effective is still the full cap
+case "$err" in *"no free slots (cap=3)"*) ok "launch refused on the cap alone";; *) bad "launch refusal: $err";; esac
+case "$err" in *"quota:"*) bad "launch refusal blames quota: $err";; *) ok "launch refusal does not blame quota";; esac
+
+echo "# 14. tick 2: a second over-1 projection still only watches"
+st=$(itick $((I0 + 20000)) ok 0.24 -376)
+is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 2
+is "allowed_total stays at the ceiling" "$(jq -r '.allowed_total' <<<"$st")" 6
+is "constrained" "$(jq -r '.constrained' <<<"$st")" false
+reason=$(jq -r '.providers.anthropic.reason' <<<"$st")
+case "$reason" in "ok (watching: anthropic:7d:fable projected"*) ok "reason still watching";;
+  *) bad "reason: $reason";; esac
+is "no esc" "$(lines "$T/keys.log")" 0
+
+echo "# 15. tick 3: the 1% step confirms the projection -> constrain, still no interrupt"
+T3=$((I0 + 40000))
+st=$(itick $T3 ok 0.25 338)
+is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 3
+burn=$(jq -r "$FQ | .burn_per_hour" <<<"$st")
+allowed=$(jq -r '.allowed_total' <<<"$st")
+want=$(jq -n --argjson a "$(jq -r '.providers.anthropic.active_builders' <<<"$st")" \
+             --argjson b "$burn" --argjson u "$(jq -r "$FQ | .used" <<<"$st")" \
+             --argjson r "$(jq -r "$FQ | .resets_at" <<<"$st")" --argjson now "$T3" \
+  '(((($r - $now) / 3600000) * 100 | round) / 100) as $h
+   | ([1, (($a * ((1 - $u) / ($b * $h))) | floor)] | max)')
+is "allowed_total = max(1, floor(act*(1-used)/(burn*hours)))" "$allowed" "$want"
+is "allowed_total below the ceiling" "$(jq -n --argjson a "$allowed" '$a < 6')" true
+is "constrained" "$(jq -r '.constrained' <<<"$st")" true
+reason=$(jq -r '.providers.anthropic.reason' <<<"$st")
+case "$reason" in projected*) ok "reason acts on the projection";; *) bad "reason: $reason";; esac
+ev=$(jq -c --argjson at "$T3" '[.events[] | select(.kind=="allowed_changed" and .at==$at)] | last' <<<"$st")
+is "allowed_changed fit.limit" "$(jq -r '.fit.limit' <<<"$ev")" anthropic:7d:fable
+is "allowed_changed fit.slope" "$(jq -r '.fit.slope' <<<"$ev")" "$burn"
+ge "allowed_changed fit.samples" "$(jq -r '.fit.samples | length' <<<"$ev")" 9
+is "fit samples carry t/used" "$(jq -r '.fit.samples[0] | keys | join(",")' <<<"$ev")" t,used
+is "provider not hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" false
+is "no esc under a projection-only constraint" "$(lines "$T/keys.log")" 0
+is "no paused entries (all builders working)" "$(jq -r '[.stalled[] | select(.cause=="paused")] | length' <<<"$st")" 0
+is "lore (prio 10) served before shape (prio 5)" \
+  "$(jq -r '.managers["ws-w7"].allotment >= .managers["ws-w9"].allotment' <<<"$st")" true
+guard_alive
+bd=$(MGR_GUARD_NOW_MS=$T3 "$ROOT/bin/mgr" board --cap 3)
+is "cap_effective is throttled" "$(jq -n --argjson c "$(jq -r '.cap_effective' <<<"$bd")" '$c < 3')" true
+set +e
+err=$(MGR_GUARD_NOW_MS=$T3 "$ROOT/bin/mgr" launch 51 --cap 3 2>&1 >/dev/null); rc=$?
+set -e
+guard_gone
+is "launch exit" "$rc" 3
+case "$err" in *"quota: projected"*) ok "launch refusal names the projection";; *) bad "launch refusal: $err";; esac
+
+echo "# 16. tick 4: shape's highest issue goes idle and is held at its turn boundary"
+jq -c '(.result.agents[] | select(.name=="issue-9") | .agent_status) = "idle"' "$AGENTS" >"$AGENTS.new" && mv "$AGENTS.new" "$AGENTS"
+T4=$((I0 + 60000))
+st=$(itick $T4 ok 0.25 43)
+PE='[.stalled[] | select(.cause=="paused")]'
+is "one paused entry" "$(jq -r "$PE | length" <<<"$st")" 1
+is "held builder" "$(jq -r "$PE | first | .name" <<<"$st")" issue-9
+is "held, not interrupted" "$(jq -r "$PE | first | .esc_sent" <<<"$st")" 0
+is "paused event" "$(jq -r --argjson at "$T4" '[.events[] | select(.kind=="paused" and .at==$at)] | length' <<<"$st")" 1
+is "still no esc" "$(lines "$T/keys.log")" 0
+is "no_room_at ws-w9 is this tick" "$(jq -r '.managers["ws-w9"].no_room_at' <<<"$st")" "$T4"
+
+echo "# 17. tick 5: the 5h limit turns warning -> level 2 escs the still-working ones"
+T5=$((I0 + 80000))
+st=$(itick $T5 warning 0.25 -219)
+is "provider hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" true
+is "esc order (highest issue first)" "$(tr '\n' '|' <"$T/keys.log")" "w9:p3 esc|w9:p2 esc|"
+is "paused entries" "$(jq -r "$PE | length" <<<"$st")" 3
+is "issue-4 esc_sent" "$(jq -r '[.stalled[] | select(.name=="issue-4")] | first | .esc_sent' <<<"$st")" 1
+is "issue-2 esc_sent" "$(jq -r '[.stalled[] | select(.name=="issue-2")] | first | .esc_sent' <<<"$st")" 1
+is "issue-9 is still a turn-boundary hold" "$(jq -r '[.stalled[] | select(.name=="issue-9")] | first | .esc_sent' <<<"$st")" 0
+is "shape paused" "$(jq -r '.managers["ws-w9"].paused' <<<"$st")" true
+is "lore untouched" "$(jq -r '.managers["ws-w7"].paused' <<<"$st")" false
+
+echo "# 18. tick 6: a flat window restores the ceiling on the same tick and resumes everyone"
+T6=$((T5 + 60000))
+{ fable_sample $((T6 - 1000000)) 0.24 402
+  fable_sample $((T6 - 800000))  0.24 -376
+  fable_sample $((T6 - 600000))  0.24 338
+  fable_sample $((T6 - 400000))  0.24 43
+  fable_sample $((T6 - 200000))  0.24 -219
+  fable_sample $((T6 - 20000))   0.24 282; } >"$MGR_STATE_DIR/samples.jsonl"
+: >"$T/prompts.log"
+st=$(itick $T6 ok 0.24 402)
+is "burn_per_hour" "$(jq -r "$FQ | .burn_per_hour" <<<"$st")" 0
+is "over_ticks" "$(jq -r "$FQ | .over_ticks" <<<"$st")" 0
+is "allowed_total back to the ceiling immediately" "$(jq -r '.allowed_total' <<<"$st")" 6
+is "constrained" "$(jq -r '.constrained' <<<"$st")" false
+is "provider not hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" false
+is "resume prompts, lowest issue first" "$(cut -f1 "$T/prompts.log" | tr '\n' '|')" "w9:p2|w9:p3|w9:p4|"
+esc_text=$(awk -F'\t' '$1=="w9:p2"{print $2}' "$T/prompts.log")
+case "$esc_text" in "mgr-guard: this project's quota allotment is back (priority 5, allotment 3)."*"interrupted your previous turn"*)
+  ok "esc'd builder is told its turn was interrupted";; *) bad "resume text: $esc_text";; esac
+held_text=$(awk -F'\t' '$1=="w9:p4"{print $2}' "$T/prompts.log")
+case "$held_text" in *"held this session at the end of its previous turn"*)
+  ok "held builder is told it was held at the turn boundary";; *) bad "resume text: $held_text";; esac
+is "paused entries cleared" "$(jq -r "$PE | length" <<<"$st")" 0
+is "resumed events" "$(jq -r --argjson at "$T6" '[.events[] | select(.kind=="resumed" and .at==$at)] | length' <<<"$st")" 3
+is "shape no longer paused" "$(jq -r '.managers["ws-w9"].paused' <<<"$st")" false
+is "no esc re-send after recovery" "$(lines "$T/keys.log")" 2
+
+echo "# 19. tick 7: nothing left to do -- no keys, no holds, full cap"
+T7=$((T5 + 120000))
+st=$(itick $T7 ok 0.24 -376)
+is "still no new esc" "$(lines "$T/keys.log")" 2
+is "no paused entries" "$(jq -r "$PE | length" <<<"$st")" 0
+is "no new resume prompts" "$(lines "$T/prompts.log")" 3
+guard_alive
+bd=$(MGR_GUARD_NOW_MS=$T7 "$ROOT/bin/mgr" board --cap 3)
+guard_gone
+is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 3
+is "quota.constrained" "$(jq -r '.quota.constrained' <<<"$bd")" false
 
 [ "$fail" = 0 ] && echo "e2e-quota: all assertions passed" || { echo "e2e-quota: FAILURES"; exit 1; }
