@@ -26,7 +26,8 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   and continues under the builder contract.
 - **A quota guard.** A plain daemon — not an agent — tracks provider usage, dials concurrency down
   to what fits before the window resets, and re-prompts sessions whose turn died on a rate limit,
-  the manager's own included.
+  the manager's own included. It is also what enforces the operator's pause: `mgr pause` is a
+  persisted cap 0 for the project, and the guard holds every builder it has until `mgr unpause`.
 - **Issue hygiene** on every request: dedupe, union overlapping asks, split multi-deliverable
   requests, wire dependencies.
 - **Harness config per repo.** `mgr config` stores extra omp CLI args, environment variables for
@@ -76,6 +77,8 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | what's on the board | `mgr board` as a table |
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
 | set the priority to 8 | `mgr priority 8` — outranks the others when quota is tight, and scales this project's cap ceiling toward the top project's the further behind it is |
+| pause the project | `mgr pause` — a persisted cap 0 for this repo until `mgr unpause`: nothing new launches and the guard interrupts and holds the builders it already has. Nothing is retired, no tab, worktree or issue is touched |
+| unpause / resume the project | `mgr unpause` (alias `mgr resume`) — the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the guard resumes the held builders itself |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Headless use
@@ -106,8 +109,8 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
-| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `priority` · `config` · `paths` · `--version` |
-| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` · `priority` — the quota daemon |
+| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `priority` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
+| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` · `priority` · `pause` · `unpause` · `paused` — the quota daemon |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager` |
 | `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |
 | `test/run.sh` | The hermetic test suite |
@@ -167,9 +170,10 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
   top all keep their own cap. Example: top project priority 10, cap 3; a project at priority 5
   gets `floor(3 × 5/10) = 1`, so with its own cap 3 it runs at `min(3, 1) = 1`, and with its own
   cap 1 or less its own cap wins; priority 1 still gets `max(1, floor(0.3)) = 1`. No project
-  derives below 1, so this is not how you pause one. Second, while quota is constrained the guard
-  serves whole tiers top-down instead of sharing evenly, so a bottom tier can drop to
-  `allotment: 0`. What that does to its builders depends on *why* the quota is constrained:
+  derives below 1, so this is not how you pause one — `mgr pause` is. Second, while quota is
+  constrained the guard serves whole tiers top-down instead of sharing evenly, so a bottom tier
+  can drop to `allotment: 0`. What that does to its builders depends on *why* the quota is
+  constrained:
   - **Level 1 — projection.** The burn trajectory says the window will not fit. `allowed_total`
     and `cap_effective` drop, new launches are refused, and running builders are left to finish
     their turn; each over-allotment builder is held the moment herdr reports it idle (a paused
@@ -184,8 +188,20 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
 
   The guard resumes them itself once the share is back: the cooldown counts from the last tick the
   manager had no room (`MGR_GUARD_RESUME_COOLDOWN_S`, 60 s by default), not from the pause, and a
-  pending `esc` re-send is cancelled as soon as the manager has room again. `mgr priority 0` is the
-  bottom tier — first to be squeezed, last to be served — which is how a project is parked today.
+  pending `esc` re-send is cancelled as soon as the manager has room again.
+- **The operator's pause.** `mgr pause` is not a priority trick: it is a persisted cap-0 override
+  for the repo, stored in `paused.json` beside `priorities.json` in the state dir, so it survives
+  the session and every worktree. The manager's registration then carries `cap: 0` and
+  `demand: 0`, and the guard sets that manager's `demand_effective` to 0 and its allotment to 0
+  unconditionally — constrained or not, whatever its priority, whatever the provider is doing. The
+  pause is applied to the demand rather than to the ceiling precisely so the floor of 1 on
+  `derived_cap` cannot leak a builder through. Its working builders are then interrupted with
+  `esc` and its idle ones held at their next turn boundary, both with `cause: operator-paused`, and
+  `mgr guard status` reports them as `managers[].paused_by_operator` plus a top-level
+  `paused_repos`. `mgr unpause` (alias `mgr resume`) drops the entry: the cap goes back to
+  `--cap`/`MGR_CAP`/`mgr config get cap`/`3` and the guard resumes the held builders on its next
+  tick, skipping the resume cooldown because this hold was the operator's, not a quota accident.
+  `mgr priority` is untouched by any of it.
 - **Stall detection.** For every `issue-*`, `adopt-*` and `manager*` agent that is not working, the
   guard reads the tail of the omp session JSONL: a last assistant message that stopped on an error
   with a 429 / rate-limit / quota-exhausted body is a stall.
@@ -194,8 +210,9 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
   Managers are reignited exactly like builders — that is what breaks the deadlock, and no agent is
   involved.
 - **Multi-manager ledger.** `~/.local/state/mgr-guard` (`MGR_STATE_DIR`) holds `guard.pid`,
-  `guard.log`, `state.json`, `samples.jsonl`, `priorities.json` and one `managers/<id>.json` per
-  manager, heartbeated by `mgr board`. One daemon serves every manager on the machine.
+  `guard.log`, `state.json`, `samples.jsonl`, `priorities.json`, `paused.json` and one
+  `managers/<id>.json` per manager, heartbeated by `mgr board`. One daemon serves every manager on
+  the machine.
 
 `mgr guard start` is idempotent, `mgr guard status` prints the verdict (and always exits 0), and the
 daemon exits by itself once no manager has been seen for 30 minutes.

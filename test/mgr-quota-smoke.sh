@@ -114,6 +114,25 @@ cat >"$fix/stall-49-paused.json" <<'EOF'
  "manager_id":"ws-w9"}
 EOF
 
+# the operator's pause as the guard reports it: cap 0 and demand 0 for this
+# manager, allotment 0 whatever the priority says, and its only builder held
+# with cause "operator-paused" (the guard's own squeeze says "paused")
+jq '.paused_repos=["owner/name"]
+    | .managers["ws-w9"] += {cap:0,demand:0,demand_effective:0,allotment:0,
+                             active_builders:0,paused:true,paused_by_operator:true}
+    | .stalled=[{pane_id:"w9:p2",name:"issue-49",workspace_id:"w9",session:"/x.jsonl",
+                 provider:"anthropic",model:null,error:null,since:1788522000000,
+                 retry_after_ms:null,attempts:0,last_reignite_at:null,next_reignite_at:null,
+                 cause:"operator-paused",paused_at:1788522000000,esc_sent:1,
+                 manager_id:"ws-w9"}]' \
+  "$fix/guard-running.json" >"$fix/guard-op-paused.json"
+jq '.guard="stopped" | .pid=null' \
+  "$fix/guard-op-paused.json" >"$fix/guard-op-paused-stopped.json"
+
+# and what `mgr-guard stall --pane` prints for that builder
+jq '.cause="operator-paused"' \
+  "$fix/stall-49-paused.json" >"$fix/stall-49-op-paused.json"
+
 # ------------------------------------------------------------------ fakes
 
 cat >"$bin/gh" <<'EOF'
@@ -192,6 +211,18 @@ case "${1:-}" in
         *)        jq -nc --arg r "$r" --argjson n "$1" '{repo:$r,priority:$n,explicit:true}';;
       esac
     fi;;
+  pause|unpause|paused)
+    # the operator pause map, faked down to one bit: MGR_TEST_PAUSED exists
+    # <=> this repo is paused. `paused` only reads it, so mgr can ask freely.
+    sub="$1"; r="${2:-}"; m="${MGR_TEST_PAUSED:-}"
+    [ -n "$r" ] || { printf '{"error":{"code":2,"message":"usage"}}\n' >&2; exit 2; }
+    case "$sub" in
+      pause)   [ -n "$m" ] && : >"$m";;
+      unpause) [ -n "$m" ] && rm -f "$m";;
+    esac
+    p=false
+    if [ -n "$m" ] && [ -f "$m" ]; then p=true; fi
+    jq -nc --arg r "$r" --argjson p "$p" '{repo:$r,paused:$p}';;
   register)
     printf '%s\n' "${2:-}" >>"$MGR_TEST_REGISTER"
     printf '%s\n' "${2:-}";;
@@ -218,6 +249,7 @@ export MGR_TEST_REGISTER="$tmp/register.log"
 export MGR_TEST_GUARD="$fix/guard-running.json"
 export MGR_TEST_STALL="$fix/stall-49.json"
 export MGR_TEST_RESUMED="$tmp/resumed"
+export MGR_TEST_PAUSED="$tmp/paused"   # exists = the operator paused this repo
 export MGR_TEST_ON_RESUME=            # set per case; empty = the guard does nothing
 export MGR_TEST_STALL_AFTER=          # set per case; the hold lands after check #1
 export HERDR_WORKSPACE_ID=w9
@@ -269,7 +301,7 @@ check 'quota.priority'            7 "$(jq -r '.quota.priority' <<<"$out")"
 check 'quota.constrained'      true "$(jq -r '.quota.constrained' <<<"$out")"
 check 'quota.paused'          false "$(jq -r '.quota.paused' <<<"$out")"
 check 'quota.managers' \
-  '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"derived_cap":3,"allotment":1,"live":true,"priority":7,"paused":false}]' \
+  '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"derived_cap":3,"allotment":1,"live":true,"priority":7,"paused":false,"paused_by_operator":false}]' \
   "$(jq -c '.quota.managers' <<<"$out")"
 # derived 3 == cap 3: the derived ceiling does not bite, so the provider speaks
 check 'quota.reason' \
@@ -539,9 +571,150 @@ check 'stall.cause'         paused "$(jq -r '.stall.cause' <<<"$out")"
 check 'stall.guard'        running "$(jq -r '.stall.guard' <<<"$out")"
 check 'parked once, settled once, then gave up' 'stall park settle stall' "$(calls)"
 
-# --------------------------------------------------- 11. self-location
+# --------------------------------------------------- 11. the operator's pause
 
-printf '\n# 11. self-location: paths, version, and the guard next to the real script\n'
+printf '\n# 11. operator pause: an alias for cap 0\n'
+export MGR_TEST_GUARD="$fix/guard-running.json"
+export MGR_TEST_STALL="$fix/stall-49.json"
+export MGR_TEST_ON_RESUME=
+rm -f "$MGR_TEST_PAUSED"; : >"$MGR_TEST_LOG"; : >"$MGR_TEST_REGISTER"
+out=$("$MGR" pause); rc=$?
+check 'pause exit'                0 "$rc"
+check 'pause stdout' \
+  '{"repo":"owner/name","paused":true,"cap":0,"previous_cap":3}' "$out"
+check 'pause forwards the repo to the guard' 1 \
+  "$(grep -cx 'mgr-guard pause owner/name' "$MGR_TEST_LOG")"
+# the pause is only real once the guard's ledger knows: pause re-registers
+check 'pause re-registers cap 0'  0 "$(jq -rs 'last|.cap' "$MGR_TEST_REGISTER")"
+check 'pause re-registers demand 0' 0 \
+  "$(jq -rs 'last|.demand' "$MGR_TEST_REGISTER")"
+out=$("$MGR" pause); rc=$?
+check 'pause again exit'          0 "$rc"
+check 'pause is idempotent' \
+  '{"repo":"owner/name","paused":true,"cap":0,"previous_cap":3}' "$out"
+
+printf '\n# 11b. while paused the board reports cap 0 and names the pause\n'
+: >"$MGR_TEST_REGISTER"
+out=$("$MGR" board --cap 2); rc=$?
+check 'board exit'                0 "$rc"
+check 'paused_by_operator'     true "$(jq -r '.paused_by_operator' <<<"$out")"
+check 'cap (the pause beats --cap 2)' 0 "$(jq -r '.cap' <<<"$out")"
+check 'cap_effective'             0 "$(jq -r '.cap_effective' <<<"$out")"
+check 'slots_free'                0 "$(jq -r '.slots_free' <<<"$out")"
+check 'config.cap keeps the configured cap' 2 "$(jq -r '.config.cap' <<<"$out")"
+check 'quota.reason' 'paused by the operator (mgr unpause lifts it)' \
+  "$(jq -r '.quota.reason' <<<"$out")"
+# the guard's own squeeze flag is a different thing and stays as the guard left it
+check 'quota.paused is the guard flag, not this one' false \
+  "$(jq -r '.quota.paused' <<<"$out")"
+check 'paused_by_operator sits immediately before cap' true \
+  "$(jq -r '(keys_unsorted|index("paused_by_operator")) as $i
+            | keys_unsorted[$i+1] == "cap"' <<<"$out")"
+check 'heartbeat cap'             0 "$(jq -rs 'last|.cap' "$MGR_TEST_REGISTER")"
+check 'heartbeat demand'          0 "$(jq -rs 'last|.demand' "$MGR_TEST_REGISTER")"
+
+printf '\n# 11c. launch while paused: refused before it touches gh or herdr\n'
+: >"$MGR_TEST_LOG"
+err=$("$MGR" launch 7 --cap 2 2>&1 >/dev/null); rc=$?
+check 'launch exit'               3 "$rc"
+check 'launch error code'         3 "$(jq -r '.error.code' <<<"$err")"
+check 'launch error message' \
+  'this project is paused by the operator (cap 0); mgr unpause lifts it' \
+  "$(jq -r '.error.message' <<<"$err")"
+check 'no tab was created' 0 \
+  "$(grep -c 'herdr tab create' "$MGR_TEST_LOG" || true)"
+
+printf '\n# 11d. mgr unpause restores the cap; resume is the same command\n'
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_REGISTER"
+out=$("$MGR" unpause); rc=$?
+check 'unpause exit'              0 "$rc"
+check 'unpause stdout' '{"repo":"owner/name","paused":false,"cap":3}' "$out"
+check 'unpause forwards the repo to the guard' 1 \
+  "$(grep -cx 'mgr-guard unpause owner/name' "$MGR_TEST_LOG")"
+check 'unpause re-registers the restored cap' 3 \
+  "$(jq -rs 'last|.cap' "$MGR_TEST_REGISTER")"
+out=$("$MGR" unpause); rc=$?
+check 'unpause when not paused exits 0' 0 "$rc"
+check 'unpause is idempotent' '{"repo":"owner/name","paused":false,"cap":3}' "$out"
+check 'resume is an alias for unpause' \
+  '{"repo":"owner/name","paused":false,"cap":3}' "$("$MGR" resume)"
+check 'MGR_CAP counts as the restored cap' \
+  '{"repo":"owner/name","paused":false,"cap":2}' "$(MGR_CAP=2 "$MGR" unpause)"
+
+printf '\n# 11e. a persisted cap is what pause remembers and unpause restores\n'
+# subshell: a main-shell `git` lands in bash's command hash, and section 12
+# later proves a restricted PATH has no git with `command -v`
+( git -C "$repo" config --local mgr.cap 4 )
+check 'pause remembers the persisted cap' \
+  '{"repo":"owner/name","paused":true,"cap":0,"previous_cap":4}' "$("$MGR" pause)"
+check 'unpause restores the persisted cap' \
+  '{"repo":"owner/name","paused":false,"cap":4}' "$("$MGR" unpause)"
+( git -C "$repo" config --local --unset mgr.cap ) || true
+check 'the persisted cap is gone again' '' \
+  "$(git -C "$repo" config --local --get mgr.cap || true)"
+out=$("$MGR" board --cap 3)
+check 'paused_by_operator after unpause' false \
+  "$(jq -r '.paused_by_operator' <<<"$out")"
+check 'cap after unpause'         3 "$(jq -r '.cap' <<<"$out")"
+check 'quota.managers[].paused_by_operator without a pause' false \
+  "$(jq -r '.quota.managers[0].paused_by_operator' <<<"$out")"
+
+printf '\n# 11f. pause/unpause usage, and a missing guard binary\n'
+err=$("$MGR" pause extra 2>&1 >/dev/null); rc=$?
+check 'pause extra arg exit'      2 "$rc"
+check 'pause usage message' 'usage: mgr pause' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" unpause extra 2>&1 >/dev/null); rc=$?
+check 'unpause extra arg exit'    2 "$rc"
+check 'unpause usage message' 'usage: mgr unpause' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$(MGR_GUARD_BIN="$tmp/nope" "$MGR" pause 2>&1 >/dev/null); rc=$?
+check 'pause without a guard binary exits 1' 1 "$rc"
+check 'pause without a guard binary explains why' true \
+  "$(jq -r '.error.message | startswith("mgr-guard is not executable")' <<<"$err")"
+check 'usage lists pause' 1 "$("$MGR" --help | grep -c '^ *mgr pause')"
+check 'usage lists unpause|resume' 1 \
+  "$("$MGR" --help | grep -c '^ *mgr unpause|resume')"
+check 'usage no longer sells priority 0 as the pause' 0 \
+  "$("$MGR" --help | grep -c '0 pauses the project' || true)"
+
+printf '\n# 11g. the guard reports the flag per manager and marks the holds\n'
+export MGR_TEST_GUARD="$fix/guard-op-paused.json"
+: >"$MGR_TEST_PAUSED"
+out=$("$MGR" board --cap 3)
+check 'quota.managers[].paused_by_operator' true \
+  "$(jq -r '.quota.managers[0].paused_by_operator' <<<"$out")"
+check 'quota.managers key order' \
+  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","priority","paused","paused_by_operator"]' \
+  "$(jq -c '.quota.managers[0]|keys_unsorted' <<<"$out")"
+check 'quota.paused_builders counts operator-paused holds' '[49]' \
+  "$(jq -c '.quota.paused_builders' <<<"$out")"
+check 'quota.stalled stays 429-only' '[]' "$(jq -c '.quota.stalled' <<<"$out")"
+check 'in_flight quota_paused'  true "$(jq -r '.in_flight[0].quota_paused' <<<"$out")"
+check 'in_flight quota_stalled' false \
+  "$(jq -r '.in_flight[0].quota_stalled' <<<"$out")"
+
+printf '\n# 11h. wait on a builder the operator pause put down\n'
+export MGR_TEST_GUARD="$fix/guard-op-paused-stopped.json"
+export MGR_TEST_STALL="$fix/stall-49-op-paused.json"
+rm -f "$MGR_TEST_RESUMED"; : >"$MGR_TEST_LOG"
+out=$("$MGR" wait 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'wait number'              49 "$(jq -r '.number' <<<"$out")"
+check 'wait pane_id'          w9:p2 "$(jq -r '.pane_id' <<<"$out")"
+check 'wait agent_status' quota-paused "$(jq -r '.agent_status' <<<"$out")"
+check 'stall.cause' operator-paused "$(jq -r '.stall.cause' <<<"$out")"
+check 'stall.esc_sent'            1 "$(jq -r '.stall.esc_sent' <<<"$out")"
+check 'stall.guard'         stopped "$(jq -r '.stall.guard' <<<"$out")"
+check 'wait report'            null "$(jq -r '.report' <<<"$out")"
+
+export MGR_TEST_GUARD="$fix/guard-running.json"
+export MGR_TEST_STALL="$fix/stall-49.json"
+rm -f "$MGR_TEST_PAUSED"; : >"$MGR_TEST_LOG"; : >"$MGR_TEST_REGISTER"
+
+# --------------------------------------------------- 12. self-location
+
+printf '\n# 12. self-location: paths, version, and the guard next to the real script\n'
 root=$(cd "$here/.." && pwd)
 check 'version matches the checkout package.json' \
   "$(jq -c '{version}' "$root/package.json")" "$("$MGR" --version)"

@@ -308,6 +308,25 @@ guard_state() {
   printf '%s' "$MGR_GUARD_CACHE"
 }
 
+# The operator's pause is a cap-0 override the guard keeps beside the priority
+# map, machine-wide per repo: while it is set every cap this CLI resolves — the
+# board's, the heartbeat's, `--cap N`'s — collapses to 0. A missing or failing
+# guard binary means nothing is paused (same reasoning as `guard_state`).
+operator_paused() {
+  [ -n "${MGR_OP_PAUSED_CACHE:-}" ] && { printf '%s' "$MGR_OP_PAUSED_CACHE"; return; }
+  local rp out=""
+  MGR_OP_PAUSED_CACHE=false
+  if [ -x "$guard_bin" ]; then
+    # its own simple command: `repo`'s `die` inside $(…) would kill a subshell
+    rp=$(repo)
+    out=$("$guard_bin" paused "$rp" 2>/dev/null) || out=""
+    if jq -e '.paused == true' >/dev/null 2>&1 <<<"$out"; then
+      MGR_OP_PAUSED_CACHE=true
+    fi
+  fi
+  printf '%s' "$MGR_OP_PAUSED_CACHE"
+}
+
 # `--pane` lets the guard answer from its own ledger: a builder it paused on
 # purpose has no rate-limit error in its session file, only a `cause:"paused"`
 # entry in state.json, and that entry wins over the file check.
@@ -343,8 +362,9 @@ guard_heartbeat() { # guard_heartbeat <board-json>
 }
 
 # the `mgr wait` answer for a builder the quota guard is holding: dead on a
-# provider rate limit (`cause:"429"`) or paused to keep quota for a
-# higher-priority project (`cause:"paused"`). No cause = a plain 429.
+# provider rate limit (`cause:"429"`), paused to keep quota for a
+# higher-priority project (`cause:"paused"`) or held because the operator
+# paused the project (`cause:"operator-paused"`). No cause = a plain 429.
 quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
   local gst
   gst=$(guard_state)
@@ -354,7 +374,8 @@ quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
     (($pv.recovers_at // ([($pv.limits // [])[] | .resets_at] | .[0])) // null) as $resets |
     ($stall.cause // "429") as $cause |
     {number:(if $n == "" then null else ($n|tonumber) end), pane_id:$pane,
-     agent_status:(if $cause == "paused" then "quota-paused" else "quota-stalled" end),
+     agent_status:(if ($cause|IN("paused","operator-paused")) then "quota-paused"
+                   else "quota-stalled" end),
      stall:($stall + {cause:$cause, resets_at:$resets, guard:($g.guard // "stopped")}),
      report:null}'
 }
@@ -383,6 +404,52 @@ cmd_priority() {
   rp=$(repo)
   [ -n "$arg" ] || exec "$guard_bin" priority "$rp"
   exec "$guard_bin" priority "$rp" "$arg"
+}
+
+# ---- pause
+#
+# `mgr pause` is not a state machine of its own: it is literally a cap-0
+# override for this repo, kept in the same machine-wide store as the priority
+# map (the guard owns the file). Everything that follows falls out of the cap
+# being 0 — the board reports no slots, `mgr launch` refuses, and the guard's
+# next tick sees demand 0, hence allotment 0, and holds this project's
+# builders through the very path a quota squeeze uses. `mgr unpause` drops the
+# override and the cap goes back to --cap/MGR_CAP/config/3.
+
+# the registration only changes when a board runs, so both commands refresh it
+# themselves: without it the guard would keep the pre-pause cap until the next
+# `mgr board`. The board runs in a subshell (its `die` must not kill this
+# command) with the pause cache already decided, so the heartbeat carries the
+# right cap, and its stdout is dropped — only the pause verdict is output.
+pause_refresh_registration() {
+  ( cmd_board >/dev/null 2>&1 ) \
+    || warn "mgr-guard registration not refreshed (mgr board failed)"
+}
+
+cmd_pause() {
+  [ $# -eq 0 ] || die 2 "usage: mgr pause"
+  [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
+  local rp prev
+  rp=$(repo)
+  prev=$(cap_of "")
+  "$guard_bin" pause "$rp" >/dev/null || die 1 "mgr-guard pause failed"
+  MGR_OP_PAUSED_CACHE=true
+  pause_refresh_registration
+  jq -nc --arg r "$rp" --argjson prev "$prev" \
+    '{repo:$r, paused:true, cap:0, previous_cap:$prev}'
+}
+
+cmd_unpause() {
+  [ $# -eq 0 ] || die 2 "usage: mgr unpause"
+  [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
+  local rp cap
+  rp=$(repo)
+  cap=$(cap_of "")
+  "$guard_bin" unpause "$rp" >/dev/null || die 1 "mgr-guard unpause failed"
+  MGR_OP_PAUSED_CACHE=false
+  pause_refresh_registration
+  jq -nc --arg r "$rp" --argjson cap "$cap" \
+    '{repo:$r, paused:false, cap:$cap}'
 }
 
 # ---------------------------------------------------------------- config
@@ -479,21 +546,30 @@ cmd_board() {
 
   # resolved before the jq call: `die` inside a command substitution would only
   # kill its own subshell, so each of these must be its own simple command.
-  local b_repo b_primary b_issues b_agents b_extra b_guard b_config b_manager board
+  local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
+  local b_manager board
   b_repo=$(repo)
+  b_paused=$(operator_paused)
   b_primary=$(primary)
   b_issues=$(open_issues)
   b_agents=$(ws_agents)
   b_extra=$(tracked_missing_issues "$b_issues" "$b_agents")
   b_guard=$(guard_state)
+  # the config reports the store, so it keeps the configured cap even when the
+  # operator's pause has collapsed the effective one to 0
   b_config=$(config_json "$cap")
   b_manager=$(manager_json "$b_agents")
+
+  # the pause outranks --cap/MGR_CAP/config: from here on the cap *is* 0, which
+  # is what the board reports and what the heartbeat registers as demand 0.
+  if [ "$b_paused" = true ]; then cap=0; fi
 
   board=$(jq -n \
     --argjson issues "$b_issues" \
     --argjson extra "$b_extra" \
     --argjson ag "$b_agents" \
     --argjson cap "$cap" \
+    --argjson paused "$b_paused" \
     --argjson guard "$b_guard" \
     --argjson config "$b_config" \
     --argjson manager "$b_manager" \
@@ -561,24 +637,29 @@ cmd_board() {
     ($me.derived_cap // null) as $derived |
     # no allotment yet (registered after the last tick): the global verdict is the ceiling
     (if $gs == "running" then ([$cap, ($allot // $guard.allowed_total // $cap)] | min) else $cap end) as $capeff |
-    # when the priority-derived cap ceiling bites at least as hard as the quota allotment
-    # it, not the quota, is the binding limit — so say so instead of the provider reason
-    (if $gs == "running" and $derived != null and $derived < $cap and (($allot // $derived) >= $derived)
+    # an operator pause is the loudest reason there is: no --cap, no derived
+    # cap and no provider verdict can explain a cap of 0 better than it does.
+    # Otherwise: when the priority-derived cap ceiling bites at least as hard as
+    # the quota allotment it, not the quota, is the binding limit — so say so
+    # instead of the provider reason
+    (if $paused then "paused by the operator (mgr unpause lifts it)"
+     elif $gs == "running" and $derived != null and $derived < $cap and (($allot // $derived) >= $derived)
      then "priority " + ($me.priority|tostring) + " vs top " + ($guard.top_priority|tostring)
           + " (cap " + ($guard.top_cap|tostring) + ") → cap " + ($derived|tostring)
      else $pv.reason // null end) as $qreason |
     # guard-held builders of this workspace, split by why the guard holds them:
     # a 429 comes from the provider, "paused" is the guard keeping quota for a
-    # higher-priority project. An entry without a cause predates the split.
+    # higher-priority project and "operator-paused" is `mgr pause`. An entry
+    # without a cause predates the split.
     ([$guard.stalled[]? | select(.workspace_id == $ws)
             | select((.name // "") | test("^issue-[0-9]+$"))
             | {n:((.name | capture("^issue-(?<n>[0-9]+)$").n) | tonumber),
                cause:(.cause // "429")}]) as $held |
     ([$held[] | select(.cause == "429") | .n] | unique) as $qstalled |
-    ([$held[] | select(.cause == "paused") | .n] | unique) as $qpaused |
+    ([$held[] | select(.cause | IN("paused","operator-paused")) | .n] | unique) as $qpaused |
     {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
      self:(if $self=="" then null else $self end), manager:$manager, config:$config,
-     cap:$cap, cap_effective:$capeff,
+     paused_by_operator:$paused, cap:$cap, cap_effective:$capeff,
      slots_free:([0, ($capeff - ($inflight|length) - ($adopting|length))] | max),
      in_flight:[$inflight[] | .number as $rn
                 | . + {quota_stalled: (($qstalled | index($rn)) != null),
@@ -600,7 +681,8 @@ cmd_board() {
                           cap:(.value.cap // null), in_flight:(.value.in_flight // null),
                           derived_cap:(.value.derived_cap // null),
                           allotment:(.value.allotment // null), live:(.value.live // false),
-                          priority:(.value.priority // null), paused:(.value.paused // false)}]
+                          priority:(.value.priority // null), paused:(.value.paused // false),
+                          paused_by_operator:(.value.paused_by_operator // false)}]
                       | sort_by(.manager_id)),
             stalled:$qstalled, paused_builders:$qpaused}}')
 
@@ -622,6 +704,12 @@ cmd_launch() {
   [ -n "$n" ] || die 2 "usage: mgr launch <N> [--cap N]"
   case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
   cap=$(cap_of "$cap")
+  # the pause wins over an explicit --cap, and it answers before any herdr or
+  # gh work: an operator who parked the project gets one sentence, not a
+  # "no free slots" report they have to decode
+  if [ "$(operator_paused)" = true ]; then
+    die 3 "this project is paused by the operator (cap 0); mgr unpause lifts it"
+  fi
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || die 3 "not running inside herdr (HERDR_WORKSPACE_ID unset)"
   require_agents
 
@@ -1129,7 +1217,10 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr guard <start|stop|status>       the deterministic quota-guard daemon: start is
                                       idempotent, status is cheap (files + kill -0)
   mgr priority [N|--clear]            show/set this repo's quota priority (machine-wide,
-                                      default 5, higher wins; 0 pauses the project)
+                                      default 5, higher wins)
+  mgr pause                           park this repo machine-wide: cap 0 until unpaused;
+                                      the guard holds its builders
+  mgr unpause|resume                  lift the pause; the configured cap applies again
   mgr config <set|add|get|unset|list> [key] [value]
                                       per-repo harness config: omp-arg (extra omp argv),
                                       env (KEY=VALUE for the builder's tab), brief-extra
@@ -1177,6 +1268,8 @@ main() {
     retire)        cmd_retire "$@";;
     guard)         cmd_guard "$@";;
     priority)      cmd_priority "$@";;
+    pause)         cmd_pause "$@";;
+    unpause|resume) cmd_unpause "$@";;
     config)        cmd_config "$@";;
     _parse-report) cmd_parse_report "$@";;
     *) die 2 "unknown subcommand: $sub (try: mgr --help)";;

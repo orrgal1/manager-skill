@@ -13,6 +13,11 @@
 # only constrains after MGR_GUARD_CONFIRM_TICKS ticks, no working builder is
 # esc-interrupted until the provider itself goes hard, and recovery restores the
 # ceiling on the same tick and resumes within the 60 s cooldown.
+# Scenario C (issue #7): the operator's own pause — `mgr pause` is a cap-0
+# override and nothing else: the board and `mgr launch` refuse on it, the guard's
+# next tick interrupts the project's builder although the provider is healthy,
+# `mgr wait` names the operator as the reason, and `mgr unpause` restores the cap
+# and resumes the builder without waiting the resume cooldown out.
 # Exit non-zero on any failed assertion.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -107,9 +112,16 @@ case "$1 $2" in
     esac;;
   "issue list") case "${HERDR_WORKSPACE_ID:-}" in
       w9) printf '%s\n' '[{"number":2,"title":"Bubble layout","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":4,"title":"Canvas zoom","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":9,"title":"Survey pass","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":51,"title":"Next thing","labels":[],"body":""}]';;
+      # scenario C's workspace: one in-flight builder (60) and two ready issues,
+      # so the manager's demand is its whole cap of 3
+      w5) printf '%s\n' '[{"number":60,"title":"Paused work","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":61,"title":"Pause me","labels":[],"body":""},{"number":62,"title":"And me","labels":[],"body":""}]';;
       *)  printf '%s\n' '[{"number":49,"title":"Add progress tracking","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":50,"title":"Wait screen","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":51,"title":"Next thing","labels":[],"body":""},{"number":52,"title":"Another","labels":[],"body":""}]';;
     esac;;
-  "issue view") case "$3" in 51) printf '%s\n' '{"number":51,"title":"Next thing","state":"OPEN","labels":[],"body":""}';; *) printf '';; esac;;
+  "issue view") case "$3" in
+      51) printf '%s\n' '{"number":51,"title":"Next thing","state":"OPEN","labels":[],"body":""}';;
+      61) printf '%s\n' '{"number":61,"title":"Pause me","state":"OPEN","labels":[],"body":""}';;
+      *) printf '';;
+    esac;;
   "label create"|"issue edit"|"issue comment") exit 0;;
   *) exit 1;;
 esac
@@ -289,7 +301,7 @@ is "quota.derived_cap" "$(jq -r '.quota.derived_cap' <<<"$bd")" 1
 # board keeps reporting the provider reason
 case "$(jq -r '.quota.reason' <<<"$bd")" in "projected 1.9 > 1 on anthropic:5h"*) ok "quota.reason is the provider reason";; *) bad "quota.reason: $(jq -r '.quota.reason' <<<"$bd")";; esac
 is "quota.managers key order" "$(jq -c '.quota.managers[0] | keys_unsorted' <<<"$bd")" \
-  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","priority","paused"]'
+  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","priority","paused","paused_by_operator"]'
 : >"$T/waits.log"
 out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50 --no-quota-block)
 is "wait status" "$(jq -r '.agent_status' <<<"$out")" quota-paused
@@ -602,5 +614,115 @@ bd=$(MGR_GUARD_NOW_MS=$T7 "$ROOT/bin/mgr" board --cap 3)
 guard_gone
 is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 3
 is "quota.constrained" "$(jq -r '.quota.constrained' <<<"$bd")" false
+
+# ---------------------------------------------------------------------------
+# Scenario C: the operator pause, end to end. Its own state dir, its own agents,
+# its own clock (every mgr/guard call pins it, so the registration's seen_at and
+# the tick agree), MGR_GUARD_NOTIFY=0 and the shipped 60 s resume cooldown.
+echo "# 23. operator-pause fixture: acme/proj in w5, one working builder issue-60, quota fine"
+export MGR_STATE_DIR="$T/state3"
+export HERDR_WORKSPACE_ID=w5 HERDR_PANE_ID=w5:p1 HERDR_TAB_ID=w5:t1
+mkdir -p "$MGR_STATE_DIR/managers"
+: >"$T/prompts.log"; : >"$T/keys.log"; : >"$T/waits.log"
+PC=1788544800000
+usage_file ok 0.05 $((PC + 18000000)) >"$FAKE_USAGE"
+jq -nc --arg s "$SESS_OK" '{result:{agents:[
+  {name:"manager",pane_id:"w5:p1",tab_id:"w5:t1",workspace_id:"w5",cwd:"/p",agent:"omp",agent_status:"idle"},
+  {name:"issue-60",pane_id:"w5:p2",tab_id:"w5:t2",workspace_id:"w5",cwd:"/p-issue-60-z",agent:"omp",agent_status:"working",agent_session:{value:$s}}]}}' >"$AGENTS"
+bd=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" board --cap 3)
+is "repo" "$(jq -r '.repo' <<<"$bd")" acme/proj
+is "paused_by_operator" "$(jq -r '.paused_by_operator' <<<"$bd")" false
+is "cap" "$(jq -r '.cap' <<<"$bd")" 3
+is "registered cap" "$(jq -r '.cap' "$MGR_STATE_DIR/managers/ws-w5.json")" 3
+is "registered demand (1 in flight + 2 ready)" "$(jq -r '.demand' "$MGR_STATE_DIR/managers/ws-w5.json")" 3
+
+echo "# 24. mgr pause: cap 0 for this repo, and the registration follows without a board call"
+out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" pause)
+is "mgr pause json" "$(jq -c . <<<"$out")" '{"repo":"acme/proj","paused":true,"cap":0,"previous_cap":3}'
+is "paused.json" "$(jq -c . "$MGR_STATE_DIR/paused.json")" '{"acme/proj":true}'
+is "registration cap after the pause" "$(jq -r '.cap' "$MGR_STATE_DIR/managers/ws-w5.json")" 0
+is "registration demand after the pause" "$(jq -r '.demand' "$MGR_STATE_DIR/managers/ws-w5.json")" 0
+out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" pause)
+is "mgr pause is idempotent (previous_cap is the configured one)" "$(jq -c . <<<"$out")" \
+  '{"repo":"acme/proj","paused":true,"cap":0,"previous_cap":3}'
+
+echo "# 25. board while paused: the pause outranks --cap 3"
+bd=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" board --cap 3)
+is "paused_by_operator" "$(jq -r '.paused_by_operator' <<<"$bd")" true
+is "cap" "$(jq -r '.cap' <<<"$bd")" 0
+is "cap_effective" "$(jq -r '.cap_effective' <<<"$bd")" 0
+is "slots_free" "$(jq -r '.slots_free' <<<"$bd")" 0
+is "config.cap still reports the configured cap" "$(jq -r '.config.cap' <<<"$bd")" 3
+is "quota.reason" "$(jq -r '.quota.reason' <<<"$bd")" 'paused by the operator (mgr unpause lifts it)'
+
+echo "# 26. mgr launch while paused: one sentence naming mgr unpause, --cap 3 does not lift it"
+set +e
+err=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" launch 61 --cap 3 2>&1 >/dev/null); rc=$?
+set -e
+is "launch exit" "$rc" 3
+is "launch refusal" "$(jq -r '.error.message' <<<"$err")" \
+  'this project is paused by the operator (cap 0); mgr unpause lifts it'
+
+echo "# 27. the guard's tick: demand 0 -> allotment 0, and the working builder is interrupted although the provider is fine"
+st=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr-guard" tick)
+is "constrained" "$(jq -r '.constrained' <<<"$st")" false
+is "provider status" "$(jq -r '.providers.anthropic.status' <<<"$st")" ok
+is "provider not hard" "$(jq -r '.providers.anthropic.hard' <<<"$st")" false
+is "ws-w5 allotment" "$(jq -r '.managers["ws-w5"].allotment' <<<"$st")" 0
+is "ws-w5 paused_by_operator" "$(jq -r '.managers["ws-w5"].paused_by_operator' <<<"$st")" true
+is "ws-w5 paused" "$(jq -r '.managers["ws-w5"].paused' <<<"$st")" true
+is "esc sent to issue-60" "$(cat "$T/keys.log")" "w5:p2 esc"
+is "held entry cause" "$(jq -r '[.stalled[] | select(.name=="issue-60")] | first | .cause' <<<"$st")" operator-paused
+is "held entry esc_sent" "$(jq -r '[.stalled[] | select(.name=="issue-60")] | first | .esc_sent' <<<"$st")" 1
+is "paused_repos" "$(jq -c '.paused_repos' <<<"$st")" '["acme/proj"]'
+gs=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" guard status)
+is "mgr guard status: managers[].paused_by_operator" "$(jq -r '.managers["ws-w5"].paused_by_operator' <<<"$gs")" true
+is "mgr guard status: paused_repos" "$(jq -c '.paused_repos' <<<"$gs")" '["acme/proj"]'
+
+echo "# 28. mgr wait and mgr board name the operator's hold"
+jq -c '(.result.agents[] | select(.name=="issue-60") | .agent_status) = "idle"' "$AGENTS" >"$AGENTS.new" && mv "$AGENTS.new" "$AGENTS"
+guard_alive
+out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" wait 60 --no-quota-block)
+is "wait agent_status" "$(jq -r '.agent_status' <<<"$out")" quota-paused
+is "wait stall.cause" "$(jq -r '.stall.cause' <<<"$out")" operator-paused
+is "parked --until working first" "$(head -1 "$T/waits.log")" "issue-60 --until working"
+bd=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" board --cap 3)
+guard_gone
+is "quota.paused" "$(jq -r '.quota.paused' <<<"$bd")" true
+is "quota.paused_builders" "$(jq -c '.quota.paused_builders' <<<"$bd")" '[60]'
+is "quota.stalled stays 429-only" "$(jq -c '.quota.stalled' <<<"$bd")" '[]'
+is "in_flight 60 quota_paused" "$(jq -r '.in_flight[0].quota_paused' <<<"$bd")" true
+is "quota.managers[].paused_by_operator" "$(jq -r '.quota.managers[0].paused_by_operator' <<<"$bd")" true
+
+echo "# 29. mgr unpause (and its resume alias): the cap comes back, so does the registration"
+out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" unpause)
+is "mgr unpause json" "$(jq -c . <<<"$out")" '{"repo":"acme/proj","paused":false,"cap":3}'
+is "paused.json" "$(jq -c . "$MGR_STATE_DIR/paused.json")" '{}'
+is "registration cap after the unpause" "$(jq -r '.cap' "$MGR_STATE_DIR/managers/ws-w5.json")" 3
+is "registration demand after the unpause" "$(jq -r '.demand' "$MGR_STATE_DIR/managers/ws-w5.json")" 3
+out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" resume)
+is "mgr resume is the same command, idempotent" "$(jq -c . <<<"$out")" '{"repo":"acme/proj","paused":false,"cap":3}'
+
+echo "# 30. the next tick resumes the held builder on the same clock, cooldown or not"
+: >"$T/prompts.log"
+st=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr-guard" tick)
+is "ws-w5 allotment" "$(jq -r '.managers["ws-w5"].allotment' <<<"$st")" 3
+is "ws-w5 paused_by_operator" "$(jq -r '.managers["ws-w5"].paused_by_operator' <<<"$st")" false
+is "paused_repos" "$(jq -c '.paused_repos' <<<"$st")" '[]'
+is "one resume prompt" "$(awk -F'\t' '$1=="w5:p2"' "$T/prompts.log" | wc -l | tr -d ' ')" 1
+resume=$(awk -F'\t' '$1=="w5:p2"{print $2}' "$T/prompts.log")
+case "$resume" in "mgr-guard: the operator unpaused this project (priority 5, allotment 3). The quota guard interrupted your previous turn because the operator paused the project."*)
+  ok "resume text names the operator's pause";; *) bad "resume text: $resume";; esac
+is "held entry gone" "$(jq -r '[.stalled[] | select(.name=="issue-60")] | length' <<<"$st")" 0
+is "operator_pause events" "$(jq -r '[.events[] | select(.kind=="operator_pause") | .detail] | join("|")' <<<"$st")" \
+  'acme/proj: paused|acme/proj: unpaused'
+is "no new esc" "$(cat "$T/keys.log")" "w5:p2 esc"
+
+echo "# 31. board after the unpause: the full cap and the free slots are back"
+bd=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" board --cap 3)
+is "paused_by_operator" "$(jq -r '.paused_by_operator' <<<"$bd")" false
+is "cap" "$(jq -r '.cap' <<<"$bd")" 3
+is "slots_free" "$(jq -r '.slots_free' <<<"$bd")" 2
+is "quota.paused" "$(jq -r '.quota.paused' <<<"$bd")" false
 
 [ "$fail" = 0 ] && echo "e2e-quota: all assertions passed" || { echo "e2e-quota: FAILURES"; exit 1; }

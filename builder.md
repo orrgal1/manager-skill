@@ -220,15 +220,17 @@ Never leave the issue silent. A builder that stops without a report looks like a
 ### Quota guard interruptions
 
 A prompt that starts with `mgr-guard:` is not from the manager or the operator — it is a plain
-daemon, and it comes in two flavours. *"provider quota … is available again"*: your previous turn
+daemon, and it comes in three flavours. *"provider quota … is available again"*: your previous turn
 died on a provider rate limit (429) and the quota is back. *"this project's quota allotment is
 back"*: the guard interrupted your turn with `esc` to keep quota for a higher-priority project,
-and your project's share has now returned. Either way nobody is asking you anything and nothing
-about your issue changed: resume exactly where you stopped, under this contract.
+and your project's share has now returned. *"the operator unpaused this project"*: the operator
+had paused the whole project (`mgr pause` — the guard interrupted you, or held you at your turn
+boundary, because of it) and has now lifted the pause. In every case nobody is asking you anything
+and nothing about your issue changed: resume exactly where you stopped, under this contract.
 
 An interruption can land mid-command, so before you continue check `git status` and the last step
 you took — the command may have half-run, and you want neither to redo it nor to build on half of
-it. Neither kind of stop is a failure: do not restart your work from the top and do not post a
+it. None of these stops is a failure: do not restart your work from the top and do not post a
 `manager-report` for it.
 
 ## 13. Report protocol

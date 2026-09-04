@@ -28,6 +28,7 @@ MGRDIR="$STATE_DIR/managers"
 SAMPLES="$STATE_DIR/samples.jsonl"
 LOCKDIR="$STATE_DIR/guard.lock"
 PRIOFILE="$STATE_DIR/priorities.json"
+PAUSEFILE="$STATE_DIR/paused.json"
 
 INTERVAL_S="${MGR_GUARD_INTERVAL:-60}"
 SLOPE_WINDOW_S="${MGR_GUARD_SLOPE_WINDOW_S:-1800}"
@@ -165,6 +166,9 @@ def fit_of($pv):
 
 def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) // null);
 
+# a held entry: cause "paused" is a quota hold by the guard, "operator-paused" one from mgr pause
+def held: ((.cause // "") | IN("paused", "operator-paused"));
+
 # ---- managers: live vs dead registrations, project priority
 ($managers | map(. + {live: (((.pane_id // "") | IN($panes[])) and ((.seen_at // 0) >= ($now - 3600000))),
                       priority: (($priorities[(.repo // "")] // 5))})) as $mgrs
@@ -175,7 +179,7 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
 | ($agents | map({key: .pane_id, value: .}) | from_entries) as $byp
 
 # ---- paused entries survive from the previous tick until resumed or their agent is gone
-| ([ ($prev.stalled // [])[] | select(.cause == "paused") | select((.pane_id // "") | IN($panes[])) ]) as $paused_prev
+| ([ ($prev.stalled // [])[] | select(held) | select((.pane_id // "") | IN($panes[])) ]) as $paused_prev
 | ($paused_prev | map(.pane_id)) as $ppanes
 
 # ---- stalled sessions (upsert against the previous tick)
@@ -289,13 +293,18 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
     | $m + {active_builders: ($ab | length), builders: $ab, all_builders: $all})) as $live1
 
 # ---- priority-derived cap ceiling: the top-priority project keeps its whole cap, everyone else
-# ---- scales down with its share of that priority, but never below one slot
+# ---- scales down with its share of that priority, but never below one slot. An operator pause
+# ---- (cap 0, or an entry in paused.json) has to get past that floor of one, so it lands on
+# ---- demand_effective and not on derived_cap: the ceiling formula stays exactly as it was, the
+# ---- demand it caps goes to zero, and the water-filling below then hands out an allotment of 0.
 | ([$live1[] | .priority] | max) as $top_priority
 | ([$live1[] | select(.priority == $top_priority) | (.cap // 0)] | max) as $top_cap
 | ($live1 | map(. as $m
     | (if ($top_priority // 0) <= 0 or $m.priority <= 0 then 1
        else ([1, (($top_cap * $m.priority / $top_priority) | floor)] | max) end) as $dc
-    | $m + {derived_cap: $dc, demand_effective: ([($m.demand // 0), $dc] | min)})) as $live
+    | (($paused[($m.repo // "")] // false) or (($m.cap // 0) == 0)) as $op
+    | $m + {derived_cap: $dc, paused_by_operator: $op,
+            demand_effective: (if $op then 0 else ([($m.demand // 0), $dc] | min) end)})) as $live
 | ((([$live[] | .demand_effective] | add) // 0)) as $demand_total
 | ($allowed_total < $demand_total) as $constrained
 
@@ -346,27 +355,38 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
       | (($pp[$k] // 5)) as $a0 | (($priorities[$k] // 5)) as $b0
       | if $a0 == $b0 then empty
         else {at: $now, kind: "priority_changed",
-              detail: ($k + ": " + ($a0 | tostring) + " -> " + ($b0 | tostring))} end) ]) as $events
+              detail: ($k + ": " + ($a0 | tostring) + " -> " + ($b0 | tostring))} end),
+     # the operator pause map changing between ticks is worth a line of its own
+     ((($prev.paused_repos // [])) as $wasp
+      | ($paused | keys | sort) as $isp
+      | (($wasp + $isp) | unique)[] as $k
+      | if ($k | IN($isp[])) == ($k | IN($wasp[])) then empty
+        else {at: $now, kind: "operator_pause",
+              detail: ($k + ": " + (if ($k | IN($isp[])) then "paused" else "unpaused" end))} end) ])
+   as $events
 
-# ---- over-allotment builders: keep working ones, then adoptees, then low issue numbers
-| (if $constrained then
-     [ $mgrsout[] | . as $m
-       | (($m.all_builders // [])
-          | sort_by([(if (.agent_status == "working") then 0 else 1 end),
-                     (if (((.name // "") | test("^adopt-"))) then 0 else 1 end),
-                     (((.name | issue_no) // 2147483647)),
-                     (.pane_id // "")]))[($m.allotment // 0):][]
-       | {pane_id: .pane_id, name: (.name // null), workspace_id: (.workspace_id // null),
-          session: (.session // null), provider: (.provider // $bp),
-          agent_status: (.agent_status // "unknown"),
-          manager_id: $m.manager_id, priority: $m.priority, allotment: $m.allotment} ]
-   else [] end) as $over
+# ---- over-allotment builders: keep working ones, then adoptees, then low issue numbers.
+# ---- Quota only trims a project while the provider is constrained; an operator pause is the one
+# ---- unconditional path — its allotment is 0, so every builder it owns is over-allotment.
+| ([ $mgrsout[] | . as $m
+     | select($constrained or ($m.paused_by_operator // false))
+     | (($m.all_builders // [])
+        | sort_by([(if (.agent_status == "working") then 0 else 1 end),
+                   (if (((.name // "") | test("^adopt-"))) then 0 else 1 end),
+                   (((.name | issue_no) // 2147483647)),
+                   (.pane_id // "")]))[($m.allotment // 0):][]
+     | {pane_id: .pane_id, name: (.name // null), workspace_id: (.workspace_id // null),
+        session: (.session // null), provider: (.provider // $bp),
+        agent_status: (.agent_status // "unknown"),
+        manager_id: $m.manager_id, priority: $m.priority, allotment: $m.allotment,
+        operator: ($m.paused_by_operator // false)} ]) as $over
 # level 1: an idle one is simply held at its turn boundary, no keys sent
 | ([ $over[] | select(.agent_status != "working")
      | del(.agent_status) + {paused_at: $now, esc_sent: 0, fresh: true, soft: true} ]) as $pause_soft
-# level 2: a working one is interrupted only when the provider itself is hard
+# level 2: a working one is interrupted when the provider itself is hard — or unconditionally when
+# the operator paused the project, since that hold has nothing to do with the provider
 | ([ $over[] | select(.agent_status == "working")
-     | select((($pfull[$bp] // {}).hard // false))
+     | select(((($pfull[$bp] // {}).hard // false)) or (.operator // false))
      | del(.agent_status) + {paused_at: $now, esc_sent: 1, fresh: true} ]
    | sort_by([(if (((.name // "") | test("^adopt-"))) then 1 else 0 end),
               (0 - ((.name | issue_no) // 0)),
@@ -375,43 +395,59 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
 
 # ---- resume candidates: paused builders whose manager has room again, lowest issue number first
 # room is counted the way the over-allotment list is: every unheld builder of the
-# manager takes a slot, working or not, so a hold is never undone on the next tick
+# manager takes a slot, working or not, so a hold is never undone on the next tick.
+# An operator-paused entry skips the cooldown: unpausing is an explicit decision, not a guess
+# about the provider recovering.
 | ([ $mgrsout[] | . as $m
      | ((($m.allotment // 0) - (($m.all_builders // []) | length))) as $room
      | select($room > 0)
-     | ([ $stalled[] | select(.cause == "paused")
+     | ([ $stalled[] | select(held)
           | select((.manager_id // "") == $m.manager_id)
-          | select($now >= (($m.no_room_at // 0) + ($cooldown * 1000)))
+          | select(((.cause // "") == "operator-paused")
+                   or ($now >= (($m.no_room_at // 0) + ($cooldown * 1000))))
           | select(((($providers[(.provider // "")] // null)
                      | if . == null then "unknown" else .status end) // "unknown") != "exhausted") ]
         | sort_by([((.name | issue_no) // 2147483647), (.pane_id // "")]))[0:$room][]
      | . as $pe
      | {pane_id: .pane_id, name: (.name // null), manager_id: $m.manager_id,
         priority: $m.priority, allotment: $m.allotment,
-        text: ("mgr-guard: this project\u0027s quota allotment is back (priority "
-               + ($m.priority | tostring) + ", allotment " + ($m.allotment | tostring) + ")."
-               + (if (($pe.esc_sent // 0) >= 1)
-                  then " The quota guard interrupted your previous turn to keep quota for"
-                  else " The quota guard held this session at the end of its previous turn"
-                       + " to keep quota for" end)
-               + " higher-priority projects. Nobody needs to answer anything — resume exactly"
-               + " where you stopped and continue under your existing instructions.")} ]) as $resume
+        text: (if (($pe.cause // "") == "operator-paused")
+               then ("mgr-guard: the operator unpaused this project (priority "
+                     + ($m.priority | tostring) + ", allotment " + ($m.allotment | tostring) + ")."
+                     + (if (($pe.esc_sent // 0) >= 1)
+                        then " The quota guard interrupted your previous turn because the operator"
+                             + " paused the project."
+                        else " The quota guard held this session at the end of its previous turn"
+                             + " because the operator paused the project." end)
+                     + " Nobody needs to answer anything — resume exactly where you stopped and"
+                     + " continue under your existing instructions.")
+               else ("mgr-guard: this project\u0027s quota allotment is back (priority "
+                     + ($m.priority | tostring) + ", allotment " + ($m.allotment | tostring) + ")."
+                     + (if (($pe.esc_sent // 0) >= 1)
+                        then " The quota guard interrupted your previous turn to keep quota for"
+                        else " The quota guard held this session at the end of its previous turn"
+                             + " to keep quota for" end)
+                     + " higher-priority projects. Nobody needs to answer anything — resume exactly"
+                     + " where you stopped and continue under your existing instructions.") end)} ])
+   as $resume
 | ($resume | map(.pane_id)) as $rpanes
 
-# ---- esc re-sends: only while the manager still has no room and the provider is hard
-| ([ $stalled[] | select(.cause == "paused")
+# ---- esc re-sends: while the manager still has no room and either the provider is hard or the
+# ---- operator is holding the project down
+| ([ $stalled[] | select(held)
      | select((.pane_id | IN($rpanes[])) | not)
      | select(((($byp[.pane_id] // {}).agent_status) // "") == "working")
      | select((.esc_sent // 0) < 3)
-     | select((($pfull[$bp] // {}).hard // false))
      | . as $pe
      | ((($mgrsout | map(select(.manager_id == ($pe.manager_id // ""))) | first) // null)) as $mm
+     | select(((($pfull[$bp] // {}).hard // false)) or (($mm.paused_by_operator) // false))
      | select(($mm == null) or ((($mm.allotment // 0) - (($mm.all_builders // []) | length)) <= 0))
      | {pane_id: .pane_id, name: (.name // null), workspace_id: (.workspace_id // null),
         session: (.session // null), provider: (.provider // $bp),
         manager_id: (.manager_id // null), priority: (.priority // null), allotment: null,
-        paused_at: (.paused_at // $now), esc_sent: ((.esc_sent // 0) + 1), fresh: false} ]) as $pause_again
-| ([ $stalled[] | select(.cause == "paused")
+        paused_at: (.paused_at // $now), esc_sent: ((.esc_sent // 0) + 1), fresh: false,
+        operator: ((($mm.paused_by_operator) // false))} ]) as $pause_again
+| ([ $stalled[] | select(held)
      | select((.pane_id | IN($rpanes[])) | not)
      | select(((($byp[.pane_id] // {}).agent_status) // "") == "working")
      | select((.esc_sent // 0) >= 3) | .pane_id ]) as $pause_stuck
@@ -445,13 +481,15 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
 | {now: $now, builder_provider: $bp, ceiling: $ceiling, providers: $providers,
    allowed_total: $allowed_total, demand_total: $demand_total, constrained: $constrained,
    top_priority: $top_priority, top_cap: $top_cap,
-   priorities: $priorities, managers: $mgrsout, dead: ($dead | map(.manager_id)),
+   priorities: $priorities, paused_repos: ($paused | keys | sort),
+   managers: $mgrsout, dead: ($dead | map(.manager_id)),
    stalled: $stalled, events: $events, reignite: $reignite,
    pause: ($pause_new + $pause_again), pause_stuck: $pause_stuck, resume: $resume}'
 
 # policy output + prompt results -> {state, toasts, log}
 JQ_FINALIZE='
 def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
+def held: ((.cause // "") | IN("paused", "operator-paused"));
 ($policy.now) as $now
 # ---- reignition bookkeeping (429 entries only)
 | ($policy.stalled | map(
@@ -475,14 +513,16 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
             | {pane_id: .pane_id, name: .name, workspace_id: .workspace_id, session: .session,
                provider: .provider, model: null, error: null, since: .paused_at,
                retry_after_ms: null, attempts: 0, last_reignite_at: null, next_reignite_at: null,
-               cause: "paused", paused_at: .paused_at, esc_sent: .esc_sent,
+               cause: (if (.operator // false) then "operator-paused" else "paused" end),
+               paused_at: .paused_at, esc_sent: .esc_sent,
                manager_id: .manager_id} ]) as $stalled
 | ([ $results[] | select(.ok) | {at: $now, kind: "reignite",
       detail: (.pane_id + " (" + .provider + ", " + .limit + ")")} ]
    + [ $pok[] | select(.fresh) | {at: $now, kind: "paused",
       detail: (.pane_id + " " + (.name // "?") + " (" + (.manager_id // "?")
                + " priority " + ((.priority // 5) | tostring)
-               + ", allotment " + ((.allotment // 0) | tostring) + ")")} ]
+               + ", allotment " + ((.allotment // 0) | tostring)
+               + (if (.operator // false) then ", operator pause" else "" end) + ")")} ]
    + [ $rresults[] | select(.ok) | {at: $now, kind: "resumed",
       detail: (.pane_id + " " + (.name // "?") + " (" + (.manager_id // "?")
                + " allotment " + ((.allotment // 0) | tostring) + ")")} ]) as $rev
@@ -496,15 +536,17 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
            top_cap: $policy.top_cap,
            constrained: $policy.constrained,
            priorities: $policy.priorities,
+           paused_repos: ($policy.paused_repos // []),
            managers: ($policy.managers | map(del(.builders) | del(.all_builders) | . as $m
              | {key: .manager_id,
                 value: ($m + {paused: (([ $stalled[]
-                    | select((.cause == "paused") and ((.manager_id // "") == $m.manager_id)) ]
-                  | length) > 0)})}) | from_entries),
+                    | select(held and ((.manager_id // "") == $m.manager_id)) ]
+                  | length) > 0),
+                  paused_by_operator: ($m.paused_by_operator // false)})}) | from_entries),
            stalled: $stalled,
            events: ((($prev.events // []) + $new) | .[-50:])},
    toasts: [ $new[] | select(.kind | IN("exhausted", "recovered", "allowed_changed", "reignite",
-                                        "paused", "resumed", "priority_changed"))
+                                        "paused", "resumed", "priority_changed", "operator_pause"))
              | (.kind + ": " + .detail) ],
    log: ("tick provider=" + $policy.builder_provider
          + " status=" + ((($policy.providers[$policy.builder_provider] // null)
@@ -535,6 +577,13 @@ read_priorities() { # the machine-wide {"owner/name":N} map, {} when absent or u
   if [ -f "$PRIOFILE" ]; then
     jq -c 'if type == "object" then with_entries(select((.value | type) == "number")) else {} end' \
       "$PRIOFILE" 2>/dev/null || printf '{}'
+  else printf '{}'; fi
+}
+
+read_paused() { # the machine-wide {"owner/name":true} operator-pause map, {} when absent
+  if [ -f "$PAUSEFILE" ]; then
+    jq -c 'if type == "object" then with_entries(select(.value == true)) else {} end' \
+      "$PAUSEFILE" 2>/dev/null || printf '{}'
   else printf '{}'; fi
 }
 
@@ -658,7 +707,9 @@ cmd_stall() {
   [ -n "$f" ] || die 2 "usage: mgr-guard stall [--pane <pane_id>] <session.jsonl>"
   if [ -n "$pane" ]; then
     entry=$(read_state | jq -c --arg p "$pane" \
-      '[(.stalled // [])[] | select((.pane_id == $p) and (.cause == "paused"))] | first // empty')
+      '[(.stalled // [])[] | select((.pane_id == $p)
+                                    and (((.cause // "") | IN("paused", "operator-paused"))))]
+       | first // empty')
     if [ -n "$entry" ]; then printf '%s\n' "$entry"; return 0; fi
   fi
   [ -e "$f" ] || die 4 "session file not found: $f"
@@ -718,6 +769,76 @@ cmd_priority() {
     '{repo:$r, priority:($m[$r] // 5), explicit:(($m | has($r)))}'
 }
 
+# ---------------------------------------------------------------- pause
+
+# The operator pause is nothing but a cap of 0 for one repo: the tick turns a paused entry into
+# demand_effective 0, so the project's allotment goes to 0 and its builders take the pause path.
+cmd_pause() {
+  local repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift;;
+      -*) die 2 "usage: mgr-guard pause [<repo>]";;
+      *) [ -n "$1" ] || die 2 "pause: <repo> must not be empty"
+         [ -z "$repo" ] || die 2 "usage: mgr-guard pause [<repo>]"
+         repo="$1"; shift;;
+    esac
+  done
+
+  local map
+  map=$(read_paused)
+
+  if [ -z "$repo" ]; then
+    jq -nc --argjson m "$map" '{paused:($m | keys | sort)}'
+    return 0
+  fi
+
+  ensure_state_dir
+  local out
+  out=$(jq -c --arg r "$repo" '.[$r] = true' <<<"$map")
+  printf '%s\n' "$out" | atomic_write "$PAUSEFILE" || die 1 "cannot write $PAUSEFILE"
+  log info "pause $repo"
+  jq -nc --arg r "$repo" '{repo:$r, paused:true}'
+}
+
+cmd_unpause() {
+  local repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift;;
+      -*) die 2 "usage: mgr-guard unpause <repo>";;
+      *) [ -n "$1" ] || die 2 "unpause: <repo> must not be empty"
+         [ -z "$repo" ] || die 2 "usage: mgr-guard unpause <repo>"
+         repo="$1"; shift;;
+    esac
+  done
+  [ -n "$repo" ] || die 2 "usage: mgr-guard unpause <repo>"
+
+  local map out
+  map=$(read_paused)
+  ensure_state_dir
+  out=$(jq -c --arg r "$repo" 'del(.[$r])' <<<"$map")
+  printf '%s\n' "$out" | atomic_write "$PAUSEFILE" || die 1 "cannot write $PAUSEFILE"
+  log info "unpause $repo"
+  jq -nc --arg r "$repo" '{repo:$r, paused:false}'
+}
+
+cmd_paused() { # read-only: mgr asks this on every board/launch, so it never writes
+  local repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift;;
+      -*) die 2 "usage: mgr-guard paused <repo>";;
+      *) [ -n "$1" ] || die 2 "paused: <repo> must not be empty"
+         [ -z "$repo" ] || die 2 "usage: mgr-guard paused <repo>"
+         repo="$1"; shift;;
+    esac
+  done
+  [ -n "$repo" ] || die 2 "usage: mgr-guard paused <repo>"
+  jq -nc --argjson m "$(read_paused)" --arg r "$repo" \
+    '{repo:$r, paused:(($m[$r] // false) == true)}'
+}
+
 # ---------------------------------------------------------------- register
 
 cmd_register() {
@@ -748,7 +869,7 @@ cmd_register() {
 
 cmd_tick() {
   ensure_state_dir
-  local now prev bp agents panes facts providers p rep reports='[]' samples managers priorities
+  local now prev bp agents panes facts providers p rep reports='[]' samples managers priorities paused
   now=$(now_ms)
   prev=$(read_state)
   bp=$(builder_provider)
@@ -757,6 +878,7 @@ cmd_tick() {
   facts=$(scan_agents "$agents" "$now")
   managers=$(managers_json)
   priorities=$(read_priorities)
+  paused=$(read_paused)
 
   providers=$(jq -r --arg bp "$bp" \
     '([$bp] + [.[] | select(.stall != null) | (.stall.provider // empty)]) | unique | .[]' <<<"$facts")
@@ -783,7 +905,8 @@ cmd_tick() {
     --argjson managers "$managers" --argjson prev "$prev" \
     --argjson reports "$reports" --argjson samples "$samples" \
     --argjson slope_window "$SLOPE_WINDOW_S" --argjson min_span "$MIN_SLOPE_SPAN_S" \
-    --argjson priorities "$priorities" --argjson cooldown "$RESUME_COOLDOWN_S" \
+    --argjson priorities "$priorities" --argjson paused "$paused" \
+    --argjson cooldown "$RESUME_COOLDOWN_S" \
     --argjson confirm "$CONFIRM_TICKS" \
     "$JQ_POLICY") || die 1 "policy evaluation failed"
 
@@ -1020,6 +1143,10 @@ mgr-guard — deterministic quota guard for herdr-hosted omp builders
   mgr-guard priority <repo>           priority of one repo (default 5)
   mgr-guard priority <repo> <N>       set it (integer >= 0, higher wins)
   mgr-guard priority <repo> --clear   drop the entry (back to the default)
+  mgr-guard pause                     print the operator-pause map (repos at cap 0)
+  mgr-guard pause <repo>              pause one repo (cap 0 for it, idempotent)
+  mgr-guard unpause <repo>            drop the pause (idempotent)
+  mgr-guard paused <repo>             whether one repo is paused (read-only)
 
 Env: MGR_STATE_DIR MGR_GUARD_INTERVAL MGR_GUARD_SLOPE_WINDOW_S
      MGR_GUARD_MIN_SLOPE_SPAN_S MGR_GUARD_IDLE_EXIT_S MGR_GUARD_NOTIFY
@@ -1041,6 +1168,9 @@ main() {
     register)       cmd_register "$@";;
     stall)          cmd_stall "$@";;
     priority)       cmd_priority "$@";;
+    pause)          cmd_pause "$@";;
+    unpause)        cmd_unpause "$@";;
+    paused)         cmd_paused "$@";;
     -h|--help|help) usage; exit 0;;
     *) die 2 "unknown subcommand: $sub (try: mgr-guard --help)";;
   esac

@@ -190,7 +190,7 @@ arm() { # arm <state-dir> <now-ms> <used-prev> <used-now> [status]: seed one pri
 
 printf '== help / usage ==\n'
 HELP="$("$GUARD" --help)"
-for c in start stop status tick run register stall priority; do
+for c in start stop status tick run register stall priority pause unpause paused; do
   case "$HELP" in *"mgr-guard $c"*) pass "--help lists $c";; *) fail "--help is missing $c";; esac
 done
 "$GUARD" nonsense >/dev/null 2>&1; assert_eq "unknown subcommand exit code" 2 "$?"
@@ -729,6 +729,184 @@ assert_jq "(n4) priority 0 -> derived_cap 1, one slot allotted" "$ST_N4" \
   '(.managers["ws-wZ"] | .priority == 0 and .derived_cap == 1
     and .demand == 3 and .demand_effective == 1 and .allotment == 1)
    and .demand_total == 4 and .constrained == false'
+
+printf '\n== (p) operator pause: a cap-0 registration is allotment 0 and an interrupt, constrained or not ==\n'
+
+# ---- (p1) the pause store itself: pause / unpause / paused, junk-safe and idempotent
+SD_OP1="$TMP/s-op1"
+PS0="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" pause)"
+assert_jq "(p1) no paused.json -> empty list" "$PS0" '.paused == []'
+PS1="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" paused acme/x)"
+assert_jq "(p1) paused <repo> with no file -> false" "$PS1" '.repo == "acme/x" and .paused == false'
+PS2="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" pause acme/x)"
+assert_jq "(p1) pause acme/x" "$PS2" '.repo == "acme/x" and .paused == true'
+assert_jq "(p1) paused.json on disk" "$(cat "$SD_OP1/paused.json")" '.["acme/x"] == true'
+PS3="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" paused acme/x)"
+assert_jq "(p1) paused acme/x -> true" "$PS3" '.repo == "acme/x" and .paused == true'
+PS4="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" pause acme/x)"
+assert_jq "(p1) pause is idempotent" "$PS4" '.repo == "acme/x" and .paused == true'
+PS5="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" pause)"
+assert_jq "(p1) pause with no args lists the repo" "$PS5" '.paused == ["acme/x"]'
+MGR_STATE_DIR="$SD_OP1" "$GUARD" pause acme/a >/dev/null
+PS6="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" pause)"
+assert_jq "(p1) the list is sorted" "$PS6" '.paused == ["acme/a","acme/x"]'
+MGR_STATE_DIR="$SD_OP1" "$GUARD" unpause acme/a >/dev/null
+PS7="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" unpause acme/x)"
+assert_eq "(p1) unpause exit code" 0 "$?"
+assert_jq "(p1) unpause acme/x" "$PS7" '.repo == "acme/x" and .paused == false'
+PS8="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" unpause acme/x)"
+assert_eq "(p1) unpause when not paused exits 0" 0 "$?"
+assert_jq "(p1) unpause is idempotent" "$PS8" '.repo == "acme/x" and .paused == false'
+PS9="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" paused acme/x)"
+assert_jq "(p1) paused acme/x -> false again" "$PS9" '.paused == false'
+PS10="$(MGR_STATE_DIR="$SD_OP1" "$GUARD" pause)"
+assert_jq "(p1) the map is empty again" "$PS10" '.paused == []'
+MGR_STATE_DIR="$SD_OP1" "$GUARD" pause "" >/dev/null 2>&1
+assert_eq "(p1) pause with an empty repo exit code" 2 "$?"
+MGR_STATE_DIR="$SD_OP1" "$GUARD" paused >/dev/null 2>&1
+assert_eq "(p1) paused without a repo exit code" 2 "$?"
+MGR_STATE_DIR="$SD_OP1" "$GUARD" unpause >/dev/null 2>&1
+assert_eq "(p1) unpause without a repo exit code" 2 "$?"
+SD_OP1B="$TMP/s-op1b"; mkdir -p "$SD_OP1B"
+printf 'this is not json at all\n' >"$SD_OP1B/paused.json"
+PS11="$(MGR_STATE_DIR="$SD_OP1B" "$GUARD" pause)"
+assert_jq "(p1) junk paused.json reads as an empty map" "$PS11" '.paused == []'
+printf '%s\n' '{"acme/x":false,"acme/y":true,"acme/z":"yes"}' >"$SD_OP1B/paused.json"
+PS12="$(MGR_STATE_DIR="$SD_OP1B" "$GUARD" pause)"
+assert_jq "(p1) only entries set to true count as paused" "$PS12" '.paused == ["acme/y"]'
+
+# ---- (p2) quota is fine and nothing is constrained, but acme/z registers cap 0 / demand 0:
+# its allotment is 0 all the same, its working builder is interrupted and its idle one held
+SD_OP="$TMP/s-op"
+agents_file "$TMP/agents-op.json" \
+  "$(mk_agent manager-wP wP:p1 wP idle '')" \
+  "$(mk_agent manager-wZ wZ:p1 wZ idle '')" \
+  "$(mk_agent issue-1 wP:p2 wP working '')" \
+  "$(mk_agent issue-9 wZ:p9 wZ working '')" \
+  "$(mk_agent issue-7 wZ:p7 wZ blocked '')"
+export FAKE_AGENTS="$TMP/agents-op.json"
+export FAKE_KEYS="$TMP/keys-op.log" FAKE_PROMPTS="$TMP/prompts-op.log" FAKE_TOASTS="$TMP/toasts-op.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"
+reg "$SD_OP" "$T0" ws-wP wP wP:p1 3 1 0 3 3 acme/p >/dev/null
+reg "$SD_OP" "$T0" ws-wZ wZ wZ:p1 0 0 0 0 0 acme/z >/dev/null
+arm "$SD_OP" "$T0" 0.25 0.25          # no burn, provider ok -> the quota is not the reason
+ST_OP1="$(MGR_STATE_DIR="$SD_OP" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(p2) the provider is fine and nothing is constrained" "$ST_OP1" \
+  '.constrained == false and .providers.anthropic.reason == "ok" and .providers.anthropic.hard == false'
+assert_jq "(p2) cap 0 -> allotment 0 past the one-slot floor" "$ST_OP1" \
+  '(.managers["ws-wZ"] | .cap == 0 and .demand_effective == 0 and .allotment == 0
+    and .derived_cap >= 1 and .paused_by_operator == true and .paused == true)'
+assert_jq "(p2) the other project is untouched" "$ST_OP1" \
+  '(.managers["ws-wP"] | .allotment == 3 and .paused_by_operator == false and .paused == false)'
+assert_eq "(p2) only the working builder of wZ is interrupted" "wZ:p9 esc" "$(cat "$FAKE_KEYS")"
+assert_jq "(p2) both wZ builders are held as operator pauses" "$ST_OP1" \
+  '[.stalled[] | select((.workspace_id // "") == "wZ")] as $z
+   | ($z | length) == 2 and ([$z[] | .cause] | unique) == ["operator-paused"]
+     and ([$z[] | select(.pane_id == "wZ:p9")] | first | .esc_sent) == 1
+     and ([$z[] | select(.pane_id == "wZ:p7")] | first | .esc_sent) == 0'
+assert_jq "(p2) a held entry keeps the shape a quota hold has" "$ST_OP1" \
+  '[.stalled[] | select(.pane_id == "wZ:p7")] | first
+   | .name == "issue-7" and .manager_id == "ws-wZ" and .provider == "anthropic"
+     and .paused_at == '"$T0"' and .since == '"$T0"'
+     and .model == null and .error == null and .attempts == 0 and .next_reignite_at == null'
+assert_jq "(p2) the paused events name the operator" "$ST_OP1" \
+  '[.events[] | select(.kind == "paused") | .detail] as $d
+   | ($d | length) == 2 and ([$d[] | select(endswith(", operator pause)"))] | length) == 2
+     and ([$d[] | select(test("wZ:p9 issue-9 \\(ws-wZ priority 5, allotment 0, operator pause\\)"))] | length) == 1'
+assert_jq "(p2) a cap-0 registration alone is not a paused repo" "$ST_OP1" '.paused_repos == []'
+assert_eq "(p2) a pause sends no prompts" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+
+# ---- (p3) paused.json outranks the registration: the cap goes back to 3 and the allotment stays 0
+NOW_OP=$(( T0 + 60000 ))
+MGR_STATE_DIR="$SD_OP" "$GUARD" pause acme/z >/dev/null
+reg "$SD_OP" "$NOW_OP" ws-wZ wZ wZ:p1 3 1 0 3 3 acme/z >/dev/null
+arm "$SD_OP" "$NOW_OP" 0.25 0.25
+ST_OP2="$(MGR_STATE_DIR="$SD_OP" MGR_GUARD_NOW_MS="$NOW_OP" "$GUARD" tick)"
+assert_jq "(p3) paused.json wins over the registered cap" "$ST_OP2" \
+  '(.managers["ws-wZ"] | .cap == 3 and .demand == 3 and .demand_effective == 0
+    and .allotment == 0 and .paused_by_operator == true)'
+assert_jq "(p3) paused_repos lists the repo" "$ST_OP2" '.paused_repos == ["acme/z"]'
+assert_jq "(p3) one operator_pause event" "$ST_OP2" \
+  '[.events[] | select(.kind == "operator_pause") | .detail] == ["acme/z: paused"]'
+if grep -q 'operator_pause: acme/z: paused' "$FAKE_TOASTS"; then
+  pass "(p3) operator_pause toast"
+else
+  fail "(p3) no operator_pause toast"
+fi
+assert_eq "(p3) esc re-sent although the provider is not hard" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+assert_jq "(p3) esc_sent 2 on the working builder, the held one untouched" "$ST_OP2" \
+  '.providers.anthropic.hard == false
+   and ([.stalled[] | select(.pane_id == "wZ:p9")] | first | .esc_sent) == 2
+   and ([.stalled[] | select(.pane_id == "wZ:p7")] | first | .esc_sent) == 0
+   and ([.stalled[] | select((.workspace_id // "") == "wZ") | .cause] | unique) == ["operator-paused"]'
+assert_eq "(p3) still no prompts" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+
+# ---- (p4) unpause on the very same clock: the operator's own hold skips the resume cooldown
+MGR_STATE_DIR="$SD_OP" "$GUARD" unpause acme/z >/dev/null
+reg "$SD_OP" "$NOW_OP" ws-wZ wZ wZ:p1 3 1 0 3 3 acme/z >/dev/null
+arm "$SD_OP" "$NOW_OP" 0.25 0.25
+ST_OP3="$(MGR_STATE_DIR="$SD_OP" MGR_GUARD_NOW_MS="$NOW_OP" "$GUARD" tick)"
+assert_jq "(p4) the derived cap is back" "$ST_OP3" \
+  '(.managers["ws-wZ"] | .allotment == 3 and .demand_effective == 3
+    and .paused_by_operator == false and .paused == false)'
+assert_jq "(p4) paused_repos empty again" "$ST_OP3" '.paused_repos == []'
+assert_eq "(p4) both held builders are resumed inside the cooldown" "wZ:p7
+wZ:p9" "$(cut -f1 <"$FAKE_PROMPTS")"
+OP_RESUME_ESC="$(grep '^wZ:p9' "$FAKE_PROMPTS" | cut -f2)"
+case "$OP_RESUME_ESC" in
+  "mgr-guard: the operator unpaused this project (priority 5, allotment 3). The quota guard interrupted your previous turn because the operator paused the project."*)
+    pass "(p4) the interrupted builder is told the operator paused it";;
+  *) fail "(p4) operator resume text: $OP_RESUME_ESC";;
+esac
+case "$OP_RESUME_ESC" in
+  *"Nobody needs to answer anything — resume exactly where you stopped and continue under your existing instructions.")
+    pass "(p4) the operator resume ends with the standard nothing-to-answer line";;
+  *) fail "(p4) operator resume tail: $OP_RESUME_ESC";;
+esac
+OP_RESUME_HELD="$(grep '^wZ:p7' "$FAKE_PROMPTS" | cut -f2)"
+case "$OP_RESUME_HELD" in
+  *"held this session at the end of its previous turn because the operator paused the project"*)
+    pass "(p4) the turn-boundary hold gets its own wording";;
+  *) fail "(p4) held resume text: $OP_RESUME_HELD";;
+esac
+assert_jq "(p4) no wZ entries left" "$ST_OP3" \
+  '[.stalled[] | select((.workspace_id // "") == "wZ")] | length == 0'
+assert_jq "(p4) resumed events and the unpause event" "$ST_OP3" \
+  '([.events[] | select(.kind == "resumed" and .at == '"$NOW_OP"')] | length) == 2
+   and ([.events[] | select(.kind == "operator_pause") | .detail] | index("acme/z: unpaused") != null)'
+assert_eq "(p4) no further esc" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+
+# ---- (p5) regression: a quota hold ("paused") still waits the resume cooldown out
+SD_OP5="$TMP/s-op5"
+agents_file "$TMP/agents-op5.json" \
+  "$(mk_agent manager wG:p1 wG idle '')" \
+  "$(mk_agent issue-1 wG:p2 wG working '')" \
+  "$(mk_agent issue-2 wG:p3 wG working '')" \
+  "$(mk_agent issue-3 wG:p4 wG working '')"
+export FAKE_AGENTS="$TMP/agents-op5.json"
+export FAKE_KEYS="$TMP/keys-op5.log" FAKE_PROMPTS="$TMP/prompts-op5.log"
+: >"$FAKE_KEYS"; : >"$FAKE_PROMPTS"
+reg "$SD_OP5" "$T0" ws-wG wG wG:p1 3 3 0 0 3 acme/g >/dev/null
+arm "$SD_OP5" "$T0" 0.25 0.50 warning
+ST_OP5A="$(MGR_STATE_DIR="$SD_OP5" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(p5) a quota squeeze still holds with cause 'paused'" "$ST_OP5A" \
+  '.constrained == true and ([.stalled[] | .cause] | unique) == ["paused"]
+   and .managers["ws-wG"].paused_by_operator == false'
+assert_eq "(p5) the two over-allotment builders are interrupted" 2 "$(wc -l <"$FAKE_KEYS" | tr -d ' ')"
+arm "$SD_OP5" $(( T0 + 30000 )) 0.10 0.10
+ST_OP5B="$(MGR_STATE_DIR="$SD_OP5" MGR_GUARD_NOW_MS=$(( T0 + 30000 )) "$GUARD" tick)"
+assert_jq "(p5) room again, but inside the cooldown the hold stands" "$ST_OP5B" \
+  '.constrained == false and ([.stalled[] | select(.cause == "paused")] | length) == 2'
+assert_eq "(p5) no resume inside the cooldown" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+arm "$SD_OP5" $(( T0 + 61000 )) 0.10 0.10
+ST_OP5C="$(MGR_STATE_DIR="$SD_OP5" MGR_GUARD_NOW_MS=$(( T0 + 61000 )) "$GUARD" tick)"
+assert_eq "(p5) the cooldown elapsed -> both resumed" 2 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+assert_jq "(p5) the quota entries are gone" "$ST_OP5C" '(.stalled | length) == 0'
+if grep -q "mgr-guard: this project's quota allotment is back (priority 5, allotment 3)." "$FAKE_PROMPTS"; then
+  pass "(p5) the quota resume text is unchanged"
+else
+  fail "(p5) quota resume text: $(grep '^wG:p3' "$FAKE_PROMPTS" | cut -f2)"
+fi
 
 printf '\n== (o) jittered resets_at: every in-window sample is fitted ==\n'
 # fit_window <samples.jsonl> <limit> <resets-at> <tolerance-ms> -> "<count> <slope>",
