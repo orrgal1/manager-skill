@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # guard-smoke.sh — self-contained smoke test for bin/mgr-guard.
-# Fakes `omp` and `herdr` on PATH, pins the clock with MGR_GUARD_NOW_MS and
+# Fakes `omp`, `herdr` and `gh` on PATH, pins the clock with MGR_GUARD_NOW_MS and
 # keeps every byte of state in a temp dir. Never touches the live herdr session.
-# The guard has two jobs here: the 429 ledger with its reignitions, and the burn
-# projection. Anything that dials pace is gone, and this file proves it stays gone.
+# The guard has three jobs here: the 429 ledger with its reignitions, the burn projection,
+# and the backlog/throughput collection behind `overview`. Anything that dials pace is gone,
+# and this file proves it stays gone.
 # Exits non-zero if any assertion fails.
 set -uo pipefail
 
@@ -97,7 +98,22 @@ case "${1:-}/${2:-}" in
 esac
 FAKE
 
-chmod +x "$BIN/omp" "$BIN/herdr"
+cat >"$BIN/gh" <<'FAKE'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$*" >>"${FAKE_GH_LOG:-/dev/null}"
+case "${1:-}/${2:-}" in
+  issue/list)
+    if [ -n "${FAKE_ISSUES:-}" ] && [ -f "${FAKE_ISSUES:-}" ]; then
+      cat "$FAKE_ISSUES"
+    else
+      printf 'fake gh: no issue fixture\n' >&2; exit 1
+    fi;;
+  *) printf 'fake gh: unsupported: %s\n' "$*" >&2; exit 1;;
+esac
+FAKE
+
+chmod +x "$BIN/omp" "$BIN/herdr" "$BIN/gh"
 PATH="$BIN:$PATH"; export PATH
 # one key log for the whole suite: a single line in it means pace-dialing came back
 FAKE_KEYS="$TMP/keys-all.log"; export FAKE_KEYS; : >"$FAKE_KEYS"
@@ -204,6 +220,43 @@ reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <a
      in_flight:$inf, adopting:$ad, ready:$rd}')"
 }
 
+mk_issue() { # mk_issue <number> <title> <labels-csv> <body>
+  jq -nc --argjson n "$1" --arg t "$2" --arg l "$3" --arg b "$4" \
+    '{number:$n, title:$t, body:$b,
+      labels: ($l | if . == "" then [] else split(",") end | map({name:.}))}'
+}
+
+issues_file() { # issues_file <file> <issue-json...>
+  local out="$1"; shift
+  printf '%s\n' "$@" | jq -sc . >"$out"
+}
+
+launches_file() { # launches_file <state-dir> <repo> <"number:launched_at"...>
+  local sd="$1" repo="$2"; shift 2
+  local slug pair obj='{}'
+  slug=$(printf '%s' "$repo" | sed 's|/|__|g')
+  mkdir -p "$sd/launches"
+  for pair in "$@"; do
+    obj=$(jq -c --argjson n "${pair%%:*}" --argjson at "${pair##*:}" \
+      '. + {($n | tostring): {number:$n, launched_at:$at}}' <<<"$obj")
+  done
+  printf '%s\n' "$obj" >"$sd/launches/$slug.json"
+}
+
+thru_file() { # thru_file <state-dir> <repo> <duration_s...>
+  local sd="$1" repo="$2"; shift 2
+  local slug d n=1
+  slug=$(printf '%s' "$repo" | sed 's|/|__|g')
+  mkdir -p "$sd/throughput"
+  : >"$sd/throughput/$slug.jsonl"
+  for d in "$@"; do
+    jq -nc --arg r "$repo" --argjson n "$n" --argjson d "$d" \
+      '{repo:$r, number:$n, launched_at:0, merged_at:($d * 1000), duration_s:$d}' \
+      >>"$sd/throughput/$slug.jsonl"
+    n=$((n + 1))
+  done
+}
+
 arm() { # arm <state-dir> <now-ms> <used-prev> <used-now> [status] [reset-offset-ms]
   # seed one prior sample half an hour back plus this tick's reading: the fit then has a
   # 30-minute span, which is exactly MGR_GUARD_MIN_SLOPE_SPAN_S
@@ -220,14 +273,14 @@ arm() { # arm <state-dir> <now-ms> <used-prev> <used-now> [status] [reset-offset
 
 printf '== help / usage ==\n'
 HELP="$("$GUARD" --help)"
-for c in start stop status tick run register touch stall; do
+for c in start stop status overview tick run register touch stall; do
   case "$HELP" in *"mgr-guard $c"*) pass "--help lists $c";; *) fail "--help is missing $c";; esac
 done
 for c in priority pause unpause paused; do
   case "$HELP" in *"mgr-guard $c"*) fail "--help still mentions $c";; *) pass "--help does not mention $c";; esac
 done
 for e in MGR_STATE_DIR MGR_GUARD_INTERVAL MGR_GUARD_SLOPE_WINDOW_S MGR_GUARD_MIN_SLOPE_SPAN_S \
-         MGR_GUARD_IDLE_EXIT_S MGR_GUARD_NOTIFY; do
+         MGR_GUARD_IDLE_EXIT_S MGR_GUARD_NOTIFY MGR_GUARD_BACKLOG_INTERVAL_S MGR_DEFAULT_TASK_S; do
   case "$HELP" in *"$e"*) pass "--help lists $e";; *) fail "--help is missing $e";; esac
 done
 for e in MGR_GUARD_CONFIRM_TICKS MGR_GUARD_RESUME_COOLDOWN_S; do
@@ -303,10 +356,15 @@ assert_jq "(b) state top-level shape"  "$ST_B" \
   '(keys) == ["builder_provider","events","interval_s","managers","pid","providers","stalled","tick_at","version"]'
 assert_jq "(b) stale heartbeat + live pane is live" "$ST_B" \
   '.managers["ws-w3"] | .live == true and .pane_alive == true and .seen_at == '"$STALE_B"
-assert_jq "(b) the row is the registration plus liveness, nothing computed" "$ST_B" \
+assert_jq "(b) the row is the registration plus liveness and this tick's collection" "$ST_B" \
   '(.managers["ws-w3"] | keys)
-   == ["adopting","cap","in_flight","live","manager_id","pane_alive","pane_id","paused_by_operator",
-       "primary","ready","repo","seen_at","workspace_id"]'
+   == ["adopting","backlog","backlog_at","backlog_error","cap","in_flight","live","manager_id",
+       "pane_alive","pane_id","paused_by_operator","primary","ready","repo","seen_at",
+       "throughput","workspace_id"]'
+assert_jq "(b) with no gh fixture the backlog is absent and says why" "$ST_B" \
+  '.managers["ws-w3"] | .backlog == null and .backlog_at == null
+   and .backlog_error == "gh issue list failed"
+   and .throughput.source == "default" and .throughput.median_s == 2700 and .throughput.n == 0'
 assert_jq "(b) the pane that is gone is the only one dropped" "$ST_B" '(.managers | keys) == ["ws-w3"]'
 assert_jq "(b) manager_dropped event" "$ST_B" \
   '[.events[] | select(.kind == "manager_dropped")] | last | .detail == "ws-w7: pane w7:p1 is gone"'
@@ -712,7 +770,13 @@ for _ in $(seq 1 10); do
 done
 assert_eq "(k) reignited after the reset" 1 "$REIGNITED"
 if kill -0 "$PID12" 2>/dev/null; then pass "(k) daemon alive after the reignition"; else fail "(k) daemon gone after the reignition"; fi
-if grep -q '^reignite: w3:p9' "$FAKE_TOASTS"; then pass "(k) reignite toast"; else fail "(k) no reignite toast"; fi
+# the toast lands a moment after the prompt (state write, log, then notify): wait for it
+TOASTED_K=0
+for _ in $(seq 1 10); do
+  if grep -q '^reignite: w3:p9' "$FAKE_TOASTS" 2>/dev/null; then TOASTED_K=1; break; fi
+  sleep 0.5
+done
+if [ "$TOASTED_K" = 1 ]; then pass "(k) reignite toast"; else fail "(k) no reignite toast"; fi
 if grep -qv '^reignite: ' "$FAKE_TOASTS"; then fail "(k) a non-reignite toast was sent"; else pass "(k) reignites are the only toasts"; fi
 # and the gate itself still closes: pane gone, ledger empty -> the daemon may leave
 printf '[]\n' >"$AG_12"
@@ -758,6 +822,297 @@ ST_Y="$(MGR_STATE_DIR="$SD_Y" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
 assert_jq "no agents, no managers, empty ledger" "$ST_Y" \
   '(.managers | length) == 0 and (.stalled | length) == 0 and .version == 2
    and .providers.anthropic.status == "ok"'
+
+printf '\n== (l) the tick collects the backlog: mgr board rules, launches, the 50 cap ==\n'
+SD_L="$TMP/s-l"
+agents_file "$TMP/agents-l.json" "$(mk_agent manager wL:p1 wL idle '')"
+export FAKE_AGENTS="$TMP/agents-l.json" FAKE_USAGE="$TMP/usage-ok.json"
+export FAKE_GH_LOG="$TMP/gh-l.log"; : >"$FAKE_GH_LOG"
+issues_file "$TMP/issues-l.json" \
+  "$(mk_issue 10 ten mgr:in-flight '')" \
+  "$(mk_issue 11 eleven mgr:awaiting-approval '')" \
+  "$(mk_issue 12 twelve '' 'a plain body')" \
+  "$(mk_issue 13 thirteen '' "$(printf 'needs the other one\nBlocked by: #12\n')")" \
+  "$(mk_issue 14 fourteen '' 'Blocked by: #99')" \
+  "$(mk_issue 15 fifteen mgr:in-flight,mgr:awaiting-approval '')"
+export FAKE_ISSUES="$TMP/issues-l.json"
+launches_file "$SD_L" acme/bk "10:$(( T0 - 600000 ))"
+reg "$SD_L" "$T0" ws-wL wL wL:p1 3 2 1 2 acme/bk >/dev/null
+ST_L="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_eq "(l) one gh call for the one repo" 1 "$(lines_of "$FAKE_GH_LOG")"
+assert_jq "(l) the gh call is the board fetch" "$(jq -Rsc . <"$FAKE_GH_LOG")" \
+  'test("issue list -R acme/bk --state open --limit 200 --json number,title,labels,body")'
+assert_jq "(l) backlog shape" "$ST_L" \
+  '(.managers["ws-wL"].backlog | keys)
+   == ["awaiting_approval","blocked","cap","counts","in_flight","ready","slots_free"]'
+assert_jq "(l) ready is unlabelled with no OPEN blocker (#14 blocked by a closed one)" "$ST_L" \
+  '.managers["ws-wL"].backlog.ready
+   == [{number:12, title:"twelve", blocked_by:[]}, {number:14, title:"fourteen", blocked_by:[]}]'
+assert_jq "(l) blocked keeps the open blocker it parsed off the body" "$ST_L" \
+  '.managers["ws-wL"].backlog.blocked == [{number:13, title:"thirteen", blocked_by:[12]}]'
+assert_jq "(l) in flight joins launched_at from the launches file" "$ST_L" \
+  '.managers["ws-wL"].backlog.in_flight
+   == [{number:10, title:"ten", launched_at:'"$(( T0 - 600000 ))"'},
+       {number:15, title:"fifteen", launched_at:null}]'
+assert_jq "(l) awaiting-approval only when it is not in flight" "$ST_L" \
+  '.managers["ws-wL"].backlog.awaiting_approval == [{number:11, title:"eleven"}]'
+assert_jq "(l) cap, slots_free and the true counts" "$ST_L" \
+  '.managers["ws-wL"].backlog
+   | .cap == 3 and .slots_free == 0
+     and .counts == {ready:2, blocked:1, in_flight:2, awaiting_approval:1, open:6}'
+assert_jq "(l) the refresh stamps backlog_at and clears backlog_error" "$ST_L" \
+  '.managers["ws-wL"] | .backlog_at == '"$T0"' and .backlog_error == null'
+# 60 open issues, all launchable: the ledger keeps the first 50 and the true count
+SD_L60="$TMP/s-l60"
+jq -nc '[range(100; 160) | {number:., title:("issue " + (. | tostring)), body:"", labels:[]}]' \
+  >"$TMP/issues-l60.json"
+export FAKE_ISSUES="$TMP/issues-l60.json" FAKE_GH_LOG="$TMP/gh-l60.log"; : >"$FAKE_GH_LOG"
+reg "$SD_L60" "$T0" ws-wL wL wL:p1 4 0 0 60 acme/big >/dev/null
+ST_L60="$(MGR_STATE_DIR="$SD_L60" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(l) the ready list is capped at 50, the count is not" "$ST_L60" \
+  '.managers["ws-wL"].backlog
+   | (.ready | length) == 50 and .counts.ready == 60 and .counts.open == 60
+     and (.ready | first | .number) == 100 and (.ready | last | .number) == 149'
+
+printf '\n== (m) the refresh is rate-limited, then refetches ==\n'
+export FAKE_ISSUES="$TMP/issues-l.json" FAKE_GH_LOG="$TMP/gh-m.log"; : >"$FAKE_GH_LOG"
+ST_M1="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)"
+assert_eq "(m) inside MGR_GUARD_BACKLOG_INTERVAL_S nothing is fetched" 0 "$(lines_of "$FAKE_GH_LOG")"
+assert_jq "(m) and the snapshot is carried forward untouched" "$ST_M1" \
+  '.managers["ws-wL"] | .backlog_at == '"$T0"' and .backlog_error == null
+   and (.backlog.counts.open == 6) and (.backlog.in_flight | length) == 2'
+ST_M2="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + 120001 )) "$GUARD" tick)"
+assert_eq "(m) past the interval it refetches" 1 "$(lines_of "$FAKE_GH_LOG")"
+assert_jq "(m) with a fresh backlog_at" "$ST_M2" \
+  '.managers["ws-wL"].backlog_at == '"$(( T0 + 120001 ))"
+
+printf '\n== (n) a failing gh keeps the last snapshot and says so ==\n'
+unset FAKE_ISSUES
+export FAKE_GH_LOG="$TMP/gh-n.log"; : >"$FAKE_GH_LOG"
+ST_N="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + 300000 )) "$GUARD" tick)"
+assert_eq "(n) it did try" 1 "$(lines_of "$FAKE_GH_LOG")"
+assert_jq "(n) the previous backlog and its stamp survive the failure" "$ST_N" \
+  '.managers["ws-wL"] | .backlog_at == '"$(( T0 + 120001 ))"'
+   and .backlog.counts == {ready:2, blocked:1, in_flight:2, awaiting_approval:1, open:6}'
+assert_jq "(n) and backlog_error names it" "$ST_N" \
+  '.managers["ws-wL"].backlog_error == "gh issue list failed"'
+export FAKE_ISSUES="$TMP/issues-l.json"
+ST_N2="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + 420001 )) "$GUARD" tick)"
+assert_jq "(n) a good fetch clears the error" "$ST_N2" \
+  '.managers["ws-wL"] | .backlog_error == null and .backlog_at == '"$(( T0 + 420001 ))"
+
+printf '\n== (o) throughput: repo median, machine median, then the default ==\n'
+SD_O="$TMP/s-o"
+agents_file "$TMP/agents-o.json" \
+  "$(mk_agent manager wO1:p1 wO1 idle '')" \
+  "$(mk_agent manager wO2:p1 wO2 idle '')"
+export FAKE_AGENTS="$TMP/agents-o.json" FAKE_GH_LOG="$TMP/gh-o.log"; : >"$FAKE_GH_LOG"
+reg "$SD_O" "$T0" ws-o1 wO1 wO1:p1 2 0 0 0 acme/t1 >/dev/null
+thru_file "$SD_O" acme/t1 600 1200 1800
+ST_O1="$(MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(o) three rows of its own -> the repo median" "$ST_O1" \
+  '.managers["ws-o1"].throughput
+   == {n:3, median_s:1200, p80_s:1800, last_10_mean_s:1200, estimated:false, source:"repo"}'
+reg "$SD_O" "$T0" ws-o2 wO2 wO2:p1 2 0 0 0 acme/t2 >/dev/null
+thru_file "$SD_O" acme/t2 300
+ST_O2="$(MGR_STATE_DIR="$SD_O" MGR_GUARD_NOW_MS=$(( T0 + 1000 )) "$GUARD" tick)"
+assert_jq "(o) one row of its own -> the machine median, flagged estimated" "$ST_O2" \
+  '.managers["ws-o2"].throughput
+   == {n:1, median_s:900, p80_s:1800, last_10_mean_s:975, estimated:true, source:"machine"}'
+assert_jq "(o) the repo with its own rows is unaffected" "$ST_O2" \
+  '.managers["ws-o1"].throughput.source == "repo" and .managers["ws-o1"].throughput.n == 3'
+SD_O3="$TMP/s-o3"
+agents_file "$TMP/agents-o3.json" "$(mk_agent manager wO3:p1 wO3 idle '')"
+export FAKE_AGENTS="$TMP/agents-o3.json"
+reg "$SD_O3" "$T0" ws-o3 wO3 wO3:p1 2 0 0 0 acme/t3 >/dev/null
+ST_O3="$(MGR_STATE_DIR="$SD_O3" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(o) no rows anywhere -> MGR_DEFAULT_TASK_S" "$ST_O3" \
+  '.managers["ws-o3"].throughput
+   == {n:0, median_s:2700, p80_s:2700, last_10_mean_s:2700, estimated:true, source:"default"}'
+ST_O4="$(MGR_DEFAULT_TASK_S=1500 MGR_STATE_DIR="$SD_O3" MGR_GUARD_NOW_MS=$(( T0 + 1000 )) "$GUARD" tick)"
+assert_jq "(o) MGR_DEFAULT_TASK_S is honoured" "$ST_O4" \
+  '.managers["ws-o3"].throughput | .median_s == 1500 and .source == "default"'
+
+printf '\n== (p) overview: the burn stall window, FIFO with a blocker, starvation ==\n'
+SD_P="$TMP/s-p"; mkdir -p "$SD_P"
+# hand-written ledger: 80% of a 5h window burning 0.4/h resets two hours out, so the
+# projection exhausts it in 30 minutes and everything after that lands past the reset
+jq -n --argjson t "$T0" '
+  {version:2, tick_at:$t, interval_s:60, builder_provider:"anthropic",
+   providers:{anthropic:{status:"warning", ok:true, recovers_at:null, exhausted_limit:null,
+     limits:[{id:"anthropic:5h", label:"5h", status:"warning", used:0.8,
+              resets_at:($t + 7200000), burn_per_hour:0.4, projected_at_reset:2.2,
+              fits:false, hours_to_reset:2, sample_count:4, samples:[]}]}},
+   managers:{
+     "ws-a":{manager_id:"ws-a", repo:"acme/a", live:true, pane_alive:true, cap:2, adopting:0,
+             backlog_at:$t, backlog_error:null,
+             throughput:{n:6, median_s:600, p80_s:700, last_10_mean_s:650,
+                         estimated:false, source:"repo"},
+             backlog:{ready:[{number:2, title:"two", blocked_by:[]},
+                             {number:3, title:"three", blocked_by:[]},
+                             {number:4, title:"four", blocked_by:[]},
+                             {number:6, title:"six", blocked_by:[]},
+                             {number:7, title:"seven", blocked_by:[]}],
+                      blocked:[{number:5, title:"five", blocked_by:[2]}],
+                      in_flight:[{number:1, title:"one", launched_at:($t - 300000)}],
+                      awaiting_approval:[], cap:2, slots_free:1,
+                      counts:{ready:5, blocked:1, in_flight:1, awaiting_approval:0, open:7}}},
+     "ws-b":{manager_id:"ws-b", repo:"shape/b", live:true, pane_alive:true, cap:2, adopting:0,
+             backlog_at:$t, backlog_error:"gh issue list failed",
+             throughput:{n:1, median_s:900, p80_s:1800, last_10_mean_s:975,
+                         estimated:true, source:"machine"},
+             backlog:{ready:[], blocked:[], in_flight:[], awaiting_approval:[],
+                      cap:2, slots_free:2,
+                      counts:{ready:0, blocked:0, in_flight:0, awaiting_approval:0, open:0}}},
+     "ws-dead":{manager_id:"ws-dead", repo:"gone/g", live:false, pane_alive:false, cap:9,
+                adopting:0, backlog_at:$t, backlog_error:null, throughput:null,
+                backlog:{ready:[{number:80, title:"eighty", blocked_by:[]}], blocked:[],
+                         in_flight:[], awaiting_approval:[], cap:9, slots_free:9,
+                         counts:{ready:1, blocked:0, in_flight:0, awaiting_approval:0, open:1}}}},
+   stalled:[], events:[]}' >"$SD_P/state.json"
+OV="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 3)"
+assert_json "overview output" "$OV"
+assert_jq "(p) top-level shape" "$OV" '(keys) == ["at","backlog","burn","timeline"] and .at == '"$T0"
+assert_jq "(p) burn limit shape" "$OV" \
+  '(.burn.limits[0] | keys)
+   == ["burn_per_hour","exhaust_at","fits","id","projected_at_reset","provider","resets_at",
+       "status","used"]'
+assert_jq "(p) exhaust_at is (1-used)/bph ahead, bounded by the reset" "$OV" \
+  '.burn.limits[0] | .fits == false and .exhaust_at == '"$(( T0 + 1800000 ))"'
+   and .provider == "anthropic"'
+assert_jq "(p) the stall window is that limit to its reset" "$OV" \
+  '.burn.stall_window
+   == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"anthropic:5h"}'
+assert_jq "(p) manager row shape" "$OV" \
+  '(.backlog.managers[0] | keys)
+   == ["awaiting_approval","backlog_at","backlog_drains_at","backlog_error","blocked","cap",
+       "idle_slots","in_flight","manager_id","ready","repo","starves_at","starving","throughput"]'
+assert_jq "(p) only live managers, sorted by repo" "$OV" \
+  '[.backlog.managers[] | .manager_id] == ["ws-a","ws-b"]'
+assert_jq "(p) shown item shape" "$OV" \
+  '(.timeline.shown[0] | keys)
+   == ["blocked_by","estimated","eta","manager_id","number","repo","state","title"]'
+# in flight 5 min in with a 10-min median: max(median, elapsed + quarter median) = median
+assert_jq "(p) the in-flight ETA runs off launched_at" "$OV" \
+  '.timeline.shown[0]
+   | .number == 1 and .state == "in_flight" and .eta == '"$(( T0 + 300000 ))"'
+     and .estimated == false and .repo == "acme/a" and .manager_id == "ws-a"'
+# cap 2, one slot free now and one at 5 min: #2 10m, #3 15m, #4 20m
+assert_jq "(p) FIFO by number over the free slots" "$OV" \
+  '[.timeline.shown[] | select(.state != "in_flight") | [.number, .eta]]
+   == [[2, '"$(( T0 + 600000 ))"'], [3, '"$(( T0 + 900000 ))"'], [4, '"$(( T0 + 1200000 ))"']]'
+OVA="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 50)"
+# FIFO is by number, so #5 is scheduled in the same pass as its blocker #2 (start = the
+# first slot free after #2 finishes); #6 lands exactly on the exhaustion and #7 crosses it
+assert_jq "(p) the blocker delays #5, and #7 is pushed past the reset" "$OVA" \
+  '[.timeline.shown[] | select(.number == 5 or .number == 6 or .number == 7) | [.number, .eta]]
+   == [[5, '"$(( T0 + 1500000 ))"'], [6, '"$(( T0 + 1800000 ))"'],
+       [7, '"$(( T0 + 7500000 ))"']]'
+assert_jq "(p) the blocked item still names its blocker" "$OVA" \
+  '[.timeline.shown[] | select(.number == 5)] | first
+   | .state == "blocked" and .blocked_by == [2]'
+assert_jq "(p) nothing hidden at --limit 50" "$OVA" '.timeline.beyond == null'
+assert_jq "(p) the working manager is not starving; its queue drains past the reset" "$OV" \
+  '[.backlog.managers[] | select(.manager_id == "ws-a")] | first
+   | .ready == 5 and .blocked == 1 and .in_flight == 1 and .cap == 2
+     and .idle_slots == 0 and .starving == false
+     and .starves_at == '"$(( T0 + 1800000 ))"'
+     and .backlog_drains_at == '"$(( T0 + 7500000 ))"
+assert_jq "(p) the empty manager starves now" "$OV" \
+  '[.backlog.managers[] | select(.manager_id == "ws-b")] | first
+   | .idle_slots == 2 and .starving == true and .starves_at == '"$T0"'
+     and .backlog_drains_at == null and .backlog_error == "gh issue list failed"'
+assert_jq "(p) the throughput chain travels into the overview" "$OV" \
+  '[.backlog.managers[] | .throughput.source] == ["repo","machine"]
+   and ([.backlog.managers[] | .throughput.estimated] == [false, true])
+   and ([.backlog.managers[] | select(.manager_id == "ws-b")] | first | .throughput.median_s) == 900'
+assert_jq "(p) totals are the sums, dead managers excluded" "$OV" \
+  '.backlog.totals
+   == {ready:5, blocked:1, in_flight:1, awaiting_approval:0, cap:4, idle_slots:2, open:7}'
+assert_jq "(p) beyond summarises what the limit hid" "$OV" \
+  '.timeline.beyond
+   == {count:3, blocked:1, last_eta:'"$(( T0 + 7500000 ))"',
+       drains_at:'"$(( T0 + 7500000 ))"'}'
+assert_jq "(p) machine drains_at and last_eta are the same number" "$OV" \
+  '.timeline.drains_at == '"$(( T0 + 7500000 ))"' and .timeline.last_eta == .timeline.drains_at'
+OV0="$(MGR_STATE_DIR="$SD_P" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 0)"
+assert_jq "(p) --limit 0 shows the in-flight work and hides the queue" "$OV0" \
+  '(.timeline.shown | length) == 1 and .timeline.shown[0].state == "in_flight"
+   and .timeline.beyond.count == 6'
+BADL="$(MGR_STATE_DIR="$SD_P" "$GUARD" overview --limit x 2>&1)"
+assert_eq "(p) --limit x exit code" 2 "$?"
+assert_jq "(p) --limit x error" "$BADL" \
+  '.error.code == 2 and (.error.message | test("non-negative integer"))'
+MGR_STATE_DIR="$SD_P" "$GUARD" overview --limit -3 >/dev/null 2>&1
+assert_eq "(p) a negative limit is refused too" 2 "$?"
+MGR_STATE_DIR="$SD_P" "$GUARD" overview --wat >/dev/null 2>&1
+assert_eq "(p) an unknown flag is refused" 2 "$?"
+OVE="$(MGR_STATE_DIR="$TMP/s-nothing" "$GUARD" overview)"
+assert_json "overview with no state at all" "$OVE"
+assert_jq "(p) no state.json -> zeros, no window, nothing queued" "$OVE" \
+  '.burn.limits == [] and .burn.stall_window == null
+   and .backlog.managers == [] and .timeline.shown == []
+   and .timeline.beyond == null and .timeline.drains_at == null
+   and .backlog.totals == {ready:0, blocked:0, in_flight:0, awaiting_approval:0,
+                           cap:0, idle_slots:0, open:0}'
+
+printf '\n== (q) overview is judicious: 40 ready, 10 shown, the rest summarised ==\n'
+SD_Q="$TMP/s-q"; mkdir -p "$SD_Q"
+jq -n --argjson t "$T0" '
+  {version:2, tick_at:$t, providers:{},
+   managers:{"ws-q":{manager_id:"ws-q", repo:"acme/q", live:true, pane_alive:true,
+     cap:2, adopting:0, backlog_at:$t, backlog_error:null,
+     throughput:{n:5, median_s:1800, p80_s:2000, last_10_mean_s:1800,
+                 estimated:false, source:"repo"},
+     backlog:{ready:[range(1; 41) | {number:., title:("i" + (. | tostring)), blocked_by:[]}],
+              blocked:[],
+              in_flight:[{number:100, title:"a", launched_at:($t - 600000)},
+                         {number:101, title:"b", launched_at:($t - 600000)}],
+              awaiting_approval:[], cap:2, slots_free:0,
+              counts:{ready:40, blocked:0, in_flight:2, awaiting_approval:0, open:42}}}},
+   stalled:[], events:[]}' >"$SD_Q/state.json"
+OVQ="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview)"
+LAST_Q=$(( T0 + 1200000 + 20 * 1800000 ))
+assert_jq "(q) shown is every in-flight plus the default ten" "$OVQ" \
+  '(.timeline.shown | length) == 12
+   and ([.timeline.shown[] | select(.state == "in_flight")] | length) == 2
+   and ([.timeline.shown[] | select(.state == "ready")] | length) == 10'
+assert_jq "(q) beyond counts the other thirty and names the last ETA" "$OVQ" \
+  '.timeline.beyond == {count:30, blocked:0, last_eta:'"$LAST_Q"', drains_at:'"$LAST_Q"'}'
+assert_jq "(q) drains_at is that same last ETA" "$OVQ" \
+  '.timeline.drains_at == '"$LAST_Q"'
+   and (.backlog.managers[0].backlog_drains_at == '"$LAST_Q"')'
+OVQ2="$(MGR_STATE_DIR="$SD_Q" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 100)"
+assert_jq "(q) the simulation covered all forty, not just the shown ten" "$OVQ2" \
+  '(.timeline.shown | length) == 42
+   and ([.timeline.shown[] | select(.eta == null)] | length) == 0
+   and ([.timeline.shown[] | select(.state == "ready")] | map(.eta) | max) == '"$LAST_Q"'
+   and .timeline.beyond == null'
+
+printf '\n== (r) a blocker this manager does not own counts as passed ==\n'
+# The `Blocked by:` line can name an issue that is closed, in another repo, or merely
+# awaiting approval. None of those are on this manager's board, so the queued issue starts
+# now instead of hanging on a blocker whose ETA can never arrive.
+SD_R="$TMP/s-r"; mkdir -p "$SD_R"
+jq -n --argjson t "$T0" '
+  {version:2, tick_at:$t, providers:{},
+   managers:{"ws-r":{manager_id:"ws-r", repo:"other/shape", live:true, pane_alive:true,
+     cap:1, adopting:0, backlog_at:$t, backlog_error:null,
+     throughput:{n:5, median_s:1500, p80_s:1600, last_10_mean_s:1500,
+                 estimated:false, source:"repo"},
+     backlog:{ready:[], blocked:[{number:101, title:"one-oh-one", blocked_by:[999]},
+                                 {number:102, title:"one-oh-two", blocked_by:[101, 999]}],
+              in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+              counts:{ready:0, blocked:2, in_flight:0, awaiting_approval:0, open:2}}}},
+   stalled:[], events:[]}' >"$SD_R/state.json"
+OVR="$(MGR_STATE_DIR="$SD_R" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview)"
+assert_jq "(r) the unknown blocker does not strand the issue" "$OVR" \
+  '[.timeline.shown[] | [.number, .eta]]
+   == [[101, '"$(( T0 + 1500000 ))"'], [102, '"$(( T0 + 3000000 ))"']]'
+assert_jq "(r) the blocker it does own is still waited on, and the queue drains" "$OVR" \
+  '.backlog.managers[0]
+   | .backlog_drains_at == '"$(( T0 + 3000000 ))"' and .idle_slots == 1
+     and .starving == true and .starves_at == '"$T0"
 
 printf '\n== nothing in the guard ever interrupts a builder ==\n'
 assert_eq "no send-keys in the whole run" 0 "$(lines_of "$FAKE_KEYS")"

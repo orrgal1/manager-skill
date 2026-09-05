@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# mgr-guard — the 429 watcher and burn projection behind mgr-managed omp builders.
-# It has exactly two jobs: re-prompt every manager and builder pane that stopped on a
-# provider rate limit once the quota renews, and keep a per-limit burn projection that
-# `mgr board` surfaces to the operator. It never dials pace: concurrency is the
-# operator's `cap` and `mgr` alone enforces it.
+# mgr-guard — the 429 watcher, burn projection and backlog collector behind mgr-managed
+# omp builders. Three jobs, nothing else: re-prompt every manager and builder pane that
+# stopped on a provider rate limit once the quota renews; keep a per-limit burn projection
+# that `mgr board` surfaces; and collect every registered manager's backlog and measured
+# throughput each tick so `mgr-guard overview` can project the machine-wide timeline.
+# It never dials pace: concurrency is the operator's `cap` and `mgr` alone enforces it.
 # No agent, no LLM: pure bash + jq.
 # Deps: jq (hard), omp + herdr (soft: their failures degrade a single entry).
 # All stdout is JSON; errors are JSON on stderr.
@@ -30,12 +31,16 @@ MGRDIR="$STATE_DIR/managers"
 SAMPLES="$STATE_DIR/samples.jsonl"
 LOCKDIR="$STATE_DIR/guard.lock"
 EXITFILE="$STATE_DIR/exit.json"
+LAUNCHDIR="$STATE_DIR/launches"
+THRUDIR="$STATE_DIR/throughput"
 
 INTERVAL_S="${MGR_GUARD_INTERVAL:-60}"
 SLOPE_WINDOW_S="${MGR_GUARD_SLOPE_WINDOW_S:-1800}"
 MIN_SLOPE_SPAN_S="${MGR_GUARD_MIN_SLOPE_SPAN_S:-300}"
 IDLE_EXIT_S="${MGR_GUARD_IDLE_EXIT_S:-1800}"
 NOTIFY="${MGR_GUARD_NOTIFY:-1}"
+BACKLOG_INTERVAL_S="${MGR_GUARD_BACKLOG_INTERVAL_S:-120}"
+DEFAULT_TASK_S="${MGR_DEFAULT_TASK_S:-2700}"
 
 int_or() { # int_or <value> <fallback>
   case "${1:-}" in
@@ -46,6 +51,8 @@ int_or() { # int_or <value> <fallback>
 INTERVAL_S=$(int_or "$INTERVAL_S" 60)
 SLOPE_WINDOW_S=$(int_or "$SLOPE_WINDOW_S" 1800)
 MIN_SLOPE_SPAN_S=$(int_or "$MIN_SLOPE_SPAN_S" 300)
+BACKLOG_INTERVAL_S=$(int_or "$BACKLOG_INTERVAL_S" 120)
+DEFAULT_TASK_S=$(int_or "$DEFAULT_TASK_S" 2700)
 case "${IDLE_EXIT_S:-}" in ''|*[!0-9]*) IDLE_EXIT_S=1800;; esac
 
 ensure_state_dir() { mkdir -p "$MGRDIR" 2>/dev/null || die 1 "cannot create state dir: $STATE_DIR"; }
@@ -176,7 +183,11 @@ def same_window($a; $b):
 # `mgr board`, so heartbeat recency goes dark exactly when the guard is needed. seen_at stays
 # on the registration as information only.
 ($managers | map((((.pane_id // "") | IN($panes[]))) as $pa
-                 | . + {pane_alive: $pa, live: $pa})) as $mgrs
+                 | . + {pane_alive: $pa, live: $pa}
+                 # this tick collected the board snapshot and the throughput stats
+                 | . + (($extras[(.manager_id // "")])
+                        // {backlog: null, backlog_at: null, backlog_error: null,
+                            throughput: null}))) as $mgrs
 | ($mgrs | map(select(.live))) as $live
 | ($mgrs | map(select(.live | not))) as $dead
 | ($live | map({key: (.workspace_id // ""), value: .manager_id}) | from_entries) as $ws2mgr
@@ -334,6 +345,199 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
          + " reason=" + ((($policy.providers[$policy.builder_provider] // null)
                           | if . == null then "n/a" else .reason end)))}'
 
+# open issues of one repo -> the backlog snapshot state.json carries for that manager.
+# The ready/blocked/in_flight/awaiting rules mirror `mgr board` (bin/mgr JQ_BLOCKERS plus
+# cmd_board): a `Blocked by:` reference counts only when it names an issue that is still
+# open in this list. Only the scan spelling differs — jaq's `scan` stops at the first hit,
+# so the blocker numbers come out of `match(...; "g")` here.
+JQ_BACKLOG='
+def blockers:
+  ((.body // "") | [splits("\n")]
+   | map(select(test("^[[:space:]]*blocked[[:space:]]+by\\b"; "i")))
+   | join(" ")
+   | [match("#[0-9]+"; "g").string | ltrimstr("#") | tonumber] | unique);
+def lbl($n): (([.labels[]?.name] | index($n)) != null);
+(map(select(type == "object"))) as $issues
+| ($issues | map(.number)) as $open
+| ($issues | map({number: .number, title: (.title // ""),
+                  blocked_by: [blockers[] | select(. as $n | $open | index($n))],
+                  inflight: lbl("mgr:in-flight"),
+                  awaiting: lbl("mgr:awaiting-approval")})) as $I
+| ([$I[] | select(.inflight)
+         | {number: .number, title: .title,
+            launched_at: ((($launches[(.number | tostring)] // null))
+                          | if . == null then null else (.launched_at // null) end)}]
+   | sort_by(.number)) as $in_flight
+| ([$I[] | select(.awaiting and (.inflight | not)) | {number: .number, title: .title}]
+   | sort_by(.number)) as $awaiting
+| ([$I[] | select((.inflight | not) and (.awaiting | not) and ((.blocked_by | length) == 0))
+         | {number: .number, title: .title, blocked_by: .blocked_by}] | sort_by(.number)) as $ready
+| ([$I[] | select((.inflight | not) and (.awaiting | not) and ((.blocked_by | length) > 0))
+         | {number: .number, title: .title, blocked_by: .blocked_by}] | sort_by(.number)) as $blocked
+| {ready: ($ready | .[0:50]), blocked: ($blocked | .[0:50]),
+   in_flight: $in_flight, awaiting_approval: $awaiting,
+   cap: $cap,
+   slots_free: ([0, ($cap - ($in_flight | length) - $adopting)] | max),
+   counts: {ready: ($ready | length), blocked: ($blocked | length),
+            in_flight: ($in_flight | length), awaiting_approval: ($awaiting | length),
+            open: ($issues | length)}}'
+
+# every throughput ledger as {"<owner>__<repo>": [duration_s, ...]} -> the stats for one repo.
+# n is always the row count of this repo; the numbers fall back repo -> machine -> default.
+JQ_THROUGHPUT='
+def med($a): ($a | sort) as $s | ($s | length) as $n
+  | if $n == 0 then null
+    elif (($n % 2) == 1) then $s[(($n - 1) / 2)]
+    else (($s[($n / 2) - 1] + $s[($n / 2)]) / 2) end;
+def p80($a): ($a | sort) as $s | ($s | length) as $n
+  | if $n == 0 then null else $s[((((0.8 * $n) | ceil) - 1))] end;
+def last10($a): ($a | .[-10:]) as $s
+  | if ($s | length) == 0 then null else (($s | add) / ($s | length)) end;
+(($map[$slug] // [])) as $rows
+| ([$map | to_entries[] | .value[]]) as $all
+| ($rows | length) as $n
+| (if $n >= 3 then {sample: $rows, source: "repo", estimated: false}
+   elif ($all | length) > 0 then {sample: $all, source: "machine", estimated: true}
+   else {sample: [], source: "default", estimated: true} end) as $pick
+| if $pick.source == "default"
+  then {n: $n, median_s: $default_s, p80_s: $default_s, last_10_mean_s: $default_s,
+        estimated: true, source: "default"}
+  else {n: $n, median_s: (med($pick.sample) | round), p80_s: (p80($pick.sample) | round),
+        last_10_mean_s: (last10($pick.sample) | round),
+        estimated: $pick.estimated, source: $pick.source}
+  end'
+
+# state.json + now -> the machine-wide picture. Burn gives the stall window, the backlog
+# snapshots give the queues, and a FIFO simulation per manager (cap slots, blockers, the
+# measured median) turns them into an ETA per issue. Projection only: nothing here acts.
+JQ_OVERVIEW='
+(($st.managers // {})) as $mobj
+| ([$mobj | to_entries[] | .value | select(.live == true)]) as $live
+| ([($st.providers // {}) | to_entries[] | .key as $p
+    | ((.value.limits // [])[])
+    | {id: (.id // "unknown"), provider: $p, used: (.used // 0),
+       burn_per_hour: (.burn_per_hour // 0), projected_at_reset: (.projected_at_reset // 0),
+       resets_at: (.resets_at // null),
+       # `//` would read a real `false` as absent, and every limit that does not fit is
+       # exactly the one this projection is about
+       fits: (if (.fits == null) then true else .fits end),
+       status: (.status // "unknown")}]) as $l0
+| ([$l0[] | . + {exhaust_at:
+     (if ((.status == "exhausted") or (.used >= 1)) then $now
+      elif ((.fits | not) and (.burn_per_hour > 0))
+      then (((($now + ((1 - .used) / .burn_per_hour * 3600000)) | round) as $e
+             | if .resets_at == null then $e else ([$e, .resets_at] | min) end))
+      else null end)}]) as $limits
+| ([$limits[] | select((.exhaust_at != null) and (.resets_at != null) and (.resets_at > $now))]
+   | sort_by(.exhaust_at) | first) as $worst
+| (if $worst == null then null
+   else {from: $worst.exhaust_at, to: $worst.resets_at, limit: $worst.id} end) as $win
+| ({n: 0, median_s: $default_s, p80_s: $default_s, last_10_mean_s: $default_s,
+    estimated: true, source: "default"}) as $tdef
+
+# wall time minus the stall: work that would have run inside the window lands after it
+| def finish($start; $work):
+    (if $win == null then ($start + $work)
+     elif (($start >= $win.from) and ($start < $win.to)) then ($win.to + $work)
+     elif (($start < $win.from) and (($start + $work) > $win.from))
+     then ($win.to + ($start + $work - $win.from))
+     else ($start + $work) end) | round;
+
+# one manager: in-flight ETAs first, then FIFO passes over ready+blocked. A pass schedules
+# every issue whose blockers are known (or absent from this repo) onto the earliest free
+# slot; passes repeat until one schedules nothing, and the leftovers keep a null eta.
+def sim($m):
+    (($m.backlog // {})) as $b
+    | (($b.cap // 0)) as $cap
+    | (($m.throughput // $tdef)) as $t
+    | ((($t.median_s // $default_s) * 1000)) as $med
+    | (if (($t.estimated) == null) then true else $t.estimated end) as $est
+    | (($m.repo // null)) as $repo
+    | (($m.manager_id // "")) as $mid
+    | ([($b.in_flight // [])[]
+        | (.launched_at // null) as $la
+        | (if $la == null then ($now + $med)
+           else ($la + ([$med, (($now - $la) + (0.25 * $med))] | max)) end) as $raw
+        | {repo: $repo, number: .number, title: (.title // ""), state: "in_flight",
+           eta: finish($now; $raw - $now), estimated: ($est or ($la == null)),
+           blocked_by: [], manager_id: $mid}]) as $inflight
+    | (([($b.ready // [])[] | {repo: $repo, number: .number, title: (.title // ""),
+                               state: "ready", blocked_by: (.blocked_by // []), manager_id: $mid}]
+        + [($b.blocked // [])[] | {repo: $repo, number: .number, title: (.title // ""),
+                                   state: "blocked", blocked_by: (.blocked_by // []), manager_id: $mid}])
+       | sort_by(.number)) as $queue
+    | ([$inflight[] | .number]) as $infn
+    | ([$queue[] | .number]) as $qn
+    | ([$inflight[] | .eta] | sort) as $ietas
+    | ($inflight | length) as $n
+    | (if $cap <= 0 then []
+       elif $n >= $cap then $ietas[($n - $cap):]
+       else ($ietas + [range(0; $cap - $n) | $now]) end) as $slots0
+    | ({slots: $slots0,
+        done: ([$inflight[] | {key: (.number | tostring), value: .eta}] | from_entries),
+        sched: [], pending: $queue, moved: true}
+       | until(((.moved | not) or ((.pending | length) == 0));
+           reduce .pending[] as $it
+             ({slots: .slots, done: .done, sched: .sched, pending: [], moved: false};
+              . as $acc
+              # `. as $bn` first: inside `index(...)` the dot is the array being searched,
+              # so a bare `index(.)` would report every blocker as present (bin/mgr does the
+              # same dance). A blocker this manager does not own counts as already passed.
+              | ([($it.blocked_by // [])[] | . as $bn
+                  | select((($qn | index($bn)) != null) or (($infn | index($bn)) != null))]) as $rel
+              | ([$rel[] | select(((($acc.done[(. | tostring)]) // null) == null))] | length) as $unknown
+              | if (($unknown > 0) or (($acc.slots | length) == 0))
+                then ($acc | .pending += [$it])
+                else ((($acc.slots | sort)) as $ss
+                      | ([$ss[0]] + [$rel[] | $acc.done[(. | tostring)]] | max) as $start
+                      | finish($start; $med) as $eta
+                      | $acc | .slots = ([$eta] + $ss[1:])
+                             | .done += {($it.number | tostring): $eta}
+                             | .sched += [$it + {eta: $eta, estimated: $est}]
+                             | .moved = true)
+                end))) as $r
+    | (($r.sched + [$r.pending[] | . + {eta: null, estimated: $est}])) as $qout
+    | (($b.counts // {})) as $c
+    | (($c.ready // 0)) as $nready
+    | (if $nready == 0 then ($b.slots_free // 0) else 0 end) as $idle
+    | {row: {manager_id: $mid, repo: $repo, cap: $cap, ready: $nready,
+             blocked: ($c.blocked // 0), in_flight: ($c.in_flight // 0),
+             awaiting_approval: ($c.awaiting_approval // 0),
+             idle_slots: $idle, starving: ($idle > 0),
+             starves_at: (if $cap <= 0 then null
+                          elif $idle > 0 then $now
+                          else ($r.slots | min) end),
+             backlog_drains_at: ([$qout[] | .eta | select(. != null)] | max),
+             throughput: $t, backlog_at: ($m.backlog_at // null),
+             backlog_error: ($m.backlog_error // null)},
+       open: ($c.open // 0), inflight: $inflight, queued: $qout};
+
+  ([$live[] | sim(.)]) as $sims
+| ([$sims[] | .row] | sort_by([(.repo // ""), .manager_id])) as $mrows
+| ([$sims[] | .inflight[]]
+   | sort_by([(if .eta == null then 1 else 0 end), (.eta // 0), (.repo // ""), .number])) as $inf
+| ([$sims[] | .queued[]]
+   | sort_by([(if .eta == null then 1 else 0 end), (.eta // 0), (.repo // ""), .number])) as $q
+| ([$mrows[] | .backlog_drains_at | select(. != null)] | max) as $drains
+| ($q[$limit:]) as $hidden
+| {at: $now,
+   burn: {limits: $limits, stall_window: $win},
+   backlog: {totals: {ready: ([$mrows[] | .ready] | add // 0),
+                      blocked: ([$mrows[] | .blocked] | add // 0),
+                      in_flight: ([$mrows[] | .in_flight] | add // 0),
+                      awaiting_approval: ([$mrows[] | .awaiting_approval] | add // 0),
+                      cap: ([$mrows[] | .cap] | add // 0),
+                      idle_slots: ([$mrows[] | .idle_slots] | add // 0),
+                      open: ([$sims[] | .open] | add // 0)},
+             managers: $mrows},
+   timeline: {shown: ($inf + $q[0:$limit]),
+              beyond: (if ($hidden | length) == 0 then null
+                       else {count: ($hidden | length),
+                             blocked: ([$hidden[] | select(.state == "blocked")] | length),
+                             last_eta: ([$hidden[] | .eta | select(. != null)] | max),
+                             drains_at: $drains} end),
+              drains_at: $drains, last_eta: $drains}}'
+
 # ---------------------------------------------------------------- inputs
 
 read_state() {
@@ -370,6 +574,109 @@ managers_json() { # the registrations, never the board's last_report files next 
     out+="$j"$'\n'
   done
   printf '%s' "$out" | jq -sc .
+}
+
+# ---- the collector. `mgr` writes launches/<owner>__<repo>.json and throughput/<owner>__<repo>.jsonl;
+# the guard only ever reads them, and asks gh for the board data itself so the overview stays
+# fresh machine-wide even when a manager has not run `mgr board` in a while.
+
+repo_slug() { printf '%s' "${1//\//__}"; }
+
+launches_json() { # launches_json <repo> -> {"<number>": {number,launched_at}}
+  local f j
+  [ -n "${1:-}" ] || { printf '{}'; return; }
+  f="$LAUNCHDIR/$(repo_slug "$1").json"
+  if [ ! -f "$f" ]; then printf '{}'; return; fi
+  j=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || j=""
+  case "$j" in ''|null) j='{}';; esac
+  printf '%s' "$j"
+}
+
+throughput_map() { # every ledger as {"<owner>__<repo>": [duration_s, ...]}, rows in file order
+  local map='{}' f slug arr
+  for f in "$THRUDIR"/*.jsonl; do
+    [ -f "$f" ] || continue
+    slug=$(basename "$f" .jsonl)
+    arr=$(jq -Rnc '[inputs | (fromjson? // empty) | select(type == "object")
+                    | .duration_s | select(type == "number") | select(. >= 0)]' "$f" 2>/dev/null) || arr='[]'
+    case "$arr" in ''|null) arr='[]';; esac
+    map=$(jq -c --arg s "$slug" --argjson a "$arr" '. + {($s): $a}' <<<"$map")
+  done
+  printf '%s' "$map"
+}
+
+gh_issues() { # gh_issues <repo> <cache-dir> -> open issues JSON, non-zero when gh cannot answer
+  local repo="$1" dir="$2" cache out=""
+  cache="$dir/$(repo_slug "$repo")"
+  if [ -f "$cache.json" ]; then cat "$cache.json"; return 0; fi
+  if [ -f "$cache.err" ]; then return 1; fi
+  if command -v gh >/dev/null 2>&1; then
+    out=$(gh issue list -R "$repo" --state open --limit 200 \
+            --json number,title,labels,body 2>/dev/null) || out=""
+  fi
+  if [ -n "$out" ]; then
+    out=$(jq -c 'select(type == "array")' <<<"$out" 2>/dev/null) || out=""
+  fi
+  if [ -z "$out" ]; then : >"$cache.err"; return 1; fi
+  printf '%s' "$out" >"$cache.json"
+  printf '%s' "$out"
+}
+
+# collect_extras <managers-json> <prev-state> <now>
+#   -> {"<manager_id>": {backlog, backlog_at, backlog_error, throughput}}
+# One gh call per distinct repo per tick, and only for managers whose snapshot is older than
+# MGR_GUARD_BACKLOG_INTERVAL_S. A refresh that fails keeps the previous snapshot and says so;
+# throughput is a file read, so it is recomputed every tick.
+collect_extras() {
+  local managers="$1" prev="$2" now="$3"
+  local extras='{}' cache tmap m mid repo cap adopting prevrow prev_at due issues bl thr err row
+  cache=$(mktemp -d "${TMPDIR:-/tmp}/mgr-guard-backlog.XXXXXX" 2>/dev/null) || cache=""
+  tmap=$(throughput_map)
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    mid=$(jq -r '.manager_id // ""' <<<"$m")
+    [ -n "$mid" ] || continue
+    repo=$(jq -r '.repo // ""' <<<"$m")
+    cap=$(jq -r '((.cap // 0) | floor)' <<<"$m")
+    adopting=$(jq -r '((.adopting // 0) | floor)' <<<"$m")
+    prevrow=$(jq -c --arg id "$mid" '((.managers // {})[$id] // {})
+      | {backlog: (.backlog // null), backlog_at: (.backlog_at // null),
+         backlog_error: (.backlog_error // null)}' <<<"$prev")
+    prev_at=$(jq -r '((.backlog_at // "") | tostring)' <<<"$prevrow")
+    due=1
+    case "$prev_at" in
+      ''|*[!0-9]*) due=1;;
+      *) if [ $(( now - prev_at )) -lt $(( BACKLOG_INTERVAL_S * 1000 )) ]; then due=0; fi;;
+    esac
+    thr=$(jq -nc --argjson map "$tmap" --arg slug "$(repo_slug "$repo")" \
+      --argjson default_s "$DEFAULT_TASK_S" "$JQ_THROUGHPUT")
+    bl=""; err=""
+    if [ "$due" = 1 ]; then
+      if [ -z "$repo" ]; then
+        err="no repo on the registration"
+      elif [ -z "$cache" ]; then
+        err="cannot create a tick cache dir"
+      elif issues=$(gh_issues "$repo" "$cache"); then
+        bl=$(jq -c --argjson launches "$(launches_json "$repo")" --argjson cap "$cap" \
+          --argjson adopting "$adopting" "$JQ_BACKLOG" <<<"$issues" 2>/dev/null) || bl=""
+        [ -n "$bl" ] || err="backlog projection failed"
+      else
+        err="gh issue list failed"
+      fi
+      [ -z "$err" ] || log warn "backlog refresh for $mid ($repo): $err"
+    fi
+    if [ -n "$bl" ]; then
+      row=$(jq -nc --argjson b "$bl" --argjson at "$now" --argjson t "$thr" \
+        '{backlog: $b, backlog_at: $at, backlog_error: null, throughput: $t}')
+    else
+      row=$(jq -nc --argjson p "$prevrow" --argjson t "$thr" --arg e "$err" \
+        '{backlog: $p.backlog, backlog_at: $p.backlog_at,
+          backlog_error: (if $e == "" then $p.backlog_error else $e end), throughput: $t}')
+    fi
+    extras=$(jq -c --arg id "$mid" --argjson v "$row" '. + {($id): $v}' <<<"$extras")
+  done < <(jq -c '.[]' <<<"$managers")
+  [ -z "$cache" ] || rm -rf "$cache"
+  printf '%s' "$extras"
 }
 
 session_facts() { # session_facts <file> <now> -> {provider,model,stall}
@@ -530,7 +837,7 @@ cmd_touch() {
 
 cmd_tick() {
   ensure_state_dir
-  local now prev bp agents panes facts providers p rep reports='[]' samples managers
+  local now prev bp agents panes facts providers p rep reports='[]' samples managers extras
   now=$(now_ms)
   prev=$(read_state)
   bp=$(builder_provider)
@@ -557,6 +864,9 @@ cmd_tick() {
 
   samples=$(prune_samples "$(( now - 86400000 ))")
 
+  # the backlog snapshot and throughput stats ride along on the manager rows
+  extras=$(collect_extras "$managers" "$prev" "$now")
+
   local policy
   policy=$(jq -nc \
     --argjson now "$now" --arg bp "$bp" \
@@ -564,6 +874,7 @@ cmd_tick() {
     --argjson managers "$managers" --argjson prev "$prev" \
     --argjson reports "$reports" --argjson samples "$samples" \
     --argjson slope_window "$SLOPE_WINDOW_S" --argjson min_span "$MIN_SLOPE_SPAN_S" \
+    --argjson extras "$extras" \
     "$JQ_POLICY") || die 1 "policy evaluation failed"
 
   # dead registrations go away, and so does the board report filed next to them
@@ -754,19 +1065,45 @@ cmd_status() {
             last_exit_at:$ex.at, last_exit_reason:$ex.reason}'
 }
 
+# ---------------------------------------------------------------- overview
+
+# Pure projection over state.json — no daemon needed, like `status`. What the tick collected
+# (burn, backlog, throughput) becomes one machine-wide picture: what is running, what is
+# queued, when each finishes, and which manager is about to run out of work.
+cmd_overview() {
+  local limit=10
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit) limit="${2:-}"; shift 2;;
+      --) shift;;
+      *) die 2 "usage: mgr-guard overview [--limit N]";;
+    esac
+  done
+  case "$limit" in ''|*[!0-9]*) die 2 "limit must be a non-negative integer: $limit";; esac
+  local st now
+  st=$(read_state)
+  now=$(now_ms)
+  jq -nc --argjson st "$st" --argjson now "$now" --argjson limit "$limit" \
+    --argjson default_s "$DEFAULT_TASK_S" "$JQ_OVERVIEW" || die 1 "overview projection failed"
+}
+
 # ---------------------------------------------------------------- usage
 
 usage() {
   cat <<'EOF'
-mgr-guard — 429 stall recovery and burn projection for herdr-hosted omp builders
+mgr-guard — 429 stall recovery, burn projection and backlog collection for herdr-hosted
+omp builders
 
-Two jobs, nothing else: re-prompt a manager or builder pane whose turn died on a provider
-rate limit once the quota renews, and keep a per-limit burn projection `mgr board` surfaces.
-Concurrency is the operator's `cap`, enforced by `mgr` alone.
+Three jobs, nothing else: re-prompt a manager or builder pane whose turn died on a provider
+rate limit once the quota renews, keep a per-limit burn projection `mgr board` surfaces, and
+collect every registered manager's backlog and measured throughput so `overview` can project
+the machine-wide timeline. Concurrency is the operator's `cap`, enforced by `mgr` alone.
 
   mgr-guard start [--interval S]      daemonize the tick loop (idempotent)
   mgr-guard stop                      SIGTERM the daemon, clear guard.pid
   mgr-guard status                    state.json + guard/pid + last exit (always exit 0)
+  mgr-guard overview [--limit N]      machine-wide burn, backlog and ETA timeline (JSON,
+                                      no daemon needed; N queued items shown, default 10)
   mgr-guard tick                      run one tick in the foreground, print state
   mgr-guard run                       foreground tick loop (what start daemonizes)
   mgr-guard register '<json>'         upsert managers/<manager_id>.json with seen_at
@@ -776,9 +1113,12 @@ Concurrency is the operator's `cap`, enforced by `mgr` alone.
 
 Env: MGR_STATE_DIR MGR_GUARD_INTERVAL MGR_GUARD_SLOPE_WINDOW_S
      MGR_GUARD_MIN_SLOPE_SPAN_S MGR_GUARD_IDLE_EXIT_S MGR_GUARD_NOTIFY
+     MGR_GUARD_BACKLOG_INTERVAL_S MGR_DEFAULT_TASK_S
 
 MGR_GUARD_IDLE_EXIT_S: the daemon exits after this long with no live manager pane and an
 empty 429 ledger. MGR_GUARD_NOTIFY=0 silences the reignite toasts.
+MGR_GUARD_BACKLOG_INTERVAL_S (120): how often a manager's backlog is re-fetched from gh.
+MGR_DEFAULT_TASK_S (2700): the task duration assumed when no throughput row exists anywhere.
 EOF
 }
 
@@ -795,6 +1135,7 @@ main() {
     run)            cmd_run "$@";;
     register)       cmd_register "$@";;
     touch)          cmd_touch "$@";;
+    overview)       cmd_overview "$@";;
     stall)          cmd_stall "$@";;
     -h|--help|help) usage; exit 0;;
     *) die 2 "unknown subcommand: $sub (try: mgr-guard --help)";;
