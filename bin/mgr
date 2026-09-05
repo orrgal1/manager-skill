@@ -291,12 +291,24 @@ tracked_missing_issues() { # tracked_missing_issues <open-issues-json> <agents-j
 
 # ---------------------------------------------------------------- quota guard
 
-# The deterministic quota daemon lives next to the real script (not next to a
-# symlink to it); MGR_GUARD_BIN overrides it (tests point it at a fake).
+# The quota daemon lives next to the real script (not next to a symlink to
+# it); MGR_GUARD_BIN overrides it (tests point it at a fake).
 guard_bin="${MGR_GUARD_BIN:-$(dirname "$MGR_SELF")/mgr-guard}"
 
+# where the guard keeps its ledger; `mgr board` records its burn projection
+# beside the guard's own registration for this manager (same default as the
+# guard's, so both halves agree without being told)
+guard_state_dir="${MGR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mgr-guard}"
+
+atomic_write() { # atomic_write <dest>   (content on stdin)
+  local dest="$1" tmp
+  tmp="$(dirname "$dest")/.tmp.$$.${RANDOM}"
+  if cat >"$tmp"; then mv -f "$tmp" "$dest"; else rm -f "$tmp"; return 1; fi
+}
+
 # `mgr-guard status` (state.json + {guard,pid}); a missing or failing binary is
-# indistinguishable from a stopped guard, and a stopped guard throttles nothing.
+# indistinguishable from a stopped guard, which is a board with no reading —
+# never a smaller cap, since the cap is the operator's dial alone.
 guard_state() {
   [ -n "${MGR_GUARD_CACHE:-}" ] && { printf '%s' "$MGR_GUARD_CACHE"; return; }
   local out=""
@@ -308,43 +320,35 @@ guard_state() {
   printf '%s' "$MGR_GUARD_CACHE"
 }
 
-# The operator's pause is a cap-0 override the guard keeps beside the priority
-# map, machine-wide per repo: while it is set every cap this CLI resolves — the
-# board's, the heartbeat's, `--cap N`'s — collapses to 0. A missing or failing
-# guard binary means nothing is paused (same reasoning as `guard_state`).
+# The operator's pause is a launch gate this CLI owns alone: it lives in the
+# primary's .git/config beside the rest of `mgr config`, so every worktree of
+# the repo sees it, and while it is set every cap this CLI resolves — the
+# board's, the heartbeat's, `--cap N`'s — collapses to 0. The guard knows
+# nothing about it and never interrupts a builder that is already running.
 operator_paused() {
   [ -n "${MGR_OP_PAUSED_CACHE:-}" ] && { printf '%s' "$MGR_OP_PAUSED_CACHE"; return; }
-  local rp out=""
-  MGR_OP_PAUSED_CACHE=false
-  if [ -x "$guard_bin" ]; then
-    # its own simple command: `repo`'s `die` inside $(…) would kill a subshell
-    rp=$(repo)
-    out=$("$guard_bin" paused "$rp" 2>/dev/null) || out=""
-    if jq -e '.paused == true' >/dev/null 2>&1 <<<"$out"; then
-      MGR_OP_PAUSED_CACHE=true
-    fi
+  if [ "$(cfg_get_one paused)" = true ]; then
+    MGR_OP_PAUSED_CACHE=true
+  else
+    MGR_OP_PAUSED_CACHE=false
   fi
   printf '%s' "$MGR_OP_PAUSED_CACHE"
 }
 
-# `--pane` lets the guard answer from its own ledger: a builder it paused on
-# purpose has no rate-limit error in its session file, only a `cause:"paused"`
-# entry in state.json, and that entry wins over the file check.
-guard_stall() { # guard_stall <pane_id> <session.jsonl> -> stall object, or nothing
-  local pane="${1:-}" path="${2:-}" out=""
+# The guard reads the builder's own session file: a 429 is the only hold there
+# is, and it is in the file whether the guard is running or not.
+guard_stall() { # guard_stall <session.jsonl> -> stall object, or nothing
+  local path="${1:-}" out=""
   [ -n "$path" ] || return 0
   [ -x "$guard_bin" ] || return 0
-  if [ -n "$pane" ]; then
-    out=$("$guard_bin" stall --pane "$pane" "$path" 2>/dev/null) || return 0
-  else
-    out=$("$guard_bin" stall "$path" 2>/dev/null) || return 0
-  fi
+  out=$("$guard_bin" stall "$path" 2>/dev/null) || return 0
   jq -e 'type == "object"' >/dev/null 2>&1 <<<"$out" || return 0
   jq -c . <<<"$out"
 }
 
 # One registration per board call: cheap (the guard only writes one small file)
-# and idempotent — it refreshes seen_at and the demand numbers, nothing else.
+# and idempotent — it refreshes seen_at and the attribution numbers, nothing
+# else; nothing in the guard computes from them.
 # `mgr-guard register` rejects a null pane_id, so a pane-less shell just skips.
 guard_heartbeat() { # guard_heartbeat <board-json>
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || return 0
@@ -352,11 +356,10 @@ guard_heartbeat() { # guard_heartbeat <board-json>
   [ -x "$guard_bin" ] || return 0
   local reg
   reg=$(jq -c --arg ws "$HERDR_WORKSPACE_ID" --arg pane "$HERDR_PANE_ID" '
-    (.in_flight|length) as $if | (.adopting|length) as $ad | (.ready|length) as $rd |
     {manager_id:("ws-" + $ws), workspace_id:$ws, pane_id:$pane,
      repo:.repo, primary:.primary, cap:.cap,
-     in_flight:$if, adopting:$ad, ready:$rd,
-     demand:([.cap, ($if + $ad + $rd)] | min)}' <<<"$1") \
+     in_flight:(.in_flight|length), adopting:(.adopting|length),
+     ready:(.ready|length)}' <<<"$1") \
     || { warn "could not build the mgr-guard registration"; return 0; }
   "$guard_bin" register "$reg" >/dev/null 2>&1 || warn "mgr-guard register failed"
 }
@@ -375,22 +378,21 @@ guard_touch() {
   "$guard_bin" touch "ws-$HERDR_WORKSPACE_ID" "$HERDR_PANE_ID" >/dev/null 2>&1 || true
 }
 
-# the `mgr wait` answer for a builder the quota guard is holding: dead on a
-# provider rate limit (`cause:"429"`), paused to keep quota for a
-# higher-priority project (`cause:"paused"`) or held because the operator
-# paused the project (`cause:"operator-paused"`). No cause = a plain 429.
+# the `mgr wait` answer for a builder that stopped on a provider rate limit:
+# dead until the quota renews, which is the guard's job to notice. `resets_at`
+# is the best reading there is — the provider's recovery time when the guard
+# has one, the session's own, or the first limit's reset.
 quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
   local gst
   gst=$(guard_state)
   jq -nc --arg n "$1" --arg pane "$2" --argjson stall "$3" --argjson g "$gst" '
     ($stall.provider // null) as $p |
     (if $p == null then null else ($g.providers[$p] // null) end) as $pv |
-    (($pv.recovers_at // ([($pv.limits // [])[] | .resets_at] | .[0])) // null) as $resets |
-    ($stall.cause // "429") as $cause |
+    (($pv.recovers_at // $stall.recovers_at
+      // ([($pv.limits // [])[] | .resets_at] | .[0])) // null) as $resets |
     {number:(if $n == "" then null else ($n|tonumber) end), pane_id:$pane,
-     agent_status:(if ($cause|IN("paused","operator-paused")) then "quota-paused"
-                   else "quota-stalled" end),
-     stall:($stall + {cause:$cause, resets_at:$resets, guard:($g.guard // "stopped")}),
+     agent_status:"quota-stalled",
+     stall:($stall + {resets_at:$resets, guard:($g.guard // "stopped")}),
      report:null}'
 }
 
@@ -404,31 +406,15 @@ cmd_guard() {
   exec "$guard_bin" "$@"
 }
 
-# `mgr priority` is a thin front for the machine-wide, per-repo priority map:
-# this repo is the key and the guard owns the file.
-cmd_priority() {
-  [ $# -le 1 ] || die 2 "usage: mgr priority [N|--clear]"
-  local arg="${1:-}"
-  case "$arg" in
-    ''|--clear) ;;
-    *[!0-9]*) die 2 "priority must be a non-negative integer: $arg";;
-  esac
-  [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
-  local rp
-  rp=$(repo)
-  [ -n "$arg" ] || exec "$guard_bin" priority "$rp"
-  exec "$guard_bin" priority "$rp" "$arg"
-}
-
 # ---- pause
 #
-# `mgr pause` is not a state machine of its own: it is literally a cap-0
-# override for this repo, kept in the same machine-wide store as the priority
-# map (the guard owns the file). Everything that follows falls out of the cap
-# being 0 — the board reports no slots, `mgr launch` refuses, and the guard's
-# next tick sees demand 0, hence allotment 0, and holds this project's
-# builders through the very path a quota squeeze uses. `mgr unpause` drops the
-# override and the cap goes back to --cap/MGR_CAP/config/3.
+# `mgr pause` is not a state machine of its own: it is a launch gate and a
+# cap-0 override for this repo, kept in the primary's .git/config beside the
+# rest of `mgr config`, and enforced by this CLI alone. Everything that
+# follows falls out of the cap being 0 — the board reports no slots and `mgr
+# launch` refuses. Builders that are already running are never interrupted.
+# `mgr unpause` drops the override and the cap goes back to
+# --cap/MGR_CAP/config/3.
 
 # the registration only changes when a board runs, so both commands refresh it
 # themselves: without it the guard would keep the pre-pause cap until the next
@@ -442,11 +428,14 @@ pause_refresh_registration() {
 
 cmd_pause() {
   [ $# -eq 0 ] || die 2 "usage: mgr pause"
-  [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
-  local rp prev
+  # its own simple command: a `die` inside $(…) would only kill the subshell
+  primary >/dev/null
+  local pri rp prev
+  pri=$(primary)
   rp=$(repo)
   prev=$(cap_of "")
-  "$guard_bin" pause "$rp" >/dev/null || die 1 "mgr-guard pause failed"
+  git -C "$pri" config --local --replace-all mgr.paused true \
+    || die 1 "git config --replace-all mgr.paused failed"
   MGR_OP_PAUSED_CACHE=true
   pause_refresh_registration
   jq -nc --arg r "$rp" --argjson prev "$prev" \
@@ -455,12 +444,13 @@ cmd_pause() {
 
 cmd_unpause() {
   [ $# -eq 0 ] || die 2 "usage: mgr unpause"
-  [ -x "$guard_bin" ] || die 1 "mgr-guard is not executable: $guard_bin"
-  local rp cap
+  primary >/dev/null
+  local pri rp cap
+  pri=$(primary)
   rp=$(repo)
-  cap=$(cap_of "")
-  "$guard_bin" unpause "$rp" >/dev/null || die 1 "mgr-guard unpause failed"
+  git -C "$pri" config --local --unset-all mgr.paused 2>/dev/null || true
   MGR_OP_PAUSED_CACHE=false
+  cap=$(cap_of "")
   pause_refresh_registration
   jq -nc --arg r "$rp" --argjson cap "$cap" \
     '{repo:$r, paused:false, cap:$cap}'
@@ -548,6 +538,55 @@ manager_json() { # manager_json <agents-json> -> {pane_id,tab_id,agent,cwd} or n
       | {pane_id, tab_id, agent:.name, cwd}] | .[0] // null'
 }
 
+# The burn projection is only worth a word when it moved, so `mgr board` keeps
+# the last one it reported for this manager beside the guard's registration and
+# diffs against it. Only the operator's own `mgr board` records: the internal
+# boards `launch`/`adopt`/`pause` run would otherwise consume the change before
+# the manager ever printed it, hence the MGR_BOARD_RECORD gate.
+report_delta() { # report_delta <limits-json> <provider> -> {changed, delta}
+  local ws="${HERDR_WORKSPACE_ID:-}" f last="" verdict at
+  if [ "${MGR_BOARD_RECORD:-0}" != 1 ] || [ -z "$ws" ]; then
+    printf '{"changed":false,"delta":null}'
+    return
+  fi
+  f="$guard_state_dir/managers/ws-$ws.last_report.json"
+  [ -f "$f" ] && last=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
+  [ -n "$last" ] || last=null
+
+  verdict=$(jq -nc --argjson lims "$1" --argjson last "$last" '
+    def fmt: (. * 100 | round) / 100 | tostring;
+    def abs: if . < 0 then -. else . end;
+    ($lims | map(select(.id != null))) as $cur |
+    (if ($last | type) == "object" then ($last.limits // []) else null end) as $prev |
+    if $prev == null then
+      (if ($cur | length) == 0 then {changed:false, delta:null}
+       else {changed:true, delta:"first projection"} end)
+    else
+      ($prev | map(select(.id != null) | {key:.id, value:.}) | from_entries) as $pm |
+      [ $cur[] | . as $l | ($l.projected_at_reset // 0) as $now
+                | ($l.fits // false) as $fits | ($pm[$l.id] // null) as $p |
+        if $p == null then $l.id + " " + ($now|fmt) + "× (new)"
+        else
+          (($p.projected_at_reset // 0)) as $was |
+          (($p.fits // false) != $fits) as $flip |
+          if $flip or (($now - $was) | abs) >= 0.1 then
+            $l.id + " " + ($was|fmt) + "× → " + ($now|fmt) + "×"
+            + (if $flip then (if $fits then " (now fits)" else " (now over)" end) else "" end)
+          else empty end
+        end ] as $ch |
+      if ($ch | length) == 0 then {changed:false, delta:null}
+      else {changed:true, delta:($ch | join("; "))} end
+    end') || { printf '{"changed":false,"delta":null}'; return; }
+
+  at=$(( $(date +%s) * 1000 ))
+  mkdir -p "$guard_state_dir/managers" 2>/dev/null || true
+  jq -nc --argjson lims "$1" --arg prov "$2" --argjson at "$at" \
+    '{at:$at, provider:(if $prov == "" then null else $prov end),
+      limits:[$lims[] | {id, projected_at_reset, fits}]}' \
+    | atomic_write "$f" || warn "could not record the burn projection in $f"
+  printf '%s' "$verdict"
+}
+
 cmd_board() {
   local cap=""
   while [ $# -gt 0 ]; do
@@ -559,9 +598,12 @@ cmd_board() {
   cap=$(cap_of "$cap")
 
   # resolved before the jq call: `die` inside a command substitution would only
-  # kill its own subshell, so each of these must be its own simple command.
+  # kill its own subshell, so each of these must be its own simple command. The
+  # primary is resolved (and cached) here for the same reason: the operator's
+  # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
   local b_manager board
+  primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
   b_primary=$(primary)
@@ -575,7 +617,7 @@ cmd_board() {
   b_manager=$(manager_json "$b_agents")
 
   # the pause outranks --cap/MGR_CAP/config: from here on the cap *is* 0, which
-  # is what the board reports and what the heartbeat registers as demand 0.
+  # is what the board reports and what the heartbeat registers.
   if [ "$b_paused" = true ]; then cap=0; fi
 
   board=$(jq -n \
@@ -642,42 +684,18 @@ cmd_board() {
     ($guard.guard // "stopped") as $gs |
     ($guard.builder_provider // null) as $prov |
     (if $prov == null then null else ($guard.providers[$prov] // null) end) as $pv |
-    ($pv.limits // []) as $lims |
-    ((if ($pv.binding_limit // null) == null then null
-      else ([$lims[] | select(.id == $pv.binding_limit)] | .[0]) end)
-     // ($lims | sort_by(.used // 0) | last)) as $bl |
-    ($guard.managers[("ws-" + $ws)] // null) as $me |
-    ($me.allotment // null) as $allot |
-    ($me.derived_cap // null) as $derived |
-    # no allotment yet (registered after the last tick): the global verdict is the ceiling
-    (if $gs == "running" then ([$cap, ($allot // $guard.allowed_total // $cap)] | min) else $cap end) as $capeff |
-    # an operator pause is the loudest reason there is: no --cap, no derived
-    # cap and no provider verdict can explain a cap of 0 better than it does.
-    # Otherwise: when the priority-derived cap ceiling bites at least as hard as
-    # the quota allotment it, not the quota, is the binding limit — so say so
-    # instead of the provider reason
-    (if $paused then "paused by the operator (mgr unpause lifts it)"
-     elif $gs == "running" and $derived != null and $derived < $cap and (($allot // $derived) >= $derived)
-     then "priority " + ($me.priority|tostring) + " vs top " + ($guard.top_priority|tostring)
-          + " (cap " + ($guard.top_cap|tostring) + ") → cap " + ($derived|tostring)
-     else $pv.reason // null end) as $qreason |
-    # guard-held builders of this workspace, split by why the guard holds them:
-    # a 429 comes from the provider, "paused" is the guard keeping quota for a
-    # higher-priority project and "operator-paused" is `mgr pause`. An entry
-    # without a cause predates the split.
+    # the builders of this workspace on the 429 list: the guard reignites them
+    # itself once the quota renews, the board only names them
     ([$guard.stalled[]? | select(.workspace_id == $ws)
             | select((.name // "") | test("^issue-[0-9]+$"))
-            | {n:((.name | capture("^issue-(?<n>[0-9]+)$").n) | tonumber),
-               cause:(.cause // "429")}]) as $held |
-    ([$held[] | select(.cause == "429") | .n] | unique) as $qstalled |
-    ([$held[] | select(.cause | IN("paused","operator-paused")) | .n] | unique) as $qpaused |
+            | ((.name | capture("^issue-(?<n>[0-9]+)$").n) | tonumber)]
+     | unique) as $qstalled |
     {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
      self:(if $self=="" then null else $self end), manager:$manager, config:$config,
-     paused_by_operator:$paused, cap:$cap, cap_effective:$capeff,
-     slots_free:([0, ($capeff - ($inflight|length) - ($adopting|length))] | max),
+     paused_by_operator:$paused, cap:$cap,
+     slots_free:([0, ($cap - ($inflight|length) - ($adopting|length))] | max),
      in_flight:[$inflight[] | .number as $rn
-                | . + {quota_stalled: (($qstalled | index($rn)) != null),
-                       quota_paused: (($qpaused | index($rn)) != null)}],
+                | . + {quota_stalled: (($qstalled | index($rn)) != null)}],
      awaiting_approval:$awaiting,
      ready:$ready, blocked:$blocked, orphans:$orphans,
      adopting:$adopting, unmanaged:$unmanaged,
@@ -687,27 +705,29 @@ cmd_board() {
             last_exit_at:($guard.last_exit_at // null),
             last_exit_reason:($guard.last_exit_reason // null),
             provider:$prov, status:($pv.status // null),
-            used:($bl.used // null), resets_at:($bl.resets_at // null),
-            burn_per_hour:($bl.burn_per_hour // null),
-            projected_at_reset:($bl.projected_at_reset // null),
-            allowed_total:($pv.allowed_total // $guard.allowed_total // null),
-            allotment:$allot, derived_cap:$derived, reason:$qreason,
-            priority:($guard.priorities[$repo] // 5),
-            constrained:($guard.constrained // false),
-            paused:($me.paused // false),
+            # the projection itself, verbatim from the last guard tick
+            limits:[($pv.limits // [])[]
+                    | {id, used, burn_per_hour, projected_at_reset, resets_at, fits}],
+            reason:($pv.reason // null),
+            stalled:$qstalled,
             # live is pane existence, not heartbeat age: pane_alive is why, and
             # seen_at is only the last time that manager ran an `mgr` command
             managers:([($guard.managers // {}) | to_entries[]
                        | {manager_id:(.value.manager_id // .key), repo:(.value.repo // null),
                           cap:(.value.cap // null), in_flight:(.value.in_flight // null),
-                          derived_cap:(.value.derived_cap // null),
-                          allotment:(.value.allotment // null), live:(.value.live // false),
+                          live:(.value.live // false),
                           pane_alive:(.value.pane_alive // false),
-                          seen_at:(.value.seen_at // null),
-                          priority:(.value.priority // null), paused:(.value.paused // false),
-                          paused_by_operator:(.value.paused_by_operator // false)}]
+                          seen_at:(.value.seen_at // null)}]
                       | sort_by(.manager_id)),
-            stalled:$qstalled, paused_builders:$qpaused}}')
+            # filled in below, so that only a top-level `mgr board` records
+            changed:false, delta:null}}')
+
+  local b_lims b_prov b_delta
+  b_lims=$(jq -c '.quota.limits' <<<"$board")
+  b_prov=$(jq -r '.quota.provider // ""' <<<"$board")
+  b_delta=$(report_delta "$b_lims" "$b_prov")
+  board=$(jq -c --argjson d "$b_delta" \
+    '.quota.changed = $d.changed | .quota.delta = $d.delta' <<<"$board")
 
   # the board JSON is the only thing on stdout; the heartbeat is silent
   printf '%s\n' "$board"
@@ -749,16 +769,10 @@ cmd_launch() {
 
   [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
 
-  local bd sf ce
+  local bd sf
   bd=$(cmd_board --cap "$cap")
   sf=$(jq -r '.slots_free' <<<"$bd")
-  if [ "$sf" -le 0 ]; then
-    ce=$(jq -r '.cap_effective' <<<"$bd")
-    if [ "$ce" -lt "$cap" ]; then
-      die 3 "no free slots (cap=$cap, cap_effective=$ce, quota: $(jq -r '.quota.reason // "throttled by mgr-guard"' <<<"$bd"))"
-    fi
-    die 3 "no free slots (cap=$cap)"
-  fi
+  [ "$sf" -le 0 ] && die 3 "no free slots (cap=$cap)"
 
   title=$(jq -r '.title' <<<"$ij")
   policy=$(policy_of "$ij")
@@ -867,11 +881,11 @@ cmd_adopt() {
     adopt-*) die 3 "agent $name on $pane is already adopted (self-registration pending)";;
   esac
 
-  local bd counts cap_eff over_cap
+  local bd counts b_cap over_cap
   bd=$(cmd_board --cap "$cap")
   counts=$(jq -r '(.in_flight|length) + (.adopting|length)' <<<"$bd")
-  cap_eff=$(jq -r '.cap_effective' <<<"$bd")
-  if [ "$counts" -ge "$cap_eff" ]; then over_cap=true; else over_cap=false; fi
+  b_cap=$(jq -r '.cap' <<<"$bd")
+  if [ "$counts" -ge "$b_cap" ]; then over_cap=true; else over_cap=false; fi
 
   local pri rp; pri=$(primary); rp=$(repo)
   local br_disp="(none)" br_cmt="none"
@@ -1025,9 +1039,9 @@ cmd_wait() {
   local got status name pane sess stall
   got=$(herdr agent get "$target" 2>/dev/null) || die 4 "agent target $target is not live"
 
-  # (a) a builder the guard is already holding never settles on its own — a 429
-  # is dead until the quota returns, a paused one until the guard resumes it.
-  # With the guard running, park on its revival first; without a guard, say so.
+  # (a) a builder stopped on a 429 never settles on its own — it is dead until
+  # the quota renews and the guard reignites it. With the guard running, park on
+  # that revival first; without a guard, nobody will, so say so.
   status=$(jq -r '.result.agent.agent_status // "unknown"' <<<"$got")
   pane=$(jq -r '.result.agent.pane_id // ""' <<<"$got")
   name=$(jq -r '.result.agent.name // ""' <<<"$got")
@@ -1037,7 +1051,7 @@ cmd_wait() {
     case "$n" in ''|*[!0-9]*) n="";; esac
   fi
   stall=""
-  if [ "$status" != working ]; then stall=$(guard_stall "$pane" "$sess" || true); fi
+  if [ "$status" != working ]; then stall=$(guard_stall "$sess" || true); fi
   if [ -n "$stall" ]; then
     if [ "$(guard_state | jq -r '.guard')" = running ]; then
       herdr agent wait "$target" --until working >/dev/null 2>&1 || true
@@ -1073,13 +1087,13 @@ cmd_wait() {
       fi
     fi
 
-    # (b) it settled with no fresh report because the guard is holding it again.
+    # (b) it settled with no fresh report because it stopped on a 429 again.
     # Reviving it is the guard's own job, so a running guard just means another
     # lap; with no guard nobody will, and the caller has to hear about it. The
     # cached verdict is dropped first — a guard that died mid-wait must show up.
     if [ "$report" = null ] && [ "$status" != working ]; then
       MGR_GUARD_CACHE=""
-      stall=$(guard_stall "$pane" "$sess" || true)
+      stall=$(guard_stall "$sess" || true)
       if [ -n "$stall" ]; then
         if [ "$no_quota_block" = false ] && [ "$(guard_state | jq -r '.guard')" = running ]; then
           herdr agent wait "$target" --until working >/dev/null 2>&1 || true
@@ -1237,12 +1251,11 @@ mgr — manager CLI for herdr-hosted omp builders
                                       waited through (--no-quota-block: return on them)
   mgr prompt <N> <text...>            send text to builder issue-N
   mgr retire <N> [--close]            close tab, remove worktree/branch, clear labels
-  mgr guard <start|stop|status>       the deterministic quota-guard daemon: start is
-                                      idempotent, status is cheap (files + kill -0)
-  mgr priority [N|--clear]            show/set this repo's quota priority (machine-wide,
-                                      default 5, higher wins)
-  mgr pause                           park this repo machine-wide: cap 0 until unpaused;
-                                      the guard holds its builders
+  mgr guard <start|stop|status>       the quota guard: it reignites sessions that
+                                      stopped on a 429 once the quota renews and
+                                      keeps the burn projection `mgr board` reports
+  mgr pause                           park this project: cap 0 until unpaused, so
+                                      `mgr launch` refuses; running builders keep going
   mgr unpause|resume                  lift the pause; the configured cap applies again
   mgr config <set|add|get|unset|list> [key] [value]
                                       per-repo harness config: omp-arg (extra omp argv),
@@ -1260,7 +1273,6 @@ env: MGR_CAP        default concurrency cap
      MGR_BRIEF_EXTRA  markdown file appended to every brief (replaces mgr.brief-extra)
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
-     MGR_GUARD_RESUME_COOLDOWN_S  seconds before a paused builder may resume (60)
      HERDR_WORKSPACE_ID  target workspace (all commands; headless use sets it explicitly)
      HERDR_PANE_ID       the caller's pane (bind, board.self, and the guard
                          heartbeat every command stamps)
@@ -1286,7 +1298,7 @@ main() {
   guard_touch
   case "$sub" in
     labels)        cmd_labels "$@";;
-    board)         cmd_board "$@";;
+    board)         MGR_BOARD_RECORD=1; cmd_board "$@";;
     launch)        cmd_launch "$@";;
     adopt)         cmd_adopt "$@";;
     bind)          cmd_bind "$@";;
@@ -1294,7 +1306,6 @@ main() {
     prompt)        cmd_prompt "$@";;
     retire)        cmd_retire "$@";;
     guard)         cmd_guard "$@";;
-    priority)      cmd_priority "$@";;
     pause)         cmd_pause "$@";;
     unpause|resume) cmd_unpause "$@";;
     config)        cmd_config "$@";;
