@@ -174,11 +174,32 @@ MGR_SELF=$(readlink -f "$0" 2>/dev/null || true)
 MGR_ROOT=$(dirname "$(dirname "$MGR_SELF")")
 MGR_SKILL_MD="$MGR_ROOT/SKILL.md"
 MGR_BUILDER_MD="$MGR_ROOT/builder.md"
+# one workflow file per size: the complete build-and-verify process a builder of
+# that size follows, handed to it by name in the brief
+MGR_WORKFLOWS_DIR="$MGR_ROOT/workflows"
 # the status-line extension every launched builder loads (rate-limited / guard
 # stopped / project paused, straight from the guard's ledger)
 MGR_STATUS_EXT="$MGR_ROOT/extensions/mgr-status.ts"
 
 # ---------------------------------------------------------------- github
+
+# The four sizes, smallest first: a `size:` label per workflow file, and the
+# model role (`omp --model @<size>`) the builder session of that size runs on.
+MGR_SIZES='tiny small medium large'
+
+size_color() { # size_color <size> -> the label colour
+  case "$1" in
+    tiny)   printf 'c5def5';;
+    small)  printf 'bfd4f2';;
+    medium) printf '5319e7';;
+    large)  printf 'b60205';;
+  esac
+}
+
+size_valid() { # size_valid <word>
+  case " $MGR_SIZES " in *" $1 "*) return 0;; esac
+  return 1
+}
 
 ensure_labels() {
   gh label create 'mgr:in-flight' --color 1d76db --force \
@@ -190,6 +211,12 @@ ensure_labels() {
   gh label create 'mgr:manual-approve' --color d93f0b --force \
     --description 'manager: builder must not self-merge; operator approves' >/dev/null 2>&1 \
     || die 1 "gh label create mgr:manual-approve failed"
+  local s
+  for s in $MGR_SIZES; do
+    gh label create "size:$s" --color "$(size_color "$s")" --force \
+      --description "builder workflow and model: $s" >/dev/null 2>&1 \
+      || die 1 "gh label create size:$s failed"
+  done
 }
 
 open_issues() { # cached json array of open issues
@@ -207,6 +234,19 @@ issue_json() { # issue_json <N> -> {number,title,state,labels,body}
 policy_of() { # policy_of <issue-json>
   jq -r 'if ([.labels[].name] | index("mgr:manual-approve")) then "manual-approve"
          else "auto-merge" end' <<<"$1"
+}
+
+# The size a builder is briefed with, read from the labels the caller already
+# fetched. Exactly one `size:` label is the only answer; anything else is the
+# caller's decision, so it gets an exit code instead of a guess.
+size_of() { # size_of <issue-json> -> the size; 1 = none, 2 = several (all printed)
+  local sizes n
+  sizes=$(jq -c '[.labels[].name | select(startswith("size:")) | ltrimstr("size:")]
+                 | sort' <<<"$1")
+  n=$(jq -r 'length' <<<"$sizes")
+  [ "$n" = 0 ] && return 1
+  jq -r 'join(" ")' <<<"$sizes"
+  [ "$n" = 1 ] || return 2
 }
 
 has_label() { # has_label <issue-json> <label>
@@ -791,18 +831,22 @@ cmd_board() {
     ($manager.pane_id // null) as $mgrpane |
     def pol: if ([.labels[].name]|index("mgr:manual-approve")) then "manual-approve" else "auto-merge" end;
     def lbl($n): ([.labels[].name]|index($n)) != null;
-    ($issues | map(. + {state:"open", policy: pol,
+    # exactly one size: label is a size; none or several is null, which is what
+    # `mgr launch` refuses on
+    def sz: [.labels[].name | select(startswith("size:")) | ltrimstr("size:")]
+            | if length == 1 then .[0] else null end;
+    ($issues | map(. + {state:"open", policy: pol, size: sz,
                         inflight: lbl("mgr:in-flight"),
                         awaiting: lbl("mgr:awaiting-approval"),
                         blocked_by: [blockers[] | select(. as $n | $open | index($n))]})) as $IO |
-    ($extra | map(. + {state:((.state // "CLOSED")|ascii_downcase), policy: pol,
+    ($extra | map(. + {state:((.state // "CLOSED")|ascii_downcase), policy: pol, size: sz,
                        awaiting: lbl("mgr:awaiting-approval"),
                        inflight: (lbl("mgr:in-flight") or (lbl("mgr:awaiting-approval")|not)),
                        blocked_by: []})) as $IX |
     ($IO + $IX) as $I |
     def agent_for($n): ($ag | map(select(.name == ("issue-" + ($n|tostring)))) | .[0] // null);
     def row: . as $i | agent_for($i.number) as $a |
-      {number:$i.number, title:$i.title, state:$i.state, policy:$i.policy,
+      {number:$i.number, title:$i.title, state:$i.state, policy:$i.policy, size:$i.size,
        agent:(if $a then $a.name else null end),
        agent_status:(if $a then $a.agent_status else null end),
        tab_id:(if $a then $a.tab_id else null end),
@@ -812,9 +856,9 @@ cmd_board() {
     ([$I[] | select(.inflight) | row] | sort_by(.number)) as $inflight |
     ([$I[] | select(.awaiting and (.inflight|not)) | row] | sort_by(.number)) as $awaiting |
     ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.blocked_by|length)==0)
-            | {number,title,policy,blocked_by}] | sort_by(.number)) as $ready |
+            | {number,title,policy,size,blocked_by}] | sort_by(.number)) as $ready |
     ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.blocked_by|length)>0)
-            | {number,title,policy,blocked_by}] | sort_by(.number)) as $blocked |
+            | {number,title,policy,size,blocked_by}] | sort_by(.number)) as $blocked |
     ([$ag[] | select(.name != null and (.name|startswith("adopt-")))
             | {pane_id,tab_id,agent:.name,agent_status,cwd}] | sort_by(.pane_id)) as $adopting |
     ([$ag[] | select(.pane_id != $self) | select(.pane_id != $mgrpane)
@@ -1055,7 +1099,7 @@ cmd_launch() {
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || die 3 "not running inside herdr (HERDR_WORKSPACE_ID unset)"
   require_agents
 
-  local ij state title policy
+  local ij state title policy size srsz=0
   ij=$(issue_json "$n")
   state=$(jq -r '.state' <<<"$ij")
   [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
@@ -1067,6 +1111,15 @@ cmd_launch() {
   [ "$(jq -r 'length' <<<"$blk")" -gt 0 ] && die 3 "issue #$n has open blockers: $(jq -rc . <<<"$blk")"
 
   [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
+
+  # the size decides both the workflow file the brief names and the model the
+  # session runs on, so a launch without exactly one `size:` label is refused
+  # before anything is created — the operator sizes the issue, never `mgr`
+  size=$(size_of "$ij") || srsz=$?
+  case "$srsz" in
+    1) die 3 "issue #$n has no size: label; add exactly one with: gh issue edit $n --add-label size:<tiny|small|medium|large> (or: $MGR_SELF size $n <size>)";;
+    2) die 3 "issue #$n has several size: labels ($size); remove all but one with: gh issue edit $n --remove-label size:<size> (or: $MGR_SELF size $n <size>)";;
+  esac
 
   local bd sf
   bd=$(cmd_board --cap "$cap")
@@ -1090,7 +1143,7 @@ cmd_launch() {
   # extension comes first, then the operator's omp-args, so `--` is always
   # there. bash 3.2 needs the `${a[@]+…}` idiom to expand a possibly-empty
   # array under `set -u`.
-  local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT")
+  local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT" --model "@$size")
   local v
   while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -1133,7 +1186,7 @@ cmd_launch() {
   $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
 
   local brief
-  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
   brief=$(brief_with_extra "$brief")
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
@@ -1200,13 +1253,17 @@ cmd_adopt() {
   ensure_labels
 
   if [ -n "$n" ]; then
-    local ij state title policy
+    local ij state title policy size
     ij=$(issue_json "$n")
     state=$(jq -r '.state' <<<"$ij")
     [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
     [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
     title=$(jq -r '.title' <<<"$ij")
     policy=$(policy_of "$ij")
+    # an adoptee is already mid-work: an unlabelled or ambiguously labelled
+    # issue is briefed as medium rather than refused
+    size=$(size_of "$ij") || size=medium
+    size_valid "$size" || size=medium
     local slug; slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
 
     herdr_or_die "herdr agent rename $pane issue-$n failed" herdr agent rename "$pane" "issue-$n"
@@ -1221,7 +1278,7 @@ cmd_adopt() {
       || warn "gh issue comment #$n failed"
 
     local brief
-    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
@@ -1238,8 +1295,10 @@ cmd_adopt() {
     local newname
     newname="adopt-$(sanitize_pane "$pane")"
     herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
-    local brief
-    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"), then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Resume your work only after bind succeeds."
+    # no issue yet, so nothing carries a size: the session is briefed as medium
+    # and labels the issue it creates
+    local brief size=medium
+    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"). Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/<the size you labelled>.md, which is how you build and verify at your size — read it before you touch code. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Size: $size. Resume your work only after bind succeeds."
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
 
@@ -1535,11 +1594,43 @@ cmd_retire() {
       throughput_appended:$tp}'
 }
 
+# ---------------------------------------------------------------- size
+
+# The operator's resize dial. A live builder resizes itself (it comments
+# `builder: resized <from>→<to>` and swaps the label), so this refuses while the
+# issue is in flight rather than pulling the workflow out from under it.
+cmd_size() {
+  local n="${1:-}" s="${2:-}"
+  [ $# -eq 2 ] || die 2 "usage: mgr size <N> <tiny|small|medium|large>"
+  case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
+  size_valid "$s" || die 2 "size must be one of tiny|small|medium|large: $s"
+
+  local ij
+  ij=$(issue_json "$n")
+  has_label "$ij" 'mgr:in-flight' \
+    && die 3 "issue #$n is in flight; its builder resizes itself (comment builder: resized <from>→<to> and swap the label)"
+
+  ensure_labels
+  local -a edit=(--add-label "size:$s")
+  local cur
+  while IFS= read -r cur; do
+    [ -n "$cur" ] || continue
+    [ "$cur" = "$s" ] && continue
+    edit+=(--remove-label "size:$cur")
+  done < <(jq -r '.labels[].name | select(startswith("size:")) | ltrimstr("size:")' <<<"$ij")
+  gh issue edit "$n" "${edit[@]}" >/dev/null \
+    || die 1 "gh issue edit #$n --add-label size:$s failed"
+
+  jq -nc --argjson number "$n" --arg size "$s" '{number:$number,size:$size}'
+}
+
 # ---------------------------------------------------------------- labels
 
 cmd_labels() {
   ensure_labels
-  jq -nc '{labels:["mgr:in-flight","mgr:awaiting-approval","mgr:manual-approve"]}'
+  jq -nc --arg sizes "$MGR_SIZES" \
+    '{labels:(["mgr:in-flight","mgr:awaiting-approval","mgr:manual-approve"]
+              + ($sizes | split(" ") | map("size:" + .)))}'
 }
 
 # ------------------------------------------------------------ version / paths
@@ -1555,8 +1646,9 @@ cmd_version() {
 
 cmd_paths() {
   jq -nc --arg root "$MGR_ROOT" --arg skill_md "$MGR_SKILL_MD" \
-    --arg builder_md "$MGR_BUILDER_MD" --arg mgr "$MGR_SELF" \
-    '{root:$root,skill_md:$skill_md,builder_md:$builder_md,mgr:$mgr}'
+    --arg builder_md "$MGR_BUILDER_MD" --arg workflows "$MGR_WORKFLOWS_DIR" \
+    --arg mgr "$MGR_SELF" \
+    '{root:$root,skill_md:$skill_md,builder_md:$builder_md,workflows:$workflows,mgr:$mgr}'
 }
 
 # ---------------------------------------------------------------- usage
@@ -1565,7 +1657,7 @@ usage() {
   cat <<'EOF'
 mgr — manager CLI for herdr-hosted omp builders
 
-  mgr labels                          ensure the mgr:* labels exist
+  mgr labels                          ensure the mgr:* and size:* labels exist
   mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
                                       blocked / orphans / adopting / unmanaged / quota /
                                       overview
@@ -1574,12 +1666,18 @@ mgr — manager CLI for herdr-hosted omp builders
                                       every live manager on this machine, as a text
                                       block (--json for the data; --limit caps the
                                       queued items shown, default 10)
-  mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N; the
-                                      builder loads extensions/mgr-status.ts (status
-                                      line: rate-limited / guard stopped / paused)
+  mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N; issue N
+                                      must carry exactly one size: label, which picks
+                                      the builder's model (--model @<size>) and its
+                                      workflows/<size>.md; the builder loads
+                                      extensions/mgr-status.ts (status line:
+                                      rate-limited / guard stopped / paused)
   mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
                                       without N it self-registers via `mgr bind`)
   mgr bind <N>                        run BY a builder in its own pane to bind to issue N
+  mgr size <N> <size>                 set issue N's size label (tiny|small|medium|large),
+                                      removing any other; refuses while mgr:in-flight —
+                                      a live builder resizes itself
   mgr wait <N|pane_id> [--no-quota-block]
                                       block until the builder reports; quota holds are
                                       waited through (--no-quota-block: return on them)
@@ -1597,8 +1695,9 @@ mgr — manager CLI for herdr-hosted omp builders
                                       (markdown file appended to every brief), cap.
                                       Stored in the primary checkout's .git/config
                                       under mgr.*, shared by every worktree
-  mgr paths                           absolute paths of root/SKILL.md/builder.md/mgr,
-                                      resolved from this script's real location
+  mgr paths                           absolute paths of
+                                      root/SKILL.md/builder.md/workflows/mgr, resolved
+                                      from this script's real location
   mgr --version                       this checkout's package.json version
 
 env: MGR_CAP        default concurrency cap
@@ -1642,6 +1741,7 @@ main() {
     launch)        cmd_launch "$@";;
     adopt)         cmd_adopt "$@";;
     bind)          cmd_bind "$@";;
+    size)          cmd_size "$@";;
     wait)          cmd_wait "$@";;
     prompt)        cmd_prompt "$@";;
     retire)        cmd_retire "$@";;
