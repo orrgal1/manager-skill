@@ -15,6 +15,10 @@ This file is your complete contract. Follow it in order, top to bottom, until yo
 
 - **One issue.** You build issue #N and nothing else; anything outside its acceptance goes on the
   issue as a comment, not into your diff.
+- **Your context is for orchestration and integration.** Understanding the issue, reading the
+  code and deciding the approach are delegated — scouts map, your size's planner plans — and come
+  back compressed; you continue from what returns and read code when you integrate. `tiny` is the
+  one exemption: it reads its file and edits in-session, and stays that way.
 - **Your cwd is your worktree.** Every path you read, edit or run is under it — confirm with
   `git worktree list` and `git rev-parse --show-toplevel`.
 - **The primary checkout is read-only and shared.** Prohibited there without exception: any edit or
@@ -111,7 +115,9 @@ comments too: the manager and the operator put decisions there.
 ## 6. Start marker
 
 Post the marker before you build, with the plan at the length your size file asks for: one line at
-`tiny` and `small`, the 3–8 line plan at `medium`, the plan and its slice table at `large`.
+`tiny` and `small`; at `medium` the plan the light planner returned, as you amended it — or, only
+under the escape hatch `workflows/medium.md` names, your own 3–8 lines; at `large` the plan and its
+slice table.
 
 ```bash
 gh issue comment <N> --body "builder: started · <the plan your size file asks for>"
@@ -128,8 +134,35 @@ the size file's, not this contract's.
 Build to acceptance and nothing beyond it. Follow the repo's existing conventions — read
 neighbouring code before inventing a pattern. Commit in scoped steps as you go.
 
-**Resize upward only, never down.** The moment the work fails your size file's scope test, or hits
-one of its budget signals, switch up — before you build more, not in the report:
+### Two escalations, not one
+
+Your size file has two dials. They are different moves; never read one as the other.
+
+**Delegate the planning** — cheap. Dispatch your size's planner — `sketch` at `small` and `medium`,
+`plan` at `large`, none at `tiny` — with the issue, its acceptance list and whatever maps you hold,
+and continue from what returns. Your size label, your workflow file and your verification set do
+not change: this is not a resize, and nothing about which checks run moves. Allowed at any point,
+not only at step 1 — a builder already mid-build that finds meat stops, gets the plan, and
+continues. Any one of these signals makes dispatching the planner the default action, not an
+option:
+
+- the scout maps contradict the issue Notes;
+- more areas are in scope than the Notes implied;
+- more than ~3 slices;
+- a contract or interface must be invented rather than followed;
+- the plan will not fit your size file's plan budget;
+- you have read more than a handful of files yourself.
+
+Then post the marker:
+
+```bash
+gh issue comment <N> --body "builder: delegated planning to <planner> · <which trigger>"
+```
+
+**Resize upward** — the other dial: it changes the verification burden — which checks run, whether
+a `reviewer` pass happens — and it is upward only, never down. The moment the work fails your size
+file's scope test, or hits one of its budget signals, switch up — before you build more, not in the
+report:
 
 ```bash
 gh issue comment <N> --body "builder: resized <from>→<to>"

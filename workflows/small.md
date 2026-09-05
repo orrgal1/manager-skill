@@ -13,15 +13,18 @@ Any box fails → resize to `medium`.
 
 ## Steps
 
-1. Read the neighbouring code before you write anything. One `scout` only if you do not know where
-   the change goes; otherwise no subagents.
+1. Map first. Dispatch one `scout` for the map — where the change goes, with `file:line` refs —
+   and implement from it; skip it only when the issue Notes already name the exact files and
+   lines. No planner by default at this size: a planning trigger (builder.md §7) is the only way
+   you get one, and it is `sketch`.
 2. Implement in-session. No fan-out.
 3. Add or update the covering test only if an observable contract changed. No tests for plumbing.
 4. Self-review your own diff (`git diff main...HEAD`, or this repo's equivalent) as if someone else
    wrote it: dead code, leftover scaffolding, unhandled error paths, naming, and anything secret
    that must not be committed.
 5. Commit in scoped steps as you go.
-6. A fourth file, a schema, or a shared library — resize to `medium`.
+6. A fourth file, a schema, or a shared library — resize to `medium`. A planning trigger
+   (builder.md §7) is not a resize: dispatch `sketch`, then continue under this file.
 
 ## Verification
 

@@ -13,10 +13,18 @@ Any box fails → resize to `large`.
 
 ## Steps
 
-1. **Map, then plan.** More than one area in scope → dispatch ONE parallel batch of `scout`s, one
-   per area, each returning a compressed map with `file:line` refs; a single area skips them. Then
-   a plan, 3–8 lines: the files, the approach, the checks you will run. A session under builder.md
-   posts it as its start marker (§6); an interactive session states it in-turn before editing.
+1. **Map, then plan** — more than one area in scope → dispatch ONE parallel batch of `scout`s, one
+   per area, each returning a compressed map with `file:line` refs; a single area skips them. Hand
+   the issue, its acceptance list and those maps to the `sketch` agent — the light planner: it
+   returns the approach, the slices, the cross-slice contracts and the verification plan. You own
+   what comes back and amend what is wrong in it. You do not read source yourself before the plan
+   returns: the scouts and the planner read; you read code when you integrate. Load-bearing
+   ambiguity — you cannot build the right thing without an answer — stops the work and asks rather
+   than guesses (a session under builder.md reports blocked, §11). Post or state the plan before you
+   touch code; a session under builder.md posts it as its start marker (§6). **Escape hatch** — skip
+   `sketch` only when all three hold: one area (no scouts were needed), one slice (step 2 will
+   dispatch nothing), and the Notes already name the files. Then state a 3–8 line plan in-session:
+   the files, the approach, the checks you will run. Anything more goes to `sketch`.
 2. **Dispatch.** Two or more independent slices → fix the interfaces between them first, then
    dispatch them in ONE parallel batch, each to the agent matching that slice's size (tiny slice →
    `tiny`, small slice → `small`). A single slice stays in-session. Tell every subagent to run no
@@ -25,7 +33,9 @@ Any box fails → resize to `large`.
 4. **Self-review** the whole diff (`git diff main...HEAD`) against what was asked: dead code,
    leftover scaffolding, unhandled error paths, naming, secrets, and docs or changelog if the repo
    keeps them.
-5. A plan that needs a second page, or a slice that is itself medium — resize to `large`.
+5. A plan that needs a second page, or a slice that is itself medium — resize to `large`. A
+   planning trigger mid-build (builder.md §7) is not a resize: stop, dispatch `sketch`, continue
+   under this file.
 
 **Escalation.** The same check failing twice for a reason you cannot name, or a review finding you
 intend to decline: hand that step to a `large` agent — a `plan` agent for a plan revision — instead
