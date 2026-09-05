@@ -13,7 +13,9 @@ Any box fails → resize to `large`.
 
 ## Steps
 
-1. **Plan**, 3–8 lines: the files, the approach, the checks you will run. A session under builder.md
+1. **Map, then plan.** More than one area in scope → dispatch ONE parallel batch of `scout`s, one
+   per area, each returning a compressed map with `file:line` refs; a single area skips them. Then
+   a plan, 3–8 lines: the files, the approach, the checks you will run. A session under builder.md
    posts it as its start marker (§6); an interactive session states it in-turn before editing.
 2. **Dispatch.** Two or more independent slices → fix the interfaces between them first, then
    dispatch them in ONE parallel batch, each to the agent matching that slice's size (tiny slice →
@@ -24,6 +26,10 @@ Any box fails → resize to `large`.
    leftover scaffolding, unhandled error paths, naming, secrets, and docs or changelog if the repo
    keeps them.
 5. A plan that needs a second page, or a slice that is itself medium — resize to `large`.
+
+**Escalation.** The same check failing twice for a reason you cannot name, or a review finding you
+intend to decline: hand that step to a `large` agent — a `plan` agent for a plan revision — instead
+of retrying it at your own level.
 
 ## Verification
 

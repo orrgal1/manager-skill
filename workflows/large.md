@@ -13,13 +13,17 @@ Any of these true → this is your file. Do not resize down: work already sized 
 
 ## Steps
 
-1. **Plan** — approach, risks, the cross-slice contracts (interfaces, schemas, file ownership), and
-   the verification plan. Load-bearing ambiguity, meaning you cannot build the right thing without
-   an answer: stop and ask rather than guess (a session under builder.md reports blocked instead,
-   builder.md §11). Post or state the plan before you touch code — a session under builder.md posts
-   it as its start marker (§6).
-2. **Break up** — a slice table: slice, size, depends-on, agent. A slice that is itself large is
-   split further; never dispatch one whole. Post or state the table.
+1. **Map, then plan** — more than one area in scope → dispatch ONE parallel batch of `scout`s, one
+   per area, each returning a compressed map with `file:line` refs; a single area skips them. Hand
+   the request and those maps to the `plan` agent: it returns the approach, the risks, the
+   cross-slice contracts (interfaces, schemas, file ownership) and the verification plan. You own
+   what comes back and amend what is wrong in it. Load-bearing ambiguity — you cannot build the
+   right thing without an answer — stops the work and asks rather than guesses (a session under
+   builder.md reports blocked, §11). Post or state the plan before you touch code; a session under
+   builder.md posts it as its start marker (§6).
+2. **Break up** — the same `plan` call returns the slice table: slice, size, depends-on, agent. A
+   slice that is itself large is split further; never dispatch one whole. Amend the table where it
+   is wrong, then post or state it.
 3. **Execute** — independent slices in ONE parallel batch to the size-matched agent (`tiny`,
    `small`, `medium`); dependent waves in dependency order, one wave at a time. Subagents run no
    suites. You integrate after each wave and commit.
@@ -33,6 +37,9 @@ Any of these true → this is your file. Do not resize down: work already sized 
 8. **Fix failures.** Re-review only if the fixes touched logic outside the diff already reviewed.
 9. **Done** — review clean, suite green.
 
+**Escalation.** A check failing twice for a reason you cannot name, or a review finding you mean to
+decline: hand that step to a fresh `large` agent (`plan` for a plan revision), never retry it alone.
+
 ## Verification
 
 Discover the commands from the repo's `CONTRIBUTING.md`, `docs/ops/conventions.md`, `package.json`
@@ -42,8 +49,7 @@ claim a check passed.
 - Always: typecheck every touched package, the covering tests, and the full suite.
 - Always: one `reviewer` pass plus one fix round.
 - The live or browser walk when the change crosses that boundary.
-- Never: a subagent running the suite, and never a slice dispatched without its interface fixed
-  first.
+- Never a subagent running the suite; never a slice dispatched before its interface is fixed.
 
 ## Done when
 
