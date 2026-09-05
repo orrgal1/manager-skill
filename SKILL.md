@@ -57,9 +57,10 @@ Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `bl
 `reason`, `stalled`. Then close the turn with the `$MGR overview` block, as every turn ends (§7).
 
 `guard start` is idempotent: one quota-guard daemon serves every manager on the machine, so you
-either start it or attach to the one another manager already started. It does two things and only
-two: it re-prompts sessions whose turn died on a rate limit once the quota renews, and it keeps the
-burn projection and the per-repo backlog the overview reports. It never slows anything down.
+either start it or attach to the one another manager already started. It does three things and
+only three: it re-prompts sessions whose turn died on a rate limit once the quota renews, it keeps
+the burn projection you report, and it collects the per-repo backlog the overview projects from.
+It never slows anything down.
 
 Orphans need a decision, so raise them rather than fixing them silently:
 

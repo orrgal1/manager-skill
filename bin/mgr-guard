@@ -447,8 +447,12 @@ JQ_OVERVIEW='
 # every issue whose blockers are known (or absent from this repo) onto the earliest free
 # slot; passes repeat until one schedules nothing, and the leftovers keep a null eta.
 def sim($m):
-    (($m.backlog // {})) as $b
-    | (($b.cap // 0)) as $cap
+    (($m.backlog // null)) as $snap
+    | (($snap // {})) as $b
+    # before the first refresh (or under a guard that predates it) the registration stands in
+    # for the counts — the cap is what the operator set, in_flight/ready are what the manager
+    # last reported — and the verdicts that need the queue (idle, starving, drains) stay null
+    | (($b.cap // $m.cap // 0)) as $cap
     | (($m.throughput // $tdef)) as $t
     | ((($t.median_s // $default_s) * 1000)) as $med
     | (if (($t.estimated) == null) then true else $t.estimated end) as $est
@@ -497,14 +501,14 @@ def sim($m):
                              | .moved = true)
                 end))) as $r
     | (($r.sched + [$r.pending[] | . + {eta: null, estimated: $est}])) as $qout
-    | (($b.counts // {})) as $c
+    | (($b.counts // {ready: ($m.ready // 0), in_flight: ($m.in_flight // 0)})) as $c
     | (($c.ready // 0)) as $nready
-    | (if $nready == 0 then ($b.slots_free // 0) else 0 end) as $idle
+    | (if ($snap != null) and ($nready == 0) then ($b.slots_free // 0) else 0 end) as $idle
     | {row: {manager_id: $mid, repo: $repo, cap: $cap, ready: $nready,
              blocked: ($c.blocked // 0), in_flight: ($c.in_flight // 0),
              awaiting_approval: ($c.awaiting_approval // 0),
              idle_slots: $idle, starving: ($idle > 0),
-             starves_at: (if $cap <= 0 then null
+             starves_at: (if ($snap == null) or ($cap <= 0) then null
                           elif $idle > 0 then $now
                           else ($r.slots | min) end),
              backlog_drains_at: ([$qout[] | .eta | select(. != null)] | max),
