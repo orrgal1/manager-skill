@@ -317,7 +317,7 @@ Trust the report, not the idle state.
 | `$MGR size <N> <size>` | swap the issue's `size:` label to `tiny`\|`small`\|`medium`\|`large`; exit `3` while `mgr:in-flight` |
 | `$MGR board [--cap N]` | the whole board: issues joined to live agents, with `overview` embedded at the default limit |
 | `$MGR overview [--json] [--limit N]` | machine-wide — every manager on this machine, which is the subscription's burn: the rendered text block by default, `--json` for the object. `--limit` is how many queued issues are listed after the in-flight ones (default `10`); the simulation always covers the whole queue, only the display is capped |
-| `$MGR launch <N> [--cap N]` | worktree + tab + omp builder + brief + label + comment |
+| `$MGR launch <N> [--cap N] [--house <anthropic\|openai\|gemini>]` | worktree + tab + omp builder + brief + label + comment; `--house` overlays that house's package for this launch only |
 | `$MGR adopt <pane_id\|tab_id> [N]` | make a live session a builder; without N it self-registers |
 | `$MGR bind <N>` | builder-side only; you never run this |
 | `$MGR wait <N\|pane_id> [--no-quota-block]` | block until idle, return the parsed `manager-report`; a rate-limit stall is waited through — the guard reignites the pane — unless `--no-quota-block`, which returns `agent_status: quota-stalled` instead |

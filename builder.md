@@ -110,8 +110,11 @@ comments too: the manager and the operator put decisions there.
 
 ## 6. Start marker
 
+Post the marker before you build, with the plan at the length your size file asks for: one line at
+`tiny` and `small`, the 3–8 line plan at `medium`, the plan and its slice table at `large`.
+
 ```bash
-gh issue comment <N> --body "builder: started · <one-line plan>"
+gh issue comment <N> --body "builder: started · <the plan your size file asks for>"
 ```
 
 ## 7. Build and verify — your size

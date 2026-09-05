@@ -75,6 +75,9 @@ case "${1:-} ${2:-}" in
     jq -nc --argjson v "$(get modelRoles)" '{key:"modelRoles",value:$v}';;
   "config set")
     key="${3:?}"; val="${4:?}"
+    # the atomicity test makes one named key fail after earlier ones succeeded
+    [ "${FAKE_OMP_FAIL_ON:-}" = "$key" ] \
+      && { printf 'fake omp: forced failure on %s\n' "$key" >&2; exit 7; }
     printf '%s\n' "$val" | jq -e . >/dev/null || { printf 'fake omp: bad JSON\n' >&2; exit 2; }
     printf 'omp config set %s %s\n' "$key" "$val" >>"${OMP_FAKE_LOG:-/dev/null}"
     printf '%s' "$val" >"$(kf "$key")"
@@ -267,6 +270,27 @@ check 'mgr setup exit' 0 "$rc"
 check 'mgr setup applied openai' openai "$(jq -r '.house' <<<"$out")"
 check 'mgr setup installed the agents' 5 "$(jq -r '.agents.installed | length' <<<"$out")"
 check 'config.yml followed' openai-codex/gpt-6-astra:high "$(cfg_role review)"
+
+# ------------------------------------- 5b. a mid-apply failure is not half-applied
+
+printf '\n# 5b. a failed `omp config set` restores config.yml and says so\n'
+cp "$agent/config.yml" "$tmp/config.before"
+# the fake prints its own forced-failure line, so the JSON error is picked out
+FAKE_OMP_FAIL_ON=task.agentModelOverrides "$PKG" package gemini \
+  >/dev/null 2>"$tmp/fail.err"; rc=$?
+err=$(grep '^{' "$tmp/fail.err" | tail -1)
+check 'a mid-apply failure exits non-zero' true \
+  "$(if [ "$rc" -ne 0 ]; then printf true; else printf false; fi)"
+check 'the error names the step that failed' true \
+  "$(jq -r '.error.message | test("omp config set task.agentModelOverrides failed")' <<<"$err")"
+check 'the error names the backup it restored' true \
+  "$(jq -r '.error.message | test("restored .*/config\\.yml\\.bak-")' <<<"$err")"
+check 'config.yml is byte-identical to before the failed apply' 0 \
+  "$(cmp -s "$tmp/config.before" "$agent/config.yml"; printf '%s' "$?")"
+check 'the half-applied package never stamped itself' 0 \
+  "$(grep -c '^activePackage: gemini' "$agent/config.yml" || true)"
+check 'the previously applied package still stands' openai \
+  "$("$PKG" package | jq -r '.active')"
 
 # --------------------------------------------------- 6. the real agent dir
 

@@ -107,14 +107,31 @@ apply() { # apply <name> -> the applied-package JSON on stdout
   backup=""
   if [ -f "$CONFIG" ]; then
     backup="$CONFIG.bak-$(date +%s)"
-    cp "$CONFIG" "$backup"
+    cp "$CONFIG" "$backup" || die 1 "cannot write backup $backup"
   fi
 
-  omp config set modelRoles "$roles" >/dev/null || die 1 "omp config set modelRoles failed"
+  # From here the three sets and the activePackage stamp are one change from the
+  # caller's side: whatever fails in this window, the backup goes back over
+  # config.yml before we die and the message names it. The ERR trap catches the
+  # unexpected (a failed sed, a full disk); the explicit calls name the step.
+  pkg_fail() { # pkg_fail <what-failed>
+    trap - ERR
+    [ -n "${tmp:-}" ] && rm -f "$tmp"
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+      cp "$backup" "$CONFIG" \
+        || die 1 "$1; and restoring $backup over $CONFIG failed — $CONFIG is half-applied"
+      die 1 "$1; restored $backup over $CONFIG"
+    fi
+    die 1 "$1; there was no $CONFIG to back up, so nothing was restored"
+  }
+  trap 'pkg_fail "applying package $name failed"' ERR
+
+  omp config set modelRoles "$roles" >/dev/null \
+    || pkg_fail "omp config set modelRoles failed"
   omp config set task.agentModelOverrides "$overrides" >/dev/null \
-    || die 1 "omp config set task.agentModelOverrides failed"
+    || pkg_fail "omp config set task.agentModelOverrides failed"
   omp config set retry.fallbackChains "$chains" >/dev/null \
-    || die 1 "omp config set retry.fallbackChains failed"
+    || pkg_fail "omp config set retry.fallbackChains failed"
 
   # `omp config set` rewrites the file without its comments and without a
   # trailing newline, so activePackage is stamped last and by hand
@@ -123,11 +140,10 @@ apply() { # apply <name> -> the applied-package JSON on stdout
   [ -s "$tmp" ] && [ -n "$(tail -c 1 "$tmp")" ] && printf '\n' >> "$tmp"
   printf 'activePackage: %s\n' "$name" >> "$tmp"
   cat "$tmp" > "$CONFIG"
-  rm -f "$tmp"
-  if ! omp config get modelRoles --json >/dev/null 2>&1; then
-    [ -n "$backup" ] && cp "$backup" "$CONFIG"
-    die 1 "config.yml stopped parsing after the merge${backup:+; restored $backup}"
-  fi
+  rm -f "$tmp"; tmp=""
+  omp config get modelRoles --json >/dev/null 2>&1 \
+    || pkg_fail "config.yml stopped parsing after the merge"
+  trap - ERR
 
   jq -nc --arg name "$name" --arg was "$was" --arg cfg "$CONFIG" --arg bk "$backup" \
     --arg note "$RESTART_NOTE" --argjson a "$before" --argjson b "$roles" \

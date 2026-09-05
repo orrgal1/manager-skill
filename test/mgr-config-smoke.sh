@@ -510,9 +510,11 @@ check 'adopt (unbound) agent' adopt-w9-p3 "$(jq -r '.agent' <<<"$out")"
 check 'adopt (unbound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
-check 'adopt (unbound) is briefed as medium with the house' true \
-  "$(contains 'Policy: auto-merge. Size: medium. House: anthropic. Resume your work only after bind succeeds.' \
+check 'adopt (unbound) carries the house and no size of its own' true \
+  "$(contains 'Policy: auto-merge. House: anthropic. Resume your work only after bind succeeds.' \
      "$(cat "$MGR_TEST_PROMPT")")"
+check 'adopt (unbound) briefs no size: the session sizes itself' false \
+  "$(contains 'Size: ' "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (unbound) tells the session to label the issue it creates' true \
   "$(contains 'Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run' \
      "$(cat "$MGR_TEST_PROMPT")")"

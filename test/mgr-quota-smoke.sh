@@ -473,6 +473,22 @@ check 'launch error message' 'no free slots (cap=1)' \
 check 'no tab was created' 0 \
   "$(grep -c 'herdr tab create' "$MGR_TEST_LOG" || true)"
 
+# a size: label that is not one of the four: the workflow file it names does not
+# exist, so the launch is refused before anything is created
+cat >"$fix/issue-8.json" <<'JSON'
+{"number":8,"title":"Odd size","state":"OPEN","labels":[{"name":"size:xl"}],"body":""}
+JSON
+: >"$MGR_TEST_LOG"
+err=$("$MGR" launch 8 --cap 3 2>&1 >/dev/null); rc=$?
+check 'unknown size exit'       3 "$rc"
+check 'unknown size code'       3 "$(jq -r '.error.code' <<<"$err")"
+check 'unknown size message' true \
+  "$(jq -r '.error.message | test("unknown size")' <<<"$err")"
+check 'unknown size message names the four' true \
+  "$(jq -r '.error.message | test("tiny\\|small\\|medium\\|large")' <<<"$err")"
+check 'an unknown size created no tab' 0 \
+  "$(grep -c 'herdr tab create' "$MGR_TEST_LOG" || true)"
+
 # ------------------------------------------ 3. the recorded burn projection
 
 printf '\n# 3. mgr board records the projection and reports what moved\n'

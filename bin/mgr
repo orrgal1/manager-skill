@@ -1199,6 +1199,8 @@ cmd_launch() {
     1) die 3 "issue #$n has no size: label; add exactly one with: gh issue edit $n --add-label size:<tiny|small|medium|large> (or: $MGR_SELF size $n <size>)";;
     2) die 3 "issue #$n has several size: labels ($size); remove all but one with: gh issue edit $n --remove-label size:<size> (or: $MGR_SELF size $n <size>)";;
   esac
+  size_valid "$size" \
+    || die 3 "issue #$n has an unknown size: label (size:$size); use one of tiny|small|medium|large (or: $MGR_SELF size $n <size>)"
 
   # and the house decides which package overlays the builder's model roles
   house=$(eff_house "$house")
@@ -1387,10 +1389,10 @@ cmd_adopt() {
     local newname
     newname="adopt-$(sanitize_pane "$pane")"
     herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
-    # no issue yet, so nothing carries a size: the session is briefed as medium
-    # and labels the issue it creates
-    local brief size=medium
-    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"). Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/<the size you labelled>.md, which is how you build and verify at your size — read it before you touch code. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Size: $size.$hfrag Resume your work only after bind succeeds."
+    # no issue yet, so nothing carries a size: the session labels the issue it
+    # creates and sizes itself from that label, so the brief names no size
+    local brief
+    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"). Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/<the size you labelled>.md, which is how you build and verify at your size — read it before you touch code. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge.$hfrag Resume your work only after bind succeeds."
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
 
