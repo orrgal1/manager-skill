@@ -58,7 +58,8 @@ cat >"$fix/guard-running.json" <<'EOF'
  "priorities":{"owner/name":7,"other/proj":2},
  "managers":{"ws-w9":{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1",
    "repo":"owner/name","cap":3,"in_flight":1,"adopting":0,"ready":1,"demand":2,
-   "seen_at":1788523750609,"live":true,"allotment":1,"priority":7,"paused":false,
+   "seen_at":1788523750609,"pane_alive":true,"live":true,
+   "allotment":1,"priority":7,"paused":false,
    "derived_cap":3,"demand_effective":2,
    "active_builders":1}},
  "stalled":[{"pane_id":"w9:p2","name":"issue-49","workspace_id":"w9","session":"/x.jsonl",
@@ -68,11 +69,14 @@ cat >"$fix/guard-running.json" <<'EOF'
  "events":[]}
 EOF
 
-# guard stopped: same (now stale) ledger, allotment 1 — mgr must NOT throttle
+# guard stopped: same (now stale) ledger, allotment 1 — mgr must NOT throttle.
+# A stopped guard also carries the exit record it wrote on its way out.
 jq '.guard="stopped" | .pid=null | .providers.anthropic.status="exhausted"
     | .providers.anthropic.recovers_at=1788530000000
     | .providers.anthropic.allowed_total=0 | .allowed_total=0
-    | .providers.anthropic.reason="exhausted: anthropic:5h resets at 2026-09-04T12:00:00Z"' \
+    | .providers.anthropic.reason="exhausted: anthropic:5h resets at 2026-09-04T12:00:00Z"
+    | .last_exit_at=1788523800000
+    | .last_exit_reason="idle-exit after 1800s with no live manager and nothing held"' \
   "$fix/guard-running.json" >"$fix/guard-stopped.json"
 
 cat >"$fix/stall-49.json" <<'EOF'
@@ -226,6 +230,10 @@ case "${1:-}" in
   register)
     printf '%s\n' "${2:-}" >>"$MGR_TEST_REGISTER"
     printf '%s\n' "${2:-}";;
+  touch)
+    # the per-command heartbeat: only the call itself matters here, so the
+    # answer is the guard's own success shape and the log line proves the args
+    jq -nc --arg id "${2:-}" '{touched:true,manager_id:$id,seen_at:1788523760000}';;
   start|stop) printf '{"running":true,"pid":4242}\n';;
   *) printf '{"error":{"code":2,"message":"usage"}}\n' >&2; exit 2;;
 esac
@@ -277,6 +285,12 @@ calls() {
     | tr '\n' ' ' | sed 's/ *$//'
 }
 
+# the mgr-guard subcommands mgr called, in order — one token each. The
+# per-command heartbeat must always be the first of them.
+guard_calls() {
+  sed -n 's/^mgr-guard \([a-z]*\).*/\1/p' "$MGR_TEST_LOG" | tr '\n' ' ' | sed 's/ *$//'
+}
+
 # --------------------------------------------------- 1. throttled board
 
 printf '\n# 1. guard running, allotment 1, one in-flight builder\n'
@@ -301,8 +315,13 @@ check 'quota.priority'            7 "$(jq -r '.quota.priority' <<<"$out")"
 check 'quota.constrained'      true "$(jq -r '.quota.constrained' <<<"$out")"
 check 'quota.paused'          false "$(jq -r '.quota.paused' <<<"$out")"
 check 'quota.managers' \
-  '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"derived_cap":3,"allotment":1,"live":true,"priority":7,"paused":false,"paused_by_operator":false}]' \
+  '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"derived_cap":3,"allotment":1,"live":true,"pane_alive":true,"seen_at":1788523750609,"priority":7,"paused":false,"paused_by_operator":false}]' \
   "$(jq -c '.quota.managers' <<<"$out")"
+# nothing exited yet: a running guard has no exit record to report
+check 'quota.last_exit_at while running' null \
+  "$(jq -r '.quota.last_exit_at' <<<"$out")"
+check 'quota.last_exit_reason while running' null \
+  "$(jq -r '.quota.last_exit_reason' <<<"$out")"
 # derived 3 == cap 3: the derived ceiling does not bite, so the provider speaks
 check 'quota.reason' \
   'projected 1.23 > 1 on anthropic:5h (burn 0.30/h, 2.1h to reset)' \
@@ -361,6 +380,12 @@ check 'cap_effective'             3 "$(jq -r '.cap_effective' <<<"$out")"
 check 'slots_free'                2 "$(jq -r '.slots_free' <<<"$out")"
 check 'quota.guard'         stopped "$(jq -r '.quota.guard' <<<"$out")"
 check 'quota.allotment still shown' 1 "$(jq -r '.quota.allotment' <<<"$out")"
+# a dead guard is only actionable with its exit record: this one left because
+# nothing was holding it up, so starting it again is the whole answer
+check 'quota.last_exit_at' 1788523800000 "$(jq -r '.quota.last_exit_at' <<<"$out")"
+check 'quota.last_exit_reason' \
+  'idle-exit after 1800s with no live manager and nothing held' \
+  "$(jq -r '.quota.last_exit_reason' <<<"$out")"
 err=$("$MGR" launch 7 2>&1 >/dev/null)
 check 'launch is no longer refused for slots' false \
   "$(jq -r '(.error.message // "") | startswith("no free slots")' <<<"$err")"
@@ -685,7 +710,7 @@ out=$("$MGR" board --cap 3)
 check 'quota.managers[].paused_by_operator' true \
   "$(jq -r '.quota.managers[0].paused_by_operator' <<<"$out")"
 check 'quota.managers key order' \
-  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","priority","paused","paused_by_operator"]' \
+  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","pane_alive","seen_at","priority","paused","paused_by_operator"]' \
   "$(jq -c '.quota.managers[0]|keys_unsorted' <<<"$out")"
 check 'quota.paused_builders counts operator-paused holds' '[49]' \
   "$(jq -c '.quota.paused_builders' <<<"$out")"
@@ -776,6 +801,37 @@ check 'guard default follows the symlink' '{"running":true,"pid":4242}' \
 out=$(env -u MGR_GUARD_BIN "$link" board --cap 2)
 check 'board finds the guard next to the real script' running \
   "$(jq -r '.quota.guard' <<<"$out")"
+
+# ------------------------------------- 13. the per-command manager heartbeat
+
+printf '\n# 13. every command stamps the manager heartbeat before it dispatches\n'
+export MGR_TEST_GUARD="$fix/guard-running.json"
+export MGR_TEST_STALL="$tmp/no-stall.json"   # absent -> nothing is held
+export MGR_TEST_ON_RESUME=
+: >"$MGR_TEST_LOG"
+"$MGR" board --cap 3 >/dev/null
+check 'board touches before its own guard calls' 'touch paused status register' \
+  "$(guard_calls)"
+check 'touch carries the manager id and the pane' 1 \
+  "$(grep -cx 'mgr-guard touch ws-w9 w9:p1' "$MGR_TEST_LOG")"
+# the point of the whole thing: `mgr wait` can park for the length of a quota
+# window, and the heartbeat lands before it, not after
+: >"$MGR_TEST_LOG"
+"$MGR" wait 49 >/dev/null
+check 'wait touches before it asks about the stall' touch \
+  "$(guard_calls | cut -d' ' -f1)"
+: >"$MGR_TEST_LOG"
+"$MGR" guard status >/dev/null
+check 'guard status touches before it execs the guard' 'touch status' \
+  "$(guard_calls)"
+: >"$MGR_TEST_LOG"
+env -u HERDR_PANE_ID "$MGR" board --cap 3 >/dev/null
+check 'no pane, no touch' 0 "$(grep -c 'mgr-guard touch' "$MGR_TEST_LOG" || true)"
+: >"$MGR_TEST_LOG"
+env -u HERDR_WORKSPACE_ID "$MGR" board --cap 3 >/dev/null
+check 'no workspace, no touch' 0 \
+  "$(grep -c 'mgr-guard touch' "$MGR_TEST_LOG" || true)"
+export MGR_TEST_STALL="$fix/stall-49.json"
 
 
 printf '\n'

@@ -301,7 +301,7 @@ is "quota.derived_cap" "$(jq -r '.quota.derived_cap' <<<"$bd")" 1
 # board keeps reporting the provider reason
 case "$(jq -r '.quota.reason' <<<"$bd")" in "projected 1.9 > 1 on anthropic:5h"*) ok "quota.reason is the provider reason";; *) bad "quota.reason: $(jq -r '.quota.reason' <<<"$bd")";; esac
 is "quota.managers key order" "$(jq -c '.quota.managers[0] | keys_unsorted' <<<"$bd")" \
-  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","priority","paused","paused_by_operator"]'
+  '["manager_id","repo","cap","in_flight","derived_cap","allotment","live","pane_alive","seen_at","priority","paused","paused_by_operator"]'
 : >"$T/waits.log"
 out=$(MGR_GUARD_NOW_MS=$NOW2 "$ROOT/bin/mgr" wait 50 --no-quota-block)
 is "wait status" "$(jq -r '.agent_status' <<<"$out")" quota-paused

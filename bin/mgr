@@ -361,6 +361,20 @@ guard_heartbeat() { # guard_heartbeat <board-json>
   "$guard_bin" register "$reg" >/dev/null 2>&1 || warn "mgr-guard register failed"
 }
 
+# The heartbeat above only runs on `mgr board`, and a manager stalled on a 429
+# runs no board at all — which is exactly when the guard needs to know its pane
+# is still there. So every `mgr` call, whatever the subcommand, first stamps
+# seen_at: a manager reignited after a quota stall is fresh again on its very
+# next command, before one that could block for minutes (`mgr wait`) has a
+# chance to hide it. Cheap (one small file rewritten) and never fatal: a
+# missing guard, a foreign pane_id or a pane-less shell is a silent no-op.
+guard_touch() {
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || return 0
+  [ -n "${HERDR_PANE_ID:-}" ] || return 0
+  [ -x "$guard_bin" ] || return 0
+  "$guard_bin" touch "ws-$HERDR_WORKSPACE_ID" "$HERDR_PANE_ID" >/dev/null 2>&1 || true
+}
+
 # the `mgr wait` answer for a builder the quota guard is holding: dead on a
 # provider rate limit (`cause:"429"`), paused to keep quota for a
 # higher-priority project (`cause:"paused"`) or held because the operator
@@ -667,7 +681,12 @@ cmd_board() {
      awaiting_approval:$awaiting,
      ready:$ready, blocked:$blocked, orphans:$orphans,
      adopting:$adopting, unmanaged:$unmanaged,
-     quota:{guard:$gs, provider:$prov, status:($pv.status // null),
+     quota:{guard:$gs,
+            # a dead guard with a reason is the difference between "nobody
+            # started it" and "it exited because nothing was held up"
+            last_exit_at:($guard.last_exit_at // null),
+            last_exit_reason:($guard.last_exit_reason // null),
+            provider:$prov, status:($pv.status // null),
             used:($bl.used // null), resets_at:($bl.resets_at // null),
             burn_per_hour:($bl.burn_per_hour // null),
             projected_at_reset:($bl.projected_at_reset // null),
@@ -676,11 +695,15 @@ cmd_board() {
             priority:($guard.priorities[$repo] // 5),
             constrained:($guard.constrained // false),
             paused:($me.paused // false),
+            # live is pane existence, not heartbeat age: pane_alive is why, and
+            # seen_at is only the last time that manager ran an `mgr` command
             managers:([($guard.managers // {}) | to_entries[]
                        | {manager_id:(.value.manager_id // .key), repo:(.value.repo // null),
                           cap:(.value.cap // null), in_flight:(.value.in_flight // null),
                           derived_cap:(.value.derived_cap // null),
                           allotment:(.value.allotment // null), live:(.value.live // false),
+                          pane_alive:(.value.pane_alive // false),
+                          seen_at:(.value.seen_at // null),
                           priority:(.value.priority // null), paused:(.value.paused // false),
                           paused_by_operator:(.value.paused_by_operator // false)}]
                       | sort_by(.manager_id)),
@@ -1239,7 +1262,8 @@ env: MGR_CAP        default concurrency cap
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
      MGR_GUARD_RESUME_COOLDOWN_S  seconds before a paused builder may resume (60)
      HERDR_WORKSPACE_ID  target workspace (all commands; headless use sets it explicitly)
-     HERDR_PANE_ID       the caller's pane (bind, board.self only)
+     HERDR_PANE_ID       the caller's pane (bind, board.self, and the guard
+                         heartbeat every command stamps)
 EOF
 }
 
@@ -1257,6 +1281,9 @@ main() {
       return;;
   esac
   need_deps
+  # before anything is dispatched — a `mgr wait` can park for minutes, and the
+  # guard must not read this manager as gone in the meantime
+  guard_touch
   case "$sub" in
     labels)        cmd_labels "$@";;
     board)         cmd_board "$@";;

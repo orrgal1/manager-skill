@@ -276,7 +276,7 @@ Trust the report, not the idle state.
 | `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue |
 | `$MGR guard start [--interval S]` | start the quota-guard daemon; idempotent, shared by all managers |
 | `$MGR guard stop` | stop it — read the Rules before you ever do |
-| `$MGR guard status` | the guard's whole verdict: providers, allowed_total, managers, derived caps, allotments, stalled, `paused_repos` and `managers[].paused_by_operator` |
+| `$MGR guard status` | the guard's whole verdict: providers, allowed_total, managers, derived caps, allotments, stalled, `paused_repos`, `managers[].paused_by_operator`, and `last_exit_at`/`last_exit_reason` when the daemon is not running. A manager is live while its herdr pane exists — `managers[].pane_alive` is that pane check and is what `live` means; `managers[].seen_at` is only the last time it ran an `mgr` command |
 | `$MGR priority [N\|--clear]` | this project's priority: no argument reads it, `N` sets it (integer ≥ 0, default 5, higher wins), `--clear` restores the default. Scales this project's derived cap ceiling toward the top-priority project's |
 | `$MGR pause` | pause this project: a persisted cap-0 override for this repo, machine-wide. `board` reports `paused_by_operator`, `launch` refuses, the guard holds every builder of the project. Idempotent |
 | `$MGR unpause` (alias `$MGR resume`) | lift the pause: the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the guard resumes the held builders on its next tick. Idempotent, exit `0` when the project is not paused |
@@ -296,12 +296,13 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `manager` | `{pane_id,tab_id,agent,cwd}` of the live agent whose tab is labelled `manager`, or `null` — the detection key external tooling uses to find the manager tab |
 | `self` | the calling pane (`HERDR_PANE_ID`), or `null` outside a herdr pane |
 | `quota.guard` | `running` \| `stale` \| `stopped` — nothing is throttled unless it is `running` |
+| `quota.last_exit_at` `quota.last_exit_reason` | when and why the guard last exited; `guard: stopped` with a reason of `idle-exit …` means nobody is holding it up — start it again |
 | `quota.provider` `status` `used` `resets_at` | the builders' provider, its limit status, used fraction, window reset (ms) |
 | `quota.burn_per_hour` `projected_at_reset` | measured burn rate and where usage lands by the reset |
 | `quota.allowed_total` `allotment` | builders the guard allows machine-wide · this manager's share |
 | `quota.derived_cap` | this project's priority-derived cap ceiling — `max(1, floor(top_cap × priority / top_priority))`, never below 1, `null` when the guard has no live top project. `cap_effective` already reflects it once it is below `allotment` |
 | `quota.reason` | why, in words — quote it to the operator; e.g. `priority 3 vs top 10 (cap 3) → cap 1` when the derived cap, not the quota share, is what is limiting this project, or `paused by the operator (mgr unpause lifts it)` while the project is paused |
-| `quota.managers` | every live manager: `manager_id`, `repo`, `cap`, `in_flight`, `derived_cap`, `allotment`, `live`, `priority`, `paused`, `paused_by_operator` |
+| `quota.managers` | every registered manager: `manager_id`, `repo`, `cap`, `in_flight`, `derived_cap`, `allotment`, `live`, `pane_alive`, `seen_at`, `priority`, `paused`, `paused_by_operator` |
 | `quota.priority` | this repo's priority — default 5, higher wins, machine-wide |
 | `quota.constrained` | `true` when `allowed_total` is below the total demand, so tiers start losing builders |
 | `quota.paused` `quota.paused_builders` | `true` when the guard paused builders of this project · the issue numbers it paused, whichever the cause (`paused` or `operator-paused`) |
@@ -341,7 +342,7 @@ by `-`, e.g. `adopt-w26-p3`.
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_CONFIRM_TICKS` | `3` | consecutive ticks a limit must project past 100% before it constrains `allowed_total` |
-| `MGR_GUARD_IDLE_EXIT_S` | `1800` | the guard exits after this long with no live manager |
+| `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager pane and no stalled or paused builders |
 | `MGR_GUARD_RESUME_COOLDOWN_S` | `60` | how long the guard waits, counted from the last tick this project had no room, before resuming a paused builder; an operator pause (`$MGR unpause`) skips it |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's toasts |
 

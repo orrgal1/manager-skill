@@ -210,12 +210,18 @@ stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
   Managers are reignited exactly like builders — that is what breaks the deadlock, and no agent is
   involved.
 - **Multi-manager ledger.** `~/.local/state/mgr-guard` (`MGR_STATE_DIR`) holds `guard.pid`,
-  `guard.log`, `state.json`, `samples.jsonl`, `priorities.json`, `paused.json` and one
-  `managers/<id>.json` per manager, heartbeated by `mgr board`. One daemon serves every manager on
+  `guard.log`, `state.json`, `samples.jsonl`, `priorities.json`, `paused.json`, `exit.json` and one
+  `managers/<id>.json` per manager, heartbeated by every `mgr` call (`mgr board` writes the full
+  registration, every other subcommand stamps `seen_at`). One daemon serves every manager on
   the machine.
 
 `mgr guard start` is idempotent, `mgr guard status` prints the verdict (and always exits 0), and the
-daemon exits by itself once no manager has been seen for 30 minutes.
+daemon exits by itself only after 30 minutes with no live manager pane and no stalled or paused
+builders. A manager is live while its herdr pane exists (`herdr agent list`); heartbeat age is
+informational, so `guard status` reports both `managers[].pane_alive` and `managers[].seen_at` —
+that is what keeps a 429-stalled manager, which runs no commands at all, from being written off.
+When the daemon does exit it records why, and `mgr guard status` and `mgr board` report it as
+`last_exit_at` / `last_exit_reason`.
 
 ## Configuration
 
@@ -236,7 +242,7 @@ error (exit `2`).
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks (`mgr-guard start --interval S` wins) |
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_MIN_SLOPE_SPAN_S` | `300` | minimum sample span before a slope is trusted; below it, burn is 0 |
-| `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager |
+| `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager pane and no stalled or paused builders |
 | `MGR_GUARD_CONFIRM_TICKS` | `3` | consecutive ticks a limit must project past 100% before it constrains |
 | `MGR_GUARD_RESUME_COOLDOWN_S` | `60` | how long after its manager last had no room the guard may resume a paused builder |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's herdr toasts |

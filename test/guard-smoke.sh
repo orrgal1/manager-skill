@@ -190,7 +190,7 @@ arm() { # arm <state-dir> <now-ms> <used-prev> <used-now> [status]: seed one pri
 
 printf '== help / usage ==\n'
 HELP="$("$GUARD" --help)"
-for c in start stop status tick run register stall priority pause unpause paused; do
+for c in start stop status tick run register touch stall priority pause unpause paused; do
   case "$HELP" in *"mgr-guard $c"*) pass "--help lists $c";; *) fail "--help is missing $c";; esac
 done
 "$GUARD" nonsense >/dev/null 2>&1; assert_eq "unknown subcommand exit code" 2 "$?"
@@ -238,6 +238,8 @@ assert_jq "(a) allowed_changed event" "$ST_A" '[.events[] | select(.kind == "all
 STATUS_A="$(MGR_STATE_DIR="$SD_A" "$GUARD" status)"
 assert_json "status output" "$STATUS_A"
 assert_jq "status guard=stopped, pid null" "$STATUS_A" '.guard == "stopped" and .pid == null and .allowed_total == 6'
+assert_jq "status last_exit is null before any exit" "$STATUS_A" \
+  '.last_exit_at == null and .last_exit_reason == null'
 
 printf '\n== (b) rising burn over three ticks -> projected throttle ==\n'
 SD_B="$TMP/s-b"
@@ -345,6 +347,52 @@ assert_jq "(f) manager_dropped event" "$ST_F" '[.events[] | select(.kind == "man
 assert_jq "(f) only live manager kept" "$ST_F" '(.managers | keys) == ["ws-w3"]'
 if [ -f "$SD_F/managers/ws-w7.json" ]; then fail "(f) ws-w7.json still on disk"; else pass "(f) ws-w7.json deleted"; fi
 if [ -f "$SD_F/managers/ws-w3.json" ]; then pass "(f) ws-w3.json kept"; else fail "(f) ws-w3.json deleted"; fi
+assert_jq "(f) dropped detail is the pane, nothing about the heartbeat" "$ST_F" \
+  '[.events[] | select(.kind == "manager_dropped")] | last | .detail == "ws-w7: pane w7:p1 is gone"'
+
+printf '\n== (s) liveness is the herdr pane, not the heartbeat ==\n'
+SD_S="$TMP/s-s"
+STALE_S=$(( T0 - 7200000 ))       # two hours old: a 429-stalled manager stops running mgr board
+agents_file "$TMP/agents-s.json" \
+  "$(mk_agent manager w3:p1 w3 idle '')" \
+  "$(mk_agent issue-9 w3:p9 w3 blocked "$SESS_ANTHROPIC")"
+export FAKE_AGENTS="$TMP/agents-s.json" FAKE_USAGE="$TMP/usage-ok.json"
+export FAKE_PROMPTS="$TMP/prompts-s.log" FAKE_TOASTS="$TMP/toasts-s.log"
+: >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"
+reg "$SD_S" "$STALE_S" ws-w3 w3 w3:p1 3 1 0 0 1 >/dev/null
+reg "$SD_S" "$STALE_S" ws-w7 w7 w7:p1 3 1 0 0 1 >/dev/null
+ST_S="$(MGR_STATE_DIR="$SD_S" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(s) stale heartbeat + live pane is live" "$ST_S" \
+  '.managers["ws-w3"] | .live == true and .pane_alive == true and .seen_at == '"$STALE_S"
+assert_jq "(s) the stale heartbeat still shows on the row" "$ST_S" \
+  '.managers["ws-w3"].seen_at < (.tick_at - 3600000)'
+assert_jq "(s) pane gone is the only way to be dropped" "$ST_S" '(.managers | keys) == ["ws-w3"]'
+assert_jq "(s) dropped detail ends with is gone" "$ST_S" \
+  '[.events[] | select(.kind == "manager_dropped")] | last | .detail | endswith("is gone")'
+assert_jq "(s) stalled row keeps its manager_id" "$ST_S" \
+  '(.stalled | length) == 1 and .stalled[0].pane_id == "w3:p9" and .stalled[0].manager_id == "ws-w3"'
+assert_eq "(s) no reignition inside the backoff" 0 "$(wc -l <"$FAKE_PROMPTS" | tr -d ' ')"
+
+printf '\n== (t) touch refreshes seen_at when the pane still matches ==\n'
+TCH1="$(MGR_STATE_DIR="$SD_S" MGR_GUARD_NOW_MS="$T0" "$GUARD" touch ws-w3 w3:p1)"; RC_T1=$?
+assert_eq "(t) touch exit code" 0 "$RC_T1"
+assert_jq "(t) touched=true with the new seen_at" "$TCH1" \
+  '.touched == true and .manager_id == "ws-w3" and .seen_at == '"$T0"
+assert_eq "(t) registration rewritten" "$T0" "$(jq -r '.seen_at' "$SD_S/managers/ws-w3.json")"
+TCH2="$(MGR_STATE_DIR="$SD_S" MGR_GUARD_NOW_MS=$(( T0 + 1000 )) "$GUARD" touch ws-w3 w3:p999)"; RC_T2=$?
+assert_eq "(t) wrong pane exit code" 0 "$RC_T2"
+assert_jq "(t) wrong pane -> touched=false" "$TCH2" \
+  '.touched == false and .manager_id == "ws-w3" and (has("seen_at") | not)'
+assert_eq "(t) wrong pane leaves seen_at alone" "$T0" "$(jq -r '.seen_at' "$SD_S/managers/ws-w3.json")"
+TCH3="$(MGR_STATE_DIR="$SD_S" MGR_GUARD_NOW_MS="$T0" "$GUARD" touch ws-nobody w3:p1)"; RC_T3=$?
+assert_eq "(t) absent registration exit code" 0 "$RC_T3"
+assert_jq "(t) absent registration -> touched=false" "$TCH3" \
+  '.touched == false and .manager_id == "ws-nobody"'
+if [ -f "$SD_S/managers/ws-nobody.json" ]; then fail "(t) touch created a registration"; else pass "(t) touch never creates a registration"; fi
+MGR_STATE_DIR="$SD_S" "$GUARD" touch 'bad id' w3:p1 >/dev/null 2>&1
+assert_eq "(t) bad manager_id exit code" 2 "$?"
+MGR_STATE_DIR="$SD_S" "$GUARD" touch ws-w3 >/dev/null 2>&1
+assert_eq "(t) missing pane_id exit code" 2 "$?"
 
 printf '\n== (g) priority CLI round-trip ==\n'
 SD_G="$TMP/s-g"
@@ -1145,7 +1193,77 @@ STOP="$(MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" stop)"
 assert_jq "stop reports stopped" "$STOP" '.stopped == true and (.pid | type) == "number"'
 STOP2="$(MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" stop)"
 assert_jq "stop is idempotent" "$STOP2" '.stopped == false and .pid == null'
-assert_jq "status after stop" "$(MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" status)" '.guard == "stopped"'
+STATUS_D2="$(MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" status)"
+assert_jq "status after stop" "$STATUS_D2" '.guard == "stopped"'
+assert_jq "stop records why the guard is gone" "$STATUS_D2" \
+  '.last_exit_reason == "stopped by mgr-guard stop" and (.last_exit_at | type) == "number"'
+
+printf '\n== (u) issue #12: a held ledger and a live pane keep the daemon past IDLE_EXIT_S ==\n'
+# The incident: every manager 429-stalled, so nothing ran `mgr board`, so no heartbeat landed
+# and the guard idle-exited while eight builders waited for the window to reset. Real clock
+# here: a daemon never gets MGR_GUARD_NOW_MS.
+DAEMON_STATE="$TMP/s-guard12"
+NOW_12=$(( $(date +%s) * 1000 ))
+AG_12="$TMP/agents-12.json"
+US_12="$TMP/usage-12.json"
+agents_file "$AG_12" \
+  "$(mk_agent manager w3:p1 w3 idle '')" \
+  "$(mk_agent issue-9 w3:p9 w3 blocked "$SESS_ANTHROPIC")"
+mk_usage "$US_12" exhausted 1 $(( NOW_12 + 4000 ))
+export FAKE_AGENTS="$AG_12" FAKE_USAGE="$US_12"
+export FAKE_PROMPTS="$TMP/prompts-12.log" FAKE_TOASTS="$TMP/toasts-12.log"
+: >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"
+reg "$DAEMON_STATE" $(( NOW_12 - 7200000 )) ws-w3 w3 w3:p1 3 1 0 0 1 >/dev/null
+START12="$(MGR_STATE_DIR="$DAEMON_STATE" MGR_GUARD_INTERVAL=1 MGR_GUARD_IDLE_EXIT_S=2 "$GUARD" start)"
+assert_jq "(u) daemon started" "$START12" '.started == true and .running == true'
+PID12="$(jq -r '.pid // empty' <<<"$START12")"
+for _ in $(seq 1 9); do sleep 0.5; done      # > IDLE_EXIT_S of ticks, zero fresh heartbeats
+if [ -n "$PID12" ] && kill -0 "$PID12" 2>/dev/null; then
+  pass "(u) daemon alive past IDLE_EXIT_S"
+else
+  fail "(u) daemon idle-exited with a builder still held"
+fi
+if grep -q 'idle-exit' "$DAEMON_STATE/guard.log" 2>/dev/null; then
+  fail "(u) idle-exit logged while a builder was held"
+else
+  pass "(u) no idle-exit while a builder was held"
+fi
+ST_U1="$(MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" status)"
+assert_jq "(u) stale heartbeat, live pane, one held builder" "$ST_U1" \
+  '.guard == "running" and (.stalled | length) == 1
+   and .managers["ws-w3"].live == true and .managers["ws-w3"].pane_alive == true
+   and .providers.anthropic.status == "exhausted"'
+# the window resets: the guard is still there to notice and reignite
+mk_usage "$US_12" ok 0.20 $(( NOW_12 + 3600000 ))
+REIGNITED=0
+for _ in $(seq 1 10); do
+  if grep -q '^w3:p9' "$FAKE_PROMPTS" 2>/dev/null; then REIGNITED=1; break; fi
+  sleep 0.5
+done
+assert_eq "(u) reignited after the reset" 1 "$REIGNITED"
+if kill -0 "$PID12" 2>/dev/null; then pass "(u) daemon alive after the reignition"; else fail "(u) daemon gone after the reignition"; fi
+ST_U2="$(MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" status)"
+assert_jq "(u) status after the reignition" "$ST_U2" \
+  '.guard == "running" and .managers["ws-w3"].live == true and .managers["ws-w3"].pane_alive == true'
+# and the gate itself still closes: pane gone, ledger empty -> the daemon may leave
+printf '[]\n' >"$AG_12"
+EXITED=0
+for _ in $(seq 1 16); do
+  kill -0 "$PID12" 2>/dev/null || { EXITED=1; break; }
+  sleep 0.5
+done
+assert_eq "(u) idle-exit once nothing is left" 1 "$EXITED"
+ST_U3="$(MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" status)"
+assert_jq "(u) the exit shows up on status" "$ST_U3" \
+  '.guard == "stopped" and (.last_exit_reason | startswith("idle-exit after 2s"))
+   and (.last_exit_at | type) == "number"'
+if grep -q 'idle-exit after 2s with no live manager and nothing held' "$DAEMON_STATE/guard.log"; then
+  pass "(u) idle-exit log line"
+else
+  fail "(u) idle-exit log line missing: $(tail -n 1 "$DAEMON_STATE/guard.log")"
+fi
+# the scenarios below inherit FAKE_AGENTS: hand back the two-manager fixture, not the empty one
+export FAKE_AGENTS="$TMP/agents-a.json"
 DAEMON_STATE=""
 
 printf '\n== degraded providers (omp/herdr unusable) ==\n'

@@ -29,6 +29,7 @@ SAMPLES="$STATE_DIR/samples.jsonl"
 LOCKDIR="$STATE_DIR/guard.lock"
 PRIOFILE="$STATE_DIR/priorities.json"
 PAUSEFILE="$STATE_DIR/paused.json"
+EXITFILE="$STATE_DIR/exit.json"
 
 INTERVAL_S="${MGR_GUARD_INTERVAL:-60}"
 SLOPE_WINDOW_S="${MGR_GUARD_SLOPE_WINDOW_S:-1800}"
@@ -97,6 +98,26 @@ pidfile_pid() {
 live_pid() { # prints the pid when the recorded process is alive
   local p; p=$(pidfile_pid)
   if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then printf '%s' "$p"; fi
+}
+
+# Every daemon exit leaves a note behind: a guard that is gone shows up on the board with a
+# reason instead of a bare `guard: stopped` nobody can explain.
+record_exit() { # record_exit <reason>
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  jq -nc --argjson at "$(now_ms)" --arg r "$1" '{at:$at, reason:$r}' \
+    | atomic_write "$EXITFILE" || warn "cannot write $EXITFILE"
+}
+
+read_exit() { # read_exit -> {at,reason}, nulls when the file is absent or junk
+  local ex=""
+  if [ -f "$EXITFILE" ]; then
+    ex=$(jq -c 'if type == "object"
+                then {at: (if (.at | type) == "number" then .at else null end),
+                      reason: (if (.reason | type) == "string" then .reason else null end)}
+                else {at:null, reason:null} end' "$EXITFILE" 2>/dev/null) || ex=""
+  fi
+  case "$ex" in ''|null) ex='{"at":null,"reason":null}';; esac
+  printf '%s' "$ex"
 }
 
 # ---------------------------------------------------------------- jq programs
@@ -169,9 +190,13 @@ def issue_no: ((((. // "") | capture("^issue-(?<n>[0-9]+)$") | .n | tonumber)?) 
 # a held entry: cause "paused" is a quota hold by the guard, "operator-paused" one from mgr pause
 def held: ((.cause // "") | IN("paused", "operator-paused"));
 
-# ---- managers: live vs dead registrations, project priority
-($managers | map(. + {live: (((.pane_id // "") | IN($panes[])) and ((.seen_at // 0) >= ($now - 3600000))),
-                      priority: (($priorities[(.repo // "")] // 5))})) as $mgrs
+# ---- managers: live vs dead registrations, project priority.
+# Liveness is the herdr pane, never the heartbeat: a manager stalled on a 429 stops running
+# `mgr board`, so heartbeat recency goes dark exactly when the guard is needed. seen_at stays
+# on the registration as information only.
+($managers | map((((.pane_id // "") | IN($panes[]))) as $pa
+                 | . + {pane_alive: $pa, live: $pa,
+                        priority: (($priorities[(.repo // "")] // 5))})) as $mgrs
 | ($mgrs | map(select(.live))) as $live0
 | ($mgrs | map(select(.live | not))) as $dead
 | (if ($live0 | length) == 0 then 1 else ([$live0[] | (.cap // 0)] | add) end) as $ceiling
@@ -189,9 +214,12 @@ def held: ((.cause // "") | IN("paused", "operator-paused"));
     | (($s.retry_after_ms // 60000)) as $ra
     | ($s.since + ([$ra, 900000] | min)) as $first
     | ((($prev.stalled // []) | map(select(.pane_id == $a.pane_id)) | first) // null) as $p
+    # manager_id is the live registration of that workspace: a stalled builder keeps its
+    # manager attribution across the stall, which is what the board and `stall --pane` read
     | {pane_id: $a.pane_id, name: $a.name, workspace_id: $a.workspace_id, session: $a.session,
        provider: $s.provider, model: $s.model, error: $s.error, since: $s.since,
-       retry_after_ms: $s.retry_after_ms, cause: "429"}
+       retry_after_ms: $s.retry_after_ms, cause: "429",
+       manager_id: ($ws2mgr[($a.workspace_id // "")] // null)}
       + (if ($p != null) and ($p.since == $s.since)
          then {attempts: ($p.attempts // 0), last_reignite_at: ($p.last_reignite_at // null),
                next_reignite_at: ($p.next_reignite_at // $first)}
@@ -337,10 +365,7 @@ def held: ((.cause // "") | IN("paused", "operator-paused"));
 
 # ---- events for this tick (reignite/paused/resumed events are appended after the I/O runs)
 | ([ ($dead[] | {at: $now, kind: "manager_dropped",
-                 detail: (.manager_id + ": "
-                   + (if (((.pane_id // "") | IN($panes[])) | not)
-                      then ("pane " + (.pane_id // "?") + " is gone")
-                      else "heartbeat older than 1h" end))}),
+                 detail: (.manager_id + ": pane " + (.pane_id // "?") + " is gone")}),
      ($providers | to_entries[] | . as $e
        | ((($prev.providers // {})[$e.key] // null) | if . == null then null else .status end) as $ps
        | if ($e.value.status == "exhausted") and ($ps != "exhausted")
@@ -869,6 +894,29 @@ cmd_register() {
   printf '%s\n' "$out"
 }
 
+# The cheap heartbeat: every `mgr` invocation refreshes seen_at so a manager coming back from
+# a 429 stops looking silent, without paying for a whole `register` payload. The pane has to
+# match the registration on disk — a stale pane id must never refresh someone else's entry,
+# and a manager with no registration is simply not touched.
+cmd_touch() {
+  local mid="${1:-}" pane="${2:-}" f now out
+  [ -n "$mid" ] && [ -n "$pane" ] || die 2 "usage: mgr-guard touch <manager_id> <pane_id>"
+  case "$mid" in
+    *[!A-Za-z0-9_.:-]*) die 2 "touch: manager_id must match [A-Za-z0-9_.:-]+ : $mid";;
+  esac
+  f="$MGRDIR/$mid.json"
+  now=$(now_ms)
+  if [ -f "$f" ] && [ "$(jq -r '.pane_id // ""' "$f" 2>/dev/null || printf '')" = "$pane" ]; then
+    out=$(jq -c --argjson now "$now" '. + {seen_at:$now}' "$f" 2>/dev/null) || out=""
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | atomic_write "$f" || die 1 "cannot write $f"
+      jq -nc --arg id "$mid" --argjson now "$now" '{touched:true, manager_id:$id, seen_at:$now}'
+      return 0
+    fi
+  fi
+  jq -nc --arg id "$mid" '{touched:false, manager_id:$id}'
+}
+
 # ---------------------------------------------------------------- tick
 
 cmd_tick() {
@@ -1003,6 +1051,7 @@ cmd_tick() {
 
 guard_exit() {
   rm -f "$PIDFILE"
+  record_exit "stopped (signal)"
   log info "stopped (signal)"
   exit 0
 }
@@ -1012,18 +1061,26 @@ cmd_run() {
   printf '%s\n' "$$" | atomic_write "$PIDFILE" || die 1 "cannot write $PIDFILE"
   trap guard_exit TERM INT
   log info "started pid=$$ interval=${INTERVAL_S}s state_dir=$STATE_DIR"
-  local last_live nlive nowsec
+  local last_live nlive nheld nowsec reason
   last_live=$(( $(now_ms) / 1000 ))
   while :; do
     # subshell: a `die` inside the tick must not take the daemon down with it
     ( cmd_tick ) >/dev/null 2>>"$LOGFILE" || log error "tick failed"
+    # Two independent reasons to stay: a manager pane still exists, or the ledger still holds
+    # a builder (429, quota pause, operator pause) that nobody else will ever reignite. The
+    # stall this guard exists to recover from is what kills the heartbeats, so leaving on a
+    # quiet heartbeat is exactly the wrong moment to go.
     nlive=$(jq -r '[.managers[]? | select(.live)] | length' "$STATEFILE" 2>/dev/null || printf '0')
     case "$nlive" in ''|*[!0-9]*) nlive=0;; esac
+    nheld=$(jq -r '(.stalled // []) | length' "$STATEFILE" 2>/dev/null || printf '0')
+    case "$nheld" in ''|*[!0-9]*) nheld=0;; esac
     nowsec=$(( $(now_ms) / 1000 ))
-    if [ "$nlive" -gt 0 ]; then
+    if [ "$nlive" -gt 0 ] || [ "$nheld" -gt 0 ]; then
       last_live=$nowsec
     elif [ $(( nowsec - last_live )) -ge "$IDLE_EXIT_S" ]; then
-      log info "idle-exit after ${IDLE_EXIT_S}s with no live manager"
+      reason="idle-exit after ${IDLE_EXIT_S}s with no live manager and nothing held"
+      log info "$reason"
+      record_exit "$reason"
       rm -f "$PIDFILE"
       exit 0
     fi
@@ -1102,12 +1159,15 @@ cmd_stop() {
   rm -f "$PIDFILE"
   local stopped=true
   kill -0 "$pid" 2>/dev/null && stopped=false
+  # the daemon's own signal handler already noted the exit; an operator stop is the better
+  # reason, so it overwrites that note once the process is really gone
+  if [ "$stopped" = true ]; then record_exit "stopped by mgr-guard stop"; fi
   log info "stopped pid=$pid"
   jq -nc --argjson pid "$pid" --argjson stopped "$stopped" '{stopped:$stopped, pid:$pid}'
 }
 
 cmd_status() {
-  local st pid guard="stopped" iv now tick
+  local st pid guard="stopped" iv now tick ex
   st=$(read_state)
   pid=$(pidfile_pid)
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -1124,8 +1184,10 @@ cmd_status() {
   else
     pid=""
   fi
-  jq -nc --argjson st "$st" --arg g "$guard" --arg pid "$pid" \
-    '$st + {guard:$g, pid:(if $pid == "" then null else ($pid | tonumber) end)}'
+  ex=$(read_exit)
+  jq -nc --argjson st "$st" --arg g "$guard" --arg pid "$pid" --argjson ex "$ex" \
+    '$st + {guard:$g, pid:(if $pid == "" then null else ($pid | tonumber) end),
+            last_exit_at:$ex.at, last_exit_reason:$ex.reason}'
 }
 
 # ---------------------------------------------------------------- usage
@@ -1136,10 +1198,12 @@ mgr-guard — deterministic quota guard for herdr-hosted omp builders
 
   mgr-guard start [--interval S]      daemonize the tick loop (idempotent)
   mgr-guard stop                      SIGTERM the daemon, clear guard.pid
-  mgr-guard status                    state.json + guard/pid (always exit 0)
+  mgr-guard status                    state.json + guard/pid + last exit (always exit 0)
   mgr-guard tick                      run one tick in the foreground, print state
   mgr-guard run                       foreground tick loop (what start daemonizes)
   mgr-guard register '<json>'         upsert managers/<manager_id>.json with seen_at
+  mgr-guard touch <manager_id> <pane_id>
+                                      refresh seen_at when the pane still matches
   mgr-guard stall [--pane <pane_id>] <session.jsonl>
                                       stall object for one omp session, or null
                                       (--pane: a paused entry for that pane wins)
@@ -1155,6 +1219,9 @@ mgr-guard — deterministic quota guard for herdr-hosted omp builders
 Env: MGR_STATE_DIR MGR_GUARD_INTERVAL MGR_GUARD_SLOPE_WINDOW_S
      MGR_GUARD_MIN_SLOPE_SPAN_S MGR_GUARD_IDLE_EXIT_S MGR_GUARD_NOTIFY
      MGR_GUARD_RESUME_COOLDOWN_S MGR_GUARD_CONFIRM_TICKS
+
+MGR_GUARD_IDLE_EXIT_S: the daemon exits after this long with no live manager pane and no
+stalled or paused builders.
 EOF
 }
 
@@ -1170,6 +1237,7 @@ main() {
     tick)           cmd_tick "$@";;
     run)            cmd_run "$@";;
     register)       cmd_register "$@";;
+    touch)          cmd_touch "$@";;
     stall)          cmd_stall "$@";;
     priority)       cmd_priority "$@";;
     pause)          cmd_pause "$@";;
