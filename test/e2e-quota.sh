@@ -228,7 +228,7 @@ is "registered ws-w3" "$(jq -r '.manager_id' "$MGR_STATE_DIR/managers/ws-w3.json
 is "registration cap" "$(jq -r '.cap' "$MGR_STATE_DIR/managers/ws-w3.json")" 3
 is "registration has no demand" "$(jq -r 'has("demand")' "$MGR_STATE_DIR/managers/ws-w3.json")" false
 is "registration keys" "$(jq -c 'keys_unsorted' "$MGR_STATE_DIR/managers/ws-w3.json")" \
-  '["manager_id","workspace_id","pane_id","repo","primary","cap","in_flight","adopting","ready","seen_at"]'
+  '["manager_id","workspace_id","pane_id","repo","primary","cap","paused_by_operator","in_flight","adopting","ready","seen_at"]'
 is "the guard skips the board's report file" "$(jq -r '.managers | keys | join(",")' <<<"$st")" ws-w3,ws-w9
 
 echo "# 5. mgr launch is refused on the cap alone, and its internal board records nothing"
@@ -402,6 +402,8 @@ out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" pause)
 is "mgr pause json" "$(jq -c . <<<"$out")" '{"repo":"acme/proj","paused":true,"cap":0,"previous_cap":3}'
 is "the pause is in the git store" "$(cat "$T/gitcfg.mgr.paused")" true
 is "registration cap after the pause" "$(jq -r '.cap' "$MGR_STATE_DIR/managers/ws-w5.json")" 0
+is "registration paused_by_operator after the pause" \
+  "$(jq -r '.paused_by_operator' "$MGR_STATE_DIR/managers/ws-w5.json")" true
 out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" pause)
 is "mgr pause is idempotent" "$(jq -c . <<<"$out")" \
   '{"repo":"acme/proj","paused":true,"cap":0,"previous_cap":3}'
@@ -440,6 +442,8 @@ out=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" unpause)
 is "mgr unpause json" "$(jq -c . <<<"$out")" '{"repo":"acme/proj","paused":false,"cap":3}'
 is "the git store is cleared" "$([ -f "$T/gitcfg.mgr.paused" ] && echo present || echo gone)" gone
 is "registration cap after the unpause" "$(jq -r '.cap' "$MGR_STATE_DIR/managers/ws-w5.json")" 3
+is "registration paused_by_operator after the unpause" \
+  "$(jq -r '.paused_by_operator' "$MGR_STATE_DIR/managers/ws-w5.json")" false
 bd=$(MGR_GUARD_NOW_MS=$PC "$ROOT/bin/mgr" board --cap 3)
 is "paused_by_operator" "$(jq -r '.paused_by_operator' <<<"$bd")" false
 is "cap" "$(jq -r '.cap' <<<"$bd")" 3

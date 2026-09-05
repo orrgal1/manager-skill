@@ -12,6 +12,9 @@ set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 MGR="$here/../bin/mgr"
+# every launched builder loads the status-line extension from the real checkout
+# (`readlink -f` in bin/mgr resolves it even through an install.sh symlink)
+ext="$(cd "$here/.." && pwd -P)/extensions/mgr-status.ts"
 [ -x "$MGR" ] || { printf 'not executable: %s\n' "$MGR" >&2; exit 1; }
 
 # physical paths throughout: `git worktree list` reports the resolved path, and
@@ -271,7 +274,7 @@ check 'launch worktree'  "$wt" "$(jq -r '.worktree' <<<"$out")"
 check 'tab create argv' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env LINK=ws://127.0.0.1:1/link --env OTHER=x --no-focus" "$MGR_TEST_LOG" || true)"
 check 'agent start argv' 1 \
-  "$(grep -cxF 'herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension /abs/ext.ts' "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --extension /abs/ext.ts" "$MGR_TEST_LOG" || true)"
 
 prompt=$(cat "$MGR_TEST_PROMPT")
 check 'brief head' true \
@@ -311,22 +314,22 @@ MGR_OMP_ARGS='--foo bar' MGR_ENV='A=1 B=2' MGR_BRIEF_EXTRA="$fix/other.md" \
   "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
 check 'MGR_OMP_ARGS replaces the git list' 1 \
-  "$(grep -cxF 'herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --foo bar' "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --foo bar" "$MGR_TEST_LOG" || true)"
 check 'MGR_ENV replaces the git list' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env A=1 --env B=2 --no-focus" "$MGR_TEST_LOG" || true)"
 check 'MGR_BRIEF_EXTRA replaces the git path' "$(printf '\nOverride rules')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 2)"
 drop_wt
 
-printf '\n# 3d. no config at all: no --env, no -- in the argv\n'
+printf '\n# 3d. no config at all: no --env, only the status extension after --\n'
 "$MGR" config unset omp-arg >/dev/null
 "$MGR" config unset env >/dev/null
 "$MGR" config unset brief-extra >/dev/null
 : >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
 "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
-check 'agent start has no --' 1 \
-  "$(grep -cx 'herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000' "$MGR_TEST_LOG" || true)"
+check 'agent start has only the status extension' 1 \
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext" "$MGR_TEST_LOG" || true)"
 check 'tab create has no --env' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --no-focus" "$MGR_TEST_LOG" || true)"
 check 'brief has no extra' 1 \

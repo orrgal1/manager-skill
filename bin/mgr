@@ -166,6 +166,9 @@ MGR_SELF=$(readlink -f "$0" 2>/dev/null || true)
 MGR_ROOT=$(dirname "$(dirname "$MGR_SELF")")
 MGR_SKILL_MD="$MGR_ROOT/SKILL.md"
 MGR_BUILDER_MD="$MGR_ROOT/builder.md"
+# the status-line extension every launched builder loads (rate-limited / guard
+# stopped / project paused, straight from the guard's ledger)
+MGR_STATUS_EXT="$MGR_ROOT/extensions/mgr-status.ts"
 
 # ---------------------------------------------------------------- github
 
@@ -348,7 +351,9 @@ guard_stall() { # guard_stall <session.jsonl> -> stall object, or nothing
 
 # One registration per board call: cheap (the guard only writes one small file)
 # and idempotent — it refreshes seen_at and the attribution numbers, nothing
-# else; nothing in the guard computes from them.
+# else; nothing in the guard computes from them. The operator's pause travels
+# on the registration too, so the status-line extension can say a project is
+# parked without a channel of its own; the guard itself still ignores it.
 # `mgr-guard register` rejects a null pane_id, so a pane-less shell just skips.
 guard_heartbeat() { # guard_heartbeat <board-json>
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || return 0
@@ -358,6 +363,7 @@ guard_heartbeat() { # guard_heartbeat <board-json>
   reg=$(jq -c --arg ws "$HERDR_WORKSPACE_ID" --arg pane "$HERDR_PANE_ID" '
     {manager_id:("ws-" + $ws), workspace_id:$ws, pane_id:$pane,
      repo:.repo, primary:.primary, cap:.cap,
+     paused_by_operator:.paused_by_operator,
      in_flight:(.in_flight|length), adopting:(.adopting|length),
      ready:(.ready|length)}' <<<"$1") \
     || { warn "could not build the mgr-guard registration"; return 0; }
@@ -790,9 +796,11 @@ cmd_launch() {
   ensure_labels
 
   # the effective harness config, read before anything is created: one --env per
-  # entry for the tab, the omp argv for `herdr agent start … -- …`. bash 3.2
-  # needs the `${a[@]+…}` idiom to expand a possibly-empty array under `set -u`.
-  local -a env_args=() omp_args=()
+  # entry for the tab, the omp argv for `herdr agent start … -- …`. The status
+  # extension comes first, then the operator's omp-args, so `--` is always
+  # there. bash 3.2 needs the `${a[@]+…}` idiom to expand a possibly-empty
+  # array under `set -u`.
+  local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT")
   local v
   while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -824,7 +832,7 @@ cmd_launch() {
 
   # a freshly created pane needs a moment to reach its interactive shell prompt
   local -a start_cmd=(herdr agent start "issue-$n" --kind omp --pane "$pane_id" --timeout 120000)
-  if [ ${#omp_args[@]} -gt 0 ]; then start_cmd+=(-- "${omp_args[@]}"); fi
+  start_cmd+=(-- "${omp_args[@]}")
   local started=false
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     if "${start_cmd[@]}" >/dev/null 2>&1; then
@@ -1245,7 +1253,9 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr labels                          ensure the mgr:* labels exist
   mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
                                       blocked / orphans / adopting / unmanaged / quota
-  mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N
+  mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N; the
+                                      builder loads extensions/mgr-status.ts (status
+                                      line: rate-limited / guard stopped / paused)
   mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
                                       without N it self-registers via `mgr bind`)
   mgr bind <N>                        run BY a builder in its own pane to bind to issue N
@@ -1276,6 +1286,8 @@ env: MGR_CAP        default concurrency cap
      MGR_BRIEF_EXTRA  markdown file appended to every brief (replaces mgr.brief-extra)
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
+     MGR_STATUS_INTERVAL_S  status-line poll interval, default 5
+     MGR_STATUS_BURN  1 shows the burn item in the status line
      HERDR_WORKSPACE_ID  target workspace (all commands; headless use sets it explicitly)
      HERDR_PANE_ID       the caller's pane (bind, board.self, and the guard
                          heartbeat every command stamps)

@@ -296,13 +296,15 @@ check 'no priority/allotment per manager' '[]' \
 
 printf '\n# 1c. the registration heartbeat: attribution only, no demand\n'
 check 'heartbeat keys' \
-  '["manager_id","workspace_id","pane_id","repo","primary","cap","in_flight","adopting","ready"]' \
+  '["manager_id","workspace_id","pane_id","repo","primary","cap","paused_by_operator","in_flight","adopting","ready"]' \
   "$(jq -sc 'last|keys_unsorted' "$MGR_TEST_REGISTER")"
 check 'heartbeat has no demand' false \
   "$(jq -rs 'last|has("demand")' "$MGR_TEST_REGISTER")"
 check 'heartbeat manager_id' ws-w9 "$(jq -rs 'last|.manager_id' "$MGR_TEST_REGISTER")"
 check 'heartbeat counts' '3/1/0/1' \
   "$(jq -rs 'last|"\(.cap)/\(.in_flight)/\(.adopting)/\(.ready)"' "$MGR_TEST_REGISTER")"
+check 'heartbeat paused_by_operator' false \
+  "$(jq -rs 'last|.paused_by_operator' "$MGR_TEST_REGISTER")"
 check 'heartbeat pane_id'   w9:p1 "$(jq -rs 'last|.pane_id' "$MGR_TEST_REGISTER")"
 check 'heartbeat repo' owner/name "$(jq -rs 'last|.repo' "$MGR_TEST_REGISTER")"
 
@@ -515,6 +517,8 @@ check 'the guard was never asked to pause anything' 0 \
   "$(grep -c 'mgr-guard pause\|mgr-guard unpause\|mgr-guard paused' "$MGR_TEST_LOG" || true)"
 # the pause is only real once the guard's ledger knows: pause re-registers
 check 'pause re-registers cap 0'  0 "$(jq -rs 'last|.cap' "$MGR_TEST_REGISTER")"
+check 'pause re-registers paused_by_operator' true \
+  "$(jq -rs 'last|.paused_by_operator' "$MGR_TEST_REGISTER")"
 check 'the internal board did not record' "$before" \
   "$(md5sum <"$report" 2>/dev/null || md5 -q "$report")"
 out=$("$MGR" pause); rc=$?

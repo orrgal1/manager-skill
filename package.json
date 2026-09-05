@@ -12,6 +12,7 @@
   },
   "files": [
     "bin/",
+    "extensions/",
     "SKILL.md",
     "builder.md",
     "README.md",
