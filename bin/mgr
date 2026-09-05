@@ -563,7 +563,7 @@ report_delta() { # report_delta <limits-json> <provider> -> {changed, delta}
        else {changed:true, delta:"first projection"} end)
     else
       ($prev | map(select(.id != null) | {key:.id, value:.}) | from_entries) as $pm |
-      [ $cur[] | . as $l | ($l.projected_at_reset // 0) as $now
+      ([ $cur[] | . as $l | ($l.projected_at_reset // 0) as $now
                 | ($l.fits // false) as $fits | ($pm[$l.id] // null) as $p |
         if $p == null then $l.id + " " + ($now|fmt) + "× (new)"
         else
@@ -573,7 +573,10 @@ report_delta() { # report_delta <limits-json> <provider> -> {changed, delta}
             $l.id + " " + ($was|fmt) + "× → " + ($now|fmt) + "×"
             + (if $flip then (if $fits then " (now fits)" else " (now over)" end) else "" end)
           else empty end
-        end ] as $ch |
+        end ]
+      + [ $prev[] | select(.id != null) | .id as $id
+          | select(($cur | map(.id) | index($id)) == null)
+          | $id + " " + ((.projected_at_reset // 0)|fmt) + "× (gone)" ]) as $ch |
       if ($ch | length) == 0 then {changed:false, delta:null}
       else {changed:true, delta:($ch | join("; "))} end
     end') || { printf '{"changed":false,"delta":null}'; return; }

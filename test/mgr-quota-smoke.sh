@@ -399,6 +399,14 @@ check 'new limit: delta' 'anthropic:opus 0.8× (new)' \
   "$(jq -r '.quota.delta' <<<"$out")"
 check 'the new limit is recorded too' 3 "$(jq -r '.limits|length' "$report")"
 
+printf '\n# 3d2. a limit the provider stopped reporting is news too\n'
+export MGR_TEST_GUARD="$fix/guard-nudged.json"
+out=$("$MGR" board --cap 3)
+check 'gone limit: changed'    true "$(jq -r '.quota.changed' <<<"$out")"
+check 'gone limit: delta' 'anthropic:opus 0.8× (gone)' \
+  "$(jq -r '.quota.delta' <<<"$out")"
+check 'the report is back to two limits' 2 "$(jq -r '.limits|length' "$report")"
+
 printf '\n# 3e. no workspace, no recording\n'
 export MGR_TEST_GUARD="$fix/guard-moved.json"
 before=$(md5sum <"$report" 2>/dev/null || md5 -q "$report")
