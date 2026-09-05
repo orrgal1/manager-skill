@@ -1072,8 +1072,12 @@ def limitname($id; $provider):
 # greedy width-aware joiner: always takes the first item even if over-long,
 # joins with " · ", spills onto one continuation line when $allowCont == 1,
 # and reserves 12 columns on the final permitted line for a possible
-# " · +N more" once no further continuation is allowed.
-def fititems($items; $allowCont; $showMore; $extra):
+# " · +N more" once no further continuation is allowed. Every line is at most
+# 111 columns of items, which is 120 with the 9-column label. `$skipOver`
+# keeps trying the shorter items behind one that does not fit — right for the
+# quota limits, where each entry stands alone, wrong for a queue whose items
+# are in ETA order and would render with a hole in the middle.
+def fititems($items; $allowCont; $showMore; $extra; $skipOver):
   ($items | length) as $total
   | if $total == 0 then []
     else
@@ -1096,7 +1100,7 @@ def fititems($items; $allowCont; $showMore; $extra):
                   elif (.contsUsed < $allowCont) then
                     (.lines = (.lines + [[$it]]) | .li = (.li + 1) | .contsUsed = (.contsUsed + 1) | .shown = (.shown + 1))
                   else
-                    (.stopped = true)
+                    (if $skipOver then . else (.stopped = true) end)
                   end
               end
           end)
@@ -1146,7 +1150,7 @@ def quotaline:
                       (if .fits == false then (.exhaust_at // 9223372036854775807) else -((.used // 0)) end) ]))
        as $sorted
       | ([ limitfull($sorted[0]) ] + [ $sorted[1:][] | limitshort(.) ]) as $items
-      | (fititems($items; 0; true; 0)) as $lines
+      | (fititems($items; 0; true; 0; true)) as $lines
       | (("quota"|pad9) + $lines[0]) as $base
       | ( if ($repo // "") == "" then 0
           else ([.backlog.managers[] | select((.repo // "") != $repo)] | length)
@@ -1185,7 +1189,7 @@ def workline:
                 else null end
             ) as $item3
             | ([$item1] + (if $item2 != null then [$item2] else [] end) + (if $item3 != null then [$item3] else [] end)) as $items
-            | (fititems($items; 0; false; 0)) as $lines
+            | (fititems($items; 0; false; 0; true)) as $lines
             | ("work"|pad9) + $lines[0]
           end
       end
@@ -1237,7 +1241,7 @@ def nextline:
             | if ($own|length) == 0 then
                 if $extra > 0 then ("next"|pad9) + "\($extra) queued, none listed at this limit" else empty end
               else
-                (fititems($texts; 1; true; $extra)) as $lines
+                (fititems($texts; 1; true; $extra; false)) as $lines
                 | buildlines("next"; $lines)
               end
           end
