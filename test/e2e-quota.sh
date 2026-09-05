@@ -122,9 +122,11 @@ case "$1 $2" in
       w5) printf '%s\n' '[{"number":60,"title":"Paused work","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":61,"title":"Pause me","labels":[],"body":""},{"number":62,"title":"And me","labels":[],"body":""}]';;
       *)  printf '%s\n' '[{"number":49,"title":"Add progress tracking","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":50,"title":"Wait screen","labels":[{"name":"mgr:in-flight"}],"body":""},{"number":51,"title":"Next thing","labels":[],"body":""},{"number":52,"title":"Another","labels":[],"body":""}]';;
     esac;;
+  # every launchable issue carries exactly one size: label — `mgr launch` refuses
+  # without one, and these scenarios are about the cap and the pause
   "issue view") case "$3" in
-      51) printf '%s\n' '{"number":51,"title":"Next thing","state":"OPEN","labels":[],"body":""}';;
-      61) printf '%s\n' '{"number":61,"title":"Pause me","state":"OPEN","labels":[],"body":""}';;
+      51) printf '%s\n' '{"number":51,"title":"Next thing","state":"OPEN","labels":[{"name":"size:small"}],"body":""}';;
+      61) printf '%s\n' '{"number":61,"title":"Pause me","state":"OPEN","labels":[{"name":"size:medium"}],"body":""}';;
       *) printf '';;
     esac;;
   "label create"|"issue edit"|"issue comment") exit 0;;
@@ -162,6 +164,9 @@ EOF
 chmod +x "$FAKE"/*
 export PATH="$FAKE:$PATH"
 export HERDR_WORKSPACE_ID=w3 HERDR_PANE_ID=w3:p1 HERDR_TAB_ID=w3:t1
+# every launch needs a model house for its package overlay; these scenarios are
+# about the cap and the pause, so it is fixed here rather than per case
+export MGR_HOUSE=anthropic
 
 NOW0=1788522000000   # 5h window resets 10 min later
 RESET=$((NOW0 + 600000))

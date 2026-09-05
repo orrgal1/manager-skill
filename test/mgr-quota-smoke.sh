@@ -20,14 +20,14 @@ git init -q "$repo"
 # ------------------------------------------------------------------ fixtures
 
 cat >"$fix/issues.json" <<'EOF'
-[{"number":7,"title":"Another thing","labels":[],"body":""},
- {"number":49,"title":"Do the thing","labels":[{"name":"mgr:in-flight"}],"body":""}]
+[{"number":7,"title":"Another thing","labels":[{"name":"size:small"}],"body":""},
+ {"number":49,"title":"Do the thing","labels":[{"name":"mgr:in-flight"},{"name":"size:medium"}],"body":""}]
 EOF
 cat >"$fix/issue-7.json" <<'EOF'
-{"number":7,"title":"Another thing","state":"OPEN","labels":[],"body":""}
+{"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:small"}],"body":""}
 EOF
 cat >"$fix/issue-49.json" <<'EOF'
-{"number":49,"title":"Do the thing","state":"OPEN","labels":[{"name":"mgr:in-flight"}],"body":""}
+{"number":49,"title":"Do the thing","state":"OPEN","labels":[{"name":"mgr:in-flight"},{"name":"size:medium"}],"body":""}
 EOF
 
 # issue 7's comment thread: the builder's merged report, with the createdAt the
@@ -41,12 +41,19 @@ EOF
 
 sess="$tmp/session-49.jsonl"
 : >"$sess"
-jq -n --arg cwd "$repo" --arg sess "$sess" '
+# the manager's own session: the last assistant message is where `mgr house`
+# reads the provider and model that answered it
+msess="$tmp/session-manager.jsonl"
+cat >"$msess" <<'EOF'
+{"type":"message","timestamp":"2026-09-04T11:59:00Z","message":{"role":"user","content":"hi"}}
+{"type":"message","timestamp":"2026-09-04T11:59:30Z","message":{"role":"assistant","provider":"anthropic","model":"claude-fable-5-1","stopReason":"end_turn"}}
+EOF
+jq -n --arg cwd "$repo" --arg sess "$sess" --arg msess "$msess" '
   {result:{agents:[
     {name:"issue-49",pane_id:"w9:p2",tab_id:"w9:t2",workspace_id:"w9",cwd:$cwd,
      agent:"omp",agent_status:"blocked",agent_session:{value:$sess}},
     {name:"manager",pane_id:"w9:p1",tab_id:"w9:t1",workspace_id:"w9",cwd:$cwd,
-     agent:"omp",agent_status:"working",agent_session:{value:"/dev/null"}}
+     agent:"omp",agent_status:"working",agent_session:{value:$msess}}
   ]}}' >"$fix/agents.json"
 jq '{result:{agent:(.result.agents[0])}}' "$fix/agents.json" >"$fix/agent-issue-49.json"
 
@@ -381,6 +388,9 @@ check 'quota.reason is the guard sentence, verbatim' \
   "$(jq -r '.quota.reason' <<<"$out")"
 check 'quota.stalled'         '[49]' "$(jq -c '.quota.stalled' <<<"$out")"
 check 'in_flight numbers'     '[49]' "$(jq -c '[.in_flight[].number]' <<<"$out")"
+# every issue row carries the size its label says, or null when it has none
+check 'in_flight row size'  medium "$(jq -r '.in_flight[0].size' <<<"$out")"
+check 'ready row size'       small "$(jq -r '.ready[0].size' <<<"$out")"
 check 'in_flight quota_stalled' true "$(jq -r '.in_flight[0].quota_stalled' <<<"$out")"
 check 'quota.managers' \
   '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"live":true,"pane_alive":true,"seen_at":1788523750609}]' \
@@ -784,6 +794,10 @@ check 'paths root'       "$real_pkg"            "$(jq -r '.root' <<<"$out")"
 check 'paths skill_md'   "$real_pkg/SKILL.md"   "$(jq -r '.skill_md' <<<"$out")"
 check 'paths builder_md' "$real_pkg/builder.md" "$(jq -r '.builder_md' <<<"$out")"
 check 'paths mgr'        "$real_pkg/bin/mgr"    "$(jq -r '.mgr' <<<"$out")"
+check 'paths workflows' "$real_pkg/workflows" "$(jq -r '.workflows' <<<"$out")"
+check 'paths omp'       "$real_pkg/omp"       "$(jq -r '.omp' <<<"$out")"
+check 'paths keys' '["root","skill_md","builder_md","workflows","omp","mgr"]' \
+  "$(jq -c 'keys_unsorted' <<<"$out")"
 check 'version through a symlink reads the package root' '{"version":"9.9.9"}' \
   "$("$link" --version)"
 
@@ -813,6 +827,64 @@ check 'guard default follows the symlink' '{"running":true,"pid":4242}' \
 out=$(env -u MGR_GUARD_BIN "$link" board --cap 2)
 check 'board finds the guard next to the real script' running \
   "$(jq -r '.quota.guard' <<<"$out")"
+
+# ------------------------------------- 7b. package / setup / house
+
+printf '\n# 7b. package and setup exec the sibling installer; house reads the session\n'
+# the installer as shipped next to mgr: it echoes its argv and the MGR_ROOT it
+# was handed, which is how it finds omp/ through a symlinked checkout
+cat >"$pkg/bin/mgr-package" <<'EOF'
+#!/usr/bin/env bash
+printf '{"argv":"%s","root":"%s"}\n' "$*" "${MGR_ROOT:-}"
+EOF
+chmod +x "$pkg/bin/mgr-package"
+check 'package execs the installer with the subcommand first' \
+  "$(jq -nc --arg r "$real_pkg" '{argv:"package --list",root:$r}')" \
+  "$("$link" package --list)"
+check 'setup execs the same installer' \
+  "$(jq -nc --arg r "$real_pkg" '{argv:"setup",root:$r}')" \
+  "$("$link" setup)"
+err=$("$tmp/nopkg/bin/mgr" package 2>&1 >/dev/null); rc=$?
+check 'package without the installer exits 4' 4 "$rc"
+check 'package without the installer says where it looked' true \
+  "$(jq -r --arg p "$(cd "$tmp/nopkg" && pwd -P)/bin/mgr-package" \
+     '.error.message == ("mgr-package not found at " + $p)' <<<"$err")"
+err=$("$tmp/nopkg/bin/mgr" setup 2>&1 >/dev/null); rc=$?
+check 'setup without the installer exits 4' 4 "$rc"
+check 'usage lists mgr package' 1 "$("$MGR" --help | grep -c '^ *mgr package')"
+check 'usage lists mgr setup'   1 "$("$MGR" --help | grep -c '^ *mgr setup')"
+check 'usage lists mgr house'   1 "$("$MGR" --help | grep -c '^ *mgr house')"
+
+# the manager's own pane, its session's last assistant message, its house
+check 'house' '{"provider":"anthropic","model":"claude-fable-5-1","house":"anthropic"}' \
+  "$("$MGR" house)"
+check 'house without a pane is all nulls' '{"provider":null,"model":null,"house":null}' \
+  "$(env -u HERDR_PANE_ID "$MGR" house)"
+# with nothing configured, the manager's own session is what the board reports
+# and what a launch would overlay
+check 'board house from this session' anthropic \
+  "$("$MGR" board --cap 3 | jq -r '.house')"
+check 'MGR_HOUSE overrides it on the board' gemini \
+  "$(MGR_HOUSE=gemini "$MGR" board --cap 3 | jq -r '.house')"
+check 'house on a pane whose session has no assistant message' \
+  '{"provider":null,"model":null,"house":null}' \
+  "$(HERDR_PANE_ID=w9:p2 "$MGR" house)"
+# every provider prefix the house map knows, and one it does not
+msess_orig=$(cat "$msess")
+for p in openai-codex:openai codex-cli:openai gemini-cli:gemini google-vertex:gemini \
+         anthropic-bedrock:anthropic mistral:; do
+  prov="${p%%:*}"; want="${p#*:}"
+  jq -nc --arg prov "$prov" \
+    '{type:"message",timestamp:"2026-09-04T11:59:30Z",
+      message:{role:"assistant",provider:$prov,model:"m"}}' >"$msess"
+  check "house maps $prov" \
+    "$(jq -nc --arg prov "$prov" --arg w "$want" \
+       '{provider:$prov,model:"m",house:(if $w=="" then null else $w end)}')" \
+    "$("$MGR" house)"
+done
+printf '%s\n' "$msess_orig" >"$msess"
+check 'house usage' 'usage: mgr house' \
+  "$(jq -r '.error.message' <<<"$("$MGR" house extra 2>&1 >/dev/null)")"
 
 # ------------------------------------- 8. the per-command manager heartbeat
 

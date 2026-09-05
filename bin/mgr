@@ -62,8 +62,8 @@ sanitize_pane() { printf '%s' "$1" | tr ':' '-' | tr '[:upper:]' '[:lower:]'; }
 # must run as its own simple command: `die` inside $(…) kills only a subshell
 cfg_check_key() { # cfg_check_key <key>
   case "${1:-}" in
-    omp-arg|env|brief-extra|cap) ;;
-    *) die 2 "unknown config key: ${1:-} (omp-arg|env|brief-extra|cap)";;
+    omp-arg|env|brief-extra|cap|house) ;;
+    *) die 2 "unknown config key: ${1:-} (omp-arg|env|brief-extra|cap|house)";;
   esac
 }
 
@@ -84,6 +84,7 @@ cfg_check_value() { # cfg_check_value <key> <value>
       esac;;
     omp-arg) [ -n "$2" ] || die 2 "omp-arg must not be empty";;
     cap) case "$2" in ''|*[!0-9]*) die 2 "cap must be a non-negative integer: $2";; esac;;
+    house) house_valid "$2" || die 2 "house must be one of anthropic|openai|gemini: $2";;
   esac
 }
 
@@ -180,11 +181,16 @@ MGR_WORKFLOWS_DIR="$MGR_ROOT/workflows"
 # the status-line extension every launched builder loads (rate-limited / guard
 # stopped / project paused, straight from the guard's ledger)
 MGR_STATUS_EXT="$MGR_ROOT/extensions/mgr-status.ts"
+# the omp agent packages this skill ships (one YAML per model house) and the
+# sibling script that installs them; `mgr package`/`mgr setup` exec it
+MGR_OMP_DIR="$MGR_ROOT/omp"
+MGR_PACKAGE_BIN="$MGR_ROOT/bin/mgr-package"
 
 # ---------------------------------------------------------------- github
 
-# The four sizes, smallest first: a `size:` label per workflow file, and the
-# model role (`omp --model @<size>`) the builder session of that size runs on.
+# The four sizes, smallest first: a `size:` label per workflow file. Every
+# builder session runs on the fixed `@builder` role whatever its size; the size
+# picks the workflow file, not the model.
 MGR_SIZES='tiny small medium large'
 
 size_color() { # size_color <size> -> the label colour
@@ -274,6 +280,71 @@ agents_raw() {
     || die 1 "herdr agent list failed"
   [ -n "$MGR_AGENTS_CACHE" ] || die 1 "herdr agent list returned no result"
   printf '%s' "$MGR_AGENTS_CACHE"
+}
+
+# Which model house this manager's own session runs on, read from its omp
+# session file the way bin/mgr-guard's session_facts does: the last assistant
+# message carries the provider and model that answered it. The tail window and
+# the dropped first line are that helper's, so a huge session stays cheap and a
+# half-written line is never parsed.
+JQ_SELF_FACTS='
+[ inputs | (fromjson? // empty) | select(type == "object")
+  | select((.type == "message") and ((.message | type) == "object")
+           and (.message.role == "assistant")) ]
+| (last // null)
+| if . == null then {provider:null, model:null}
+  else {provider:(.message.provider // null), model:(.message.model // null)} end'
+
+# the model houses a package exists for: omp/packages/<house>.yml
+MGR_HOUSES='anthropic openai gemini'
+
+house_valid() { # house_valid <word>
+  case " $MGR_HOUSES " in *" $1 "*) return 0;; esac
+  return 1
+}
+
+house_of() { # house_of <provider> -> anthropic|openai|gemini ("" when unknown)
+  case "$1" in
+    anthropic*)     printf 'anthropic';;
+    openai*|codex*) printf 'openai';;
+    gemini*|google*) printf 'gemini';;
+  esac
+}
+
+self_house() { # self_house -> {provider,model,house}  (nulls when unknown)
+  local pane="${HERDR_PANE_ID:-}" sess="" facts body size
+  local none='{"provider":null,"model":null}'
+  facts="$none"
+  if [ -n "$pane" ]; then
+    sess=$(agents_raw | jq -r --arg p "$pane" \
+      '[.[] | select(.pane_id == $p) | .agent_session.value // ""] | .[0] // ""')
+  fi
+  if [ -n "$sess" ] && [ -f "$sess" ]; then
+    size=$(wc -c <"$sess" 2>/dev/null | tr -d ' ') || size=0
+    case "$size" in ''|*[!0-9]*) size=0;; esac
+    if [ "$size" -gt 65536 ]; then
+      body=$(tail -c 65536 "$sess" 2>/dev/null | sed 1d) || body=""
+    else
+      body=$(cat "$sess" 2>/dev/null) || body=""
+    fi
+    facts=$(printf '%s\n' "$body" | jq -Rnc "$JQ_SELF_FACTS") || facts="$none"
+  fi
+  jq -c --arg h "$(house_of "$(jq -r '.provider // ""' <<<"$facts")")" \
+    '. + {house:(if $h == "" then null else $h end)}' <<<"$facts"
+}
+
+# The house a builder is launched under, in precedence order: the launch flag,
+# the env, the per-repo store, and finally the manager's own session — every
+# session on this machine reads the same config.yml, so its house is the
+# machine's. Empty means nothing could tell.
+eff_house() { # eff_house <explicit-or-empty> -> the house ("" when unknown)
+  local h="${1:-}"
+  [ -n "$h" ] || h="${MGR_HOUSE:-}"
+  [ -n "$h" ] || h=$(cfg_get_one house)
+  [ -n "$h" ] || h=$(self_house | jq -r '.house // ""')
+  [ -n "$h" ] || return 0
+  house_valid "$h" || die 2 "house must be one of anthropic|openai|gemini: $h"
+  printf '%s' "$h"
 }
 
 agent_git() { # agent_git <cwd> -> "<worktree>\t<branch>"  (empty fields when n/a)
@@ -665,9 +736,11 @@ cfg_list_json() {
   jq -nc --argjson omp "$(json_lines "$(cfg_get_all omp-arg)")" \
     --argjson env "$(json_lines "$(cfg_get_all env)")" \
     --arg brief "$(cfg_get_one brief-extra)" --arg cap "$(cfg_get_one cap)" \
+    --arg house "$(cfg_get_one house)" \
     '{"omp-arg":$omp, env:$env,
       "brief-extra":(if $brief=="" then null else $brief end),
-      cap:(if $cap=="" then null else ($cap|tonumber) end)}'
+      cap:(if $cap=="" then null else ($cap|tonumber) end),
+      house:(if $house=="" then null else $house end)}'
 }
 
 # The store, never the effective values: an operator inspecting the config must
@@ -789,7 +862,7 @@ cmd_board() {
   # primary is resolved (and cached) here for the same reason: the operator's
   # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
-  local b_manager b_overview board
+  local b_manager b_overview b_house board
   primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
@@ -802,6 +875,9 @@ cmd_board() {
   # operator's pause has collapsed the effective one to 0
   b_config=$(config_json "$cap")
   b_manager=$(manager_json "$b_agents")
+  # the house a `mgr launch` would pick right now: the flag is the only input
+  # the board cannot see
+  b_house=$(eff_house "")
   # the machine-wide overview travels with the board so one call serves both a
   # manager's own state and the picture it ends its turn with; a guard that
   # cannot answer is a null field, never a failed board
@@ -822,6 +898,7 @@ cmd_board() {
     --argjson guard "$b_guard" \
     --argjson config "$b_config" \
     --argjson manager "$b_manager" \
+    --arg house "$b_house" \
     --arg repo "$b_repo" \
     --arg primary "$b_primary" \
     --arg ws "${HERDR_WORKSPACE_ID:-}" \
@@ -889,6 +966,7 @@ cmd_board() {
      | unique) as $qstalled |
     {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
      self:(if $self=="" then null else $self end), manager:$manager, config:$config,
+     house:(if $house=="" then null else $house end),
      paused_by_operator:$paused, cap:$cap,
      slots_free:([0, ($cap - ($inflight|length) - ($adopting|length))] | max),
      in_flight:[$inflight[] | .number as $rn
@@ -1080,14 +1158,15 @@ cmd_overview() {
 # ---------------------------------------------------------------- launch
 
 cmd_launch() {
-  local n="" cap=""
+  local n="" cap="" house=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --cap) cap="${2:-}"; shift 2;;
-      *) [ -n "$n" ] && die 2 "usage: mgr launch <N> [--cap N]"; n="$1"; shift;;
+      --house) house="${2:-}"; shift 2;;
+      *) [ -n "$n" ] && die 2 "usage: mgr launch <N> [--cap N] [--house <house>]"; n="$1"; shift;;
     esac
   done
-  [ -n "$n" ] || die 2 "usage: mgr launch <N> [--cap N]"
+  [ -n "$n" ] || die 2 "usage: mgr launch <N> [--cap N] [--house <house>]"
   case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
   cap=$(cap_of "$cap")
   # the pause wins over an explicit --cap, and it answers before any herdr or
@@ -1112,14 +1191,19 @@ cmd_launch() {
 
   [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
 
-  # the size decides both the workflow file the brief names and the model the
-  # session runs on, so a launch without exactly one `size:` label is refused
-  # before anything is created — the operator sizes the issue, never `mgr`
+  # the size decides the workflow file the brief names, so a launch without
+  # exactly one `size:` label is refused before anything is created — the
+  # operator sizes the issue, never `mgr`
   size=$(size_of "$ij") || srsz=$?
   case "$srsz" in
     1) die 3 "issue #$n has no size: label; add exactly one with: gh issue edit $n --add-label size:<tiny|small|medium|large> (or: $MGR_SELF size $n <size>)";;
     2) die 3 "issue #$n has several size: labels ($size); remove all but one with: gh issue edit $n --remove-label size:<size> (or: $MGR_SELF size $n <size>)";;
   esac
+
+  # and the house decides which package overlays the builder's model roles
+  house=$(eff_house "$house")
+  [ -n "$house" ] \
+    || die 3 "cannot determine the model house; run: mgr config set house <anthropic|openai|gemini>"
 
   local bd sf
   bd=$(cmd_board --cap "$cap")
@@ -1140,10 +1224,11 @@ cmd_launch() {
 
   # the effective harness config, read before anything is created: one --env per
   # entry for the tab, the omp argv for `herdr agent start … -- …`. The status
-  # extension comes first, then the operator's omp-args, so `--` is always
-  # there. bash 3.2 needs the `${a[@]+…}` idiom to expand a possibly-empty
-  # array under `set -u`.
-  local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT" --model "@$size")
+  # extension, the builder role and the house's package overlay come first, then
+  # the operator's omp-args, so `--` is always there. bash 3.2 needs the
+  # `${a[@]+…}` idiom to expand a possibly-empty array under `set -u`.
+  local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT" --model "@builder"
+                                 --config "$MGR_OMP_DIR/packages/$house.yml")
   local v
   while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -1186,7 +1271,7 @@ cmd_launch() {
   $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
 
   local brief
-  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. House: $house. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
   brief=$(brief_with_extra "$brief")
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
@@ -1250,6 +1335,13 @@ cmd_adopt() {
   [ -n "$br" ] && { br_disp="$br"; br_cmt="$br"; }
   local wt; wt=$(jq -r '.worktree // ""' <<<"$a")
 
+  # an adoptee is already running under whatever config its session started
+  # with, so the house is reported when one resolves and left out when it does
+  # not — never a refusal
+  local house hfrag=""
+  house=$(eff_house "")
+  [ -n "$house" ] && hfrag=" House: $house."
+
   ensure_labels
 
   if [ -n "$n" ]; then
@@ -1278,7 +1370,7 @@ cmd_adopt() {
       || warn "gh issue comment #$n failed"
 
     local brief
-    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size.$hfrag Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
@@ -1298,7 +1390,7 @@ cmd_adopt() {
     # no issue yet, so nothing carries a size: the session is briefed as medium
     # and labels the issue it creates
     local brief size=medium
-    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"). Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/<the size you labelled>.md, which is how you build and verify at your size — read it before you touch code. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Size: $size. Resume your work only after bind succeeds."
+    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"). Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/<the size you labelled>.md, which is how you build and verify at your size — read it before you touch code. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Size: $size.$hfrag Resume your work only after bind succeeds."
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
 
@@ -1633,6 +1725,16 @@ cmd_labels() {
               + ($sizes | split(" ") | map("size:" + .)))}'
 }
 
+# ---------------------------------------------------------------- house
+
+# The model house of this manager's own session: what `mgr package` installs for
+# and what a builder inherits, since every session on this machine reads the
+# same config.yml.
+cmd_house() {
+  [ $# -eq 0 ] || die 2 "usage: mgr house"
+  self_house
+}
+
 # ------------------------------------------------------------ version / paths
 
 # Both answer from the checkout alone: only jq is needed, no gh/herdr/git.
@@ -1647,8 +1749,9 @@ cmd_version() {
 cmd_paths() {
   jq -nc --arg root "$MGR_ROOT" --arg skill_md "$MGR_SKILL_MD" \
     --arg builder_md "$MGR_BUILDER_MD" --arg workflows "$MGR_WORKFLOWS_DIR" \
-    --arg mgr "$MGR_SELF" \
-    '{root:$root,skill_md:$skill_md,builder_md:$builder_md,workflows:$workflows,mgr:$mgr}'
+    --arg omp "$MGR_OMP_DIR" --arg mgr "$MGR_SELF" \
+    '{root:$root,skill_md:$skill_md,builder_md:$builder_md,workflows:$workflows,
+      omp:$omp,mgr:$mgr}'
 }
 
 # ---------------------------------------------------------------- usage
@@ -1666,12 +1769,16 @@ mgr — manager CLI for herdr-hosted omp builders
                                       every live manager on this machine, as a text
                                       block (--json for the data; --limit caps the
                                       queued items shown, default 10)
-  mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N; issue N
+  mgr launch <N> [--cap N] [--house <anthropic|openai|gemini>]
+                                      worktree + tab + omp builder for issue N; issue N
                                       must carry exactly one size: label, which picks
-                                      the builder's model (--model @<size>) and its
-                                      workflows/<size>.md; the builder loads
-                                      extensions/mgr-status.ts (status line:
-                                      rate-limited / guard stopped / paused)
+                                      the workflows/<size>.md the brief sends it to;
+                                      the session runs on --model @builder with the
+                                      house's omp/packages/<house>.yml overlay and
+                                      loads extensions/mgr-status.ts (status line:
+                                      rate-limited / guard stopped / paused). The house
+                                      is --house, else MGR_HOUSE, else mgr config
+                                      house, else this manager's own session
   mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
                                       without N it self-registers via `mgr bind`)
   mgr bind <N>                        run BY a builder in its own pane to bind to issue N
@@ -1692,18 +1799,27 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr config <set|add|get|unset|list> [key] [value]
                                       per-repo harness config: omp-arg (extra omp argv),
                                       env (KEY=VALUE for the builder's tab), brief-extra
-                                      (markdown file appended to every brief), cap.
+                                      (markdown file appended to every brief), cap,
+                                      house (anthropic|openai|gemini — the package
+                                      overlay every builder launches with).
                                       Stored in the primary checkout's .git/config
                                       under mgr.*, shared by every worktree
+  mgr package [args...]               the omp agent packages in omp/: list, show and
+                                      install one (runs bin/mgr-package)
+  mgr setup [args...]                 first-run install of the package matching this
+                                      machine's model house (runs bin/mgr-package)
+  mgr house                           the model house this manager's own session runs
+                                      on: {provider, model, house}
   mgr paths                           absolute paths of
-                                      root/SKILL.md/builder.md/workflows/mgr, resolved
-                                      from this script's real location
+                                      root/SKILL.md/builder.md/workflows/omp/mgr,
+                                      resolved from this script's real location
   mgr --version                       this checkout's package.json version
 
 env: MGR_CAP        default concurrency cap
      MGR_OMP_ARGS   extra omp argv (whitespace-split; replaces mgr.omp-arg)
      MGR_ENV        KEY=VALUE tab env (whitespace-split; replaces mgr.env)
      MGR_BRIEF_EXTRA  markdown file appended to every brief (replaces mgr.brief-extra)
+     MGR_HOUSE      model house for launches (replaces mgr.house)
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
      MGR_GUARD_BACKLOG_INTERVAL_S  how often the guard refreshes a manager's
@@ -1749,6 +1865,13 @@ main() {
     pause)         cmd_pause "$@";;
     unpause|resume) cmd_unpause "$@";;
     config)        cmd_config "$@";;
+    package|setup)
+      # the installer is a sibling script and owns its own argv; MGR_ROOT is how
+      # it finds omp/ through a symlinked checkout
+      [ -x "$MGR_PACKAGE_BIN" ] || die 4 "mgr-package not found at $MGR_PACKAGE_BIN"
+      export MGR_ROOT
+      exec "$MGR_PACKAGE_BIN" "$sub" "$@";;
+    house)         cmd_house "$@";;
     _parse-report) cmd_parse_report "$@";;
     *) die 2 "unknown subcommand: $sub (try: mgr --help)";;
   esac
