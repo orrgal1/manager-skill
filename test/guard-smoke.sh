@@ -200,7 +200,8 @@ reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <a
     --arg id "$3" --arg ws "$4" --arg pane "$5" --arg repo "$repo" \
     --argjson cap "$6" --argjson inf "$7" --argjson ad "$8" --argjson rd "$9" '
     {manager_id:$id, workspace_id:$ws, pane_id:$pane, repo:$repo,
-     primary:"/Users/x/code/widgets", cap:$cap, in_flight:$inf, adopting:$ad, ready:$rd}')"
+     primary:"/Users/x/code/widgets", cap:$cap, paused_by_operator:false,
+     in_flight:$inf, adopting:$ad, ready:$rd}')"
 }
 
 arm() { # arm <state-dir> <now-ms> <used-prev> <used-now> [status] [reset-offset-ms]
@@ -304,8 +305,8 @@ assert_jq "(b) stale heartbeat + live pane is live" "$ST_B" \
   '.managers["ws-w3"] | .live == true and .pane_alive == true and .seen_at == '"$STALE_B"
 assert_jq "(b) the row is the registration plus liveness, nothing computed" "$ST_B" \
   '(.managers["ws-w3"] | keys)
-   == ["adopting","cap","in_flight","live","manager_id","pane_alive","pane_id","primary",
-       "ready","repo","seen_at","workspace_id"]'
+   == ["adopting","cap","in_flight","live","manager_id","pane_alive","pane_id","paused_by_operator",
+       "primary","ready","repo","seen_at","workspace_id"]'
 assert_jq "(b) the pane that is gone is the only one dropped" "$ST_B" '(.managers | keys) == ["ws-w3"]'
 assert_jq "(b) manager_dropped event" "$ST_B" \
   '[.events[] | select(.kind == "manager_dropped")] | last | .detail == "ws-w7: pane w7:p1 is gone"'
@@ -473,7 +474,7 @@ assert_jq "(e) fields extensions/mgr-status.ts reads exist: the burn item" "$ST_
    and (.providers.anthropic.limits[0] | has("id") and has("used") and has("burn_per_hour")
         and has("projected_at_reset") and has("resets_at") and has("fits"))'
 assert_jq "(e) fields extensions/mgr-status.ts reads exist: the manager row" "$ST_E" \
-  '.managers["ws-w3"] | has("workspace_id") and has("pane_id")'
+  '.managers["ws-w3"] | has("workspace_id") and has("pane_id") and has("paused_by_operator")'
 assert_eq "(e) no prompt while exhausted" 0 "$(lines_of "$FAKE_PROMPTS")"
 assert_eq "(e) and no toast for an exhausted provider" 0 "$(lines_of "$FAKE_TOASTS")"
 # past the backoff, still exhausted, reset still ahead -> still nothing

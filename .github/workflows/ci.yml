@@ -47,5 +47,7 @@ jobs:
           git config --global user.name "ci"
           git config --global user.email "ci@example.com"
           git config --global init.defaultBranch main
+      - uses: oven-sh/setup-bun@v2
+        # test/mgr-status-unit.sh is a bun unit test (omp itself runs on bun)
       - name: Test
         run: test/run.sh

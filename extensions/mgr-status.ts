@@ -228,13 +228,14 @@ function pollSeconds(): number {
   return DEFAULT_INTERVAL_S;
 }
 
+// Same test as `kill -0 "$pid"` in mgr-guard status: any failure, ESRCH or EPERM,
+// is "not our running daemon".
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (err) {
-    // EPERM means somebody else's live process — still a running guard.
-    return (err as { code?: string } | null)?.code === "EPERM";
+  } catch {
+    return false;
   }
 }
 
