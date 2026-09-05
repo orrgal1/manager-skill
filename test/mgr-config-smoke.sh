@@ -229,6 +229,9 @@ check 'unset house' '{"key":"house","value":null}' "$("$MGR" config unset house)
 check 'get rigor unset'   '{"key":"rigor","value":null}' "$("$MGR" config get rigor)"
 check 'set rigor'         '{"key":"rigor","value":"sprint"}' \
   "$("$MGR" config set rigor sprint)"
+check 'set rigor production' '{"key":"rigor","value":"production"}' \
+  "$("$MGR" config set rigor production)"
+"$MGR" config set rigor sprint >/dev/null
 check 'rigor is stored under mgr.rigor' sprint \
   "$(git -C "$repo" config --local --get-all mgr.rigor)"
 check 'the working tree stays clean after set rigor' '' "$(git -C "$repo" status --porcelain)"
@@ -516,6 +519,8 @@ err=$(MGR_RIGOR=bogus "$MGR" launch 7 2>&1 >/dev/null); rc=$?
 check 'bad MGR_RIGOR: launch still exits 0' 0 "$rc"
 check 'bad MGR_RIGOR: brief still carries production' true \
   "$(contains 'Rigor: production.' "$(cat "$MGR_TEST_PROMPT")")"
+check 'bad MGR_RIGOR: launch warns exactly once' 1 \
+  "$(printf '%s\n' "$err" | grep -c 'mgr: warning: rigor must be one of sprint|production: bogus' || true)"
 drop_wt
 
 # --------------------------------------------------- 4. adopt

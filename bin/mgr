@@ -1358,12 +1358,14 @@ cmd_launch() {
   [ -n "$house" ] \
     || die 3 "cannot determine the model house; run: mgr config set house <anthropic|openai|gemini>"
 
-  local rigor; rigor=$(eff_rigor)
-
-  local bd sf
+  local bd sf rigor
   bd=$(cmd_board --cap "$cap")
   sf=$(jq -r '.slots_free' <<<"$bd")
   [ "$sf" -le 0 ] && die 3 "no free slots (cap=$cap)"
+  # the board above already resolved rigor (and warned on stderr if the
+  # configured value was invalid); reading it back here — board.rigor is
+  # never null — keeps that warning to once per launch instead of twice.
+  rigor=$(jq -r '.rigor' <<<"$bd")
 
   title=$(jq -r '.title' <<<"$ij")
   policy=$(policy_of "$ij")
@@ -1496,7 +1498,9 @@ cmd_adopt() {
   local house hfrag=""
   house=$(eff_house "")
   [ -n "$house" ] && hfrag=" House: $house."
-  local rigor; rigor=$(eff_rigor)
+  # bd already resolved rigor via cmd_board above; calling eff_rigor again
+  # would warn twice on stderr for one adopt, so it is read back instead.
+  local rigor; rigor=$(jq -r '.rigor' <<<"$bd")
 
   ensure_labels
 

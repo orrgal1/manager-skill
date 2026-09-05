@@ -50,10 +50,10 @@ claim a check passed.
   surface's integration or e2e subset (builder.md §7).
 - Full suite only when your rigor and the diff surface call for it (builder.md §7); never for
   size alone.
-- One review pass over the whole diff; the reviewer and the rung follow the diff surface
-  (builder.md §7) — `reviewer` on the top rung, with `security-reviewer` beside it for auth or
-  permissions; `sweep` on the work rung; or no pass at all. Fix every finding or decline it with a
-  reason, then re-run the same set.
+- One review pass over the whole diff; the reviewer and the rung follow the diff surface and your
+  rigor (builder.md §7) — `reviewer` on the top rung, with `security-reviewer` beside it for auth
+  or permissions; `sweep` on the work rung; or no pass at all. Fix every finding or decline it
+  with a reason, then re-run the same set.
 - The repo has a live or browser walk → run it only if the change crosses that boundary.
 
 ## Done when

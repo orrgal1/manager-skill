@@ -38,9 +38,10 @@ claim a check passed.
 - Typecheck the packages you touched.
 - Run the test files that cover the changed code, and the touched surface's
   integration or e2e subset (builder.md §7).
-- Review: the reviewer and the rung follow the diff surface (builder.md §7) — `reviewer` on the top
-  rung, with `security-reviewer` beside it for auth or permissions; `sweep` on the work rung; or no
-  pass at all. Your size does not decide it: a three-file diff that touches auth gets the top rung.
+- Review: the reviewer and the rung follow the diff surface and your rigor (builder.md §7) —
+  `reviewer` on the top rung, with `security-reviewer` beside it for auth or permissions; `sweep`
+  on the work rung; or no pass at all. Your size does not decide it: a three-file diff that
+  touches auth gets the top rung.
 - Never at this size: the full suite.
 
 Fix everything you or the reviewer found, re-run the same set, commit.

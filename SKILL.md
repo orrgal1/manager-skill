@@ -71,9 +71,9 @@ the tab rename.** `$MGR board` echoes `manager` — the manager tab it detected 
 you are the one being found.
 
 Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `blocked`,
-`orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, `house`, and `quota` — `guard`, `limits`,
-`reason`, `stalled`. Then close the turn with the `$MGR overview` block — `quota` machine-wide,
-`work`/`next` scoped to this repo — as every turn ends (§7).
+`orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, `house`, `rigor`, and `quota` —
+`guard`, `limits`, `reason`, `stalled`. Then close the turn with the `$MGR overview` block —
+`quota` machine-wide, `work`/`next` scoped to this repo — as every turn ends (§7).
 
 `house` is the package every launch overlays. `null` → run `$MGR house`, which reads the house off
 your own session; still nothing → `$MGR config set house <anthropic|openai|gemini>` before any
@@ -442,8 +442,8 @@ either.
 | `MGR_GUARD_BACKLOG_INTERVAL_S` | `120` | seconds between the guard's per-repo `gh issue list` refreshes for the overview |
 | `MGR_DEFAULT_TASK_S` | `2700` | task duration assumed when a repo has no throughput history and neither does the machine |
 
-Precedence for `cap`, `omp-arg`, `env` and `brief-extra`: CLI flag > `MGR_*` env > git config
-(`$MGR config`) > built-in default.
+Precedence for `cap`, `omp-arg`, `env`, `brief-extra` and `rigor`: CLI flag (where the key
+has one) > `MGR_*` env > git config (`$MGR config`) > built-in default.
 
 ### Headless
 
