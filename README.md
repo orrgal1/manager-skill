@@ -23,9 +23,9 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   do. Every session runs on `--model @builder` with the house's `omp/packages/<house>.yml` overlaid,
   so the size picks the workflow and the agents slices go to, never the model. A builder that
   outgrows its size resizes upward itself. Its own context is for orchestration and integration —
-  scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; none at `tiny`) do the
-  reading and the deciding and return compressed — and it can delegate the planning without
-  resizing.
+  scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; `small` plans in-session,
+  `tiny` does neither) do the reading and the deciding and return compressed — and it can delegate
+  the planning without resizing.
 - **One model package per subscription.** `mgr setup` installs the six agents (`tiny`, `small`,
   `medium`, `large`, `plan`, `sketch`) into the omp agent directory and applies
   `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,

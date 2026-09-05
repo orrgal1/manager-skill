@@ -15,10 +15,12 @@ This file is your complete contract. Follow it in order, top to bottom, until yo
 
 - **One issue.** You build issue #N and nothing else; anything outside its acceptance goes on the
   issue as a comment, not into your diff.
-- **Your context is for orchestration and integration.** Understanding the issue, reading the
-  code and deciding the approach are delegated — scouts map, your size's planner plans — and come
-  back compressed; you continue from what returns and read code when you integrate. `tiny` is the
-  one exemption: it reads its file and edits in-session, and stays that way.
+- **Your context is for orchestration and integration.** Understanding the issue, reading the code
+  and deciding the approach are delegated — scouts map, your size's planner plans — and come back
+  compressed; you continue from what returns and read code when you integrate. `tiny` is the one
+  exemption from delegating at all — it reads its file and edits in-session, and stays that way. How
+  far the rest goes is your size file's call: `small` maps with a `scout` but plans in-session, and
+  reaches for a planner only on a §7 trigger; `medium` and `large` hand the plan out by default.
 - **Your cwd is your worktree.** Every path you read, edit or run is under it — confirm with
   `git worktree list` and `git rev-parse --show-toplevel`.
 - **The primary checkout is read-only and shared.** Prohibited there without exception: any edit or

@@ -181,11 +181,11 @@ A builder that finds itself under-sized resizes upward on its own and comments
 The size also decides where the thinking happens. A builder's own context is for orchestration and
 integration: scouts map the code, its size's planner — `sketch` at `medium`, `plan` at `large` —
 decides the approach, and both return compressed; the builder reads code when it integrates. `tiny`
-is the one exemption and stays in-session. A builder that finds real meat in a correctly-sized
-issue has a cheaper move than resizing: it delegates the planning to its size's planner (`sketch`
-at `small` too), keeps its size, workflow file and checks, and comments
-`builder: delegated planning to <planner> · <which trigger>`. Neither comment needs anything from
-you.
+is the one exemption and stays in-session; `small` maps with a scout but plans in-session unless a
+trigger fires. A builder that finds real meat in a correctly-sized issue has a cheaper move than
+resizing: it delegates the planning to its size's planner (`sketch` at `small` too), keeps its size,
+workflow file and checks, and comments `builder: delegated planning to <planner> · <which trigger>`.
+Neither comment needs anything from you.
 
 ### (c) Policy
 
