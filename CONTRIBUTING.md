@@ -30,7 +30,7 @@ lints with `shellcheck` (0.11.0), another runs `test/run.sh` on both `ubuntu-lat
 
 ```sh
 test/run.sh
-shellcheck -S warning bin/mgr bin/mgr-guard install.sh test/*.sh
+shellcheck -S warning bin/mgr bin/mgr-guard bin/mgr-package install.sh test/*.sh
 ```
 
 ## Pull requests

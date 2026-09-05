@@ -13,6 +13,8 @@
   "files": [
     "bin/",
     "extensions/",
+    "workflows/",
+    "omp/",
     "SKILL.md",
     "builder.md",
     "README.md",
