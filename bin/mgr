@@ -818,7 +818,7 @@ cmd_launch() {
   $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
 
   local brief
-  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
   brief=$(brief_with_extra "$brief")
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
@@ -902,7 +902,7 @@ cmd_adopt() {
       || warn "gh issue comment #$n failed"
 
     local brief
-    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Read $MGR_BUILDER_MD now and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
@@ -918,7 +918,7 @@ cmd_adopt() {
     newname="adopt-$(sanitize_pane "$pane")"
     herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
     local brief
-    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"), then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Resume your work only after bind succeeds."
+    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"), then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it from here on; it is your complete contract, including self-review, landing, and reporting back to the manager when you are done. Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge. Resume your work only after bind succeeds."
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
 

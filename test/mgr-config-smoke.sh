@@ -278,6 +278,8 @@ check 'brief head' true \
   "$(starts_with 'You are the builder for issue #7 in owner/name.' "$prompt")"
 check 'brief keeps the original tail' true \
   "$(contains 'Begin with: gh issue view 7 --comments' "$prompt")"
+check 'brief points at proportionate verification before the first check' true \
+  "$(contains 'Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check.' "$prompt")"
 check 'brief-extra appended after a blank line' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$prompt" | tail -n 3)"
@@ -345,6 +347,8 @@ check 'adopt (bound) agent' issue-7 "$(jq -r '.agent' <<<"$out")"
 check 'adopt (bound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
+check 'adopt (bound) brief points at proportionate verification' true \
+  "$(contains 'Verification is proportionate to the change: its Self-review section' "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (bound) starts no agent' 0 \
   "$(grep -c 'herdr agent start' "$MGR_TEST_LOG" || true)"
 check 'adopt (bound) passes no --env' 0 \
@@ -357,6 +361,8 @@ check 'adopt (unbound) agent' adopt-w9-p3 "$(jq -r '.agent' <<<"$out")"
 check 'adopt (unbound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
+check 'adopt (unbound) brief points at proportionate verification' true \
+  "$(contains 'Verification is proportionate to the change: its Self-review section' "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (unbound) starts no agent' 0 \
   "$(grep -c 'herdr agent start' "$MGR_TEST_LOG" || true)"
 check 'adopt (unbound) passes no --env' 0 \

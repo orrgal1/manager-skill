@@ -131,12 +131,23 @@ git diff main...HEAD
 Check against acceptance, then for: dead code and leftover scaffolding, unhandled error paths,
 naming, docs/changelog if this repo keeps them, and anything secret that must not be committed.
 
-Then run the project's checks — typecheck and the **full** suite. Discover the commands from
-`package.json` scripts, `justfile`, `Makefile` or the CI workflow; if the repo has none, say so
+Then run the checks **the change warrants**, not the whole suite by reflex. Discover the commands
+from `package.json` scripts, `justfile`, `Makefile` or the CI workflow; if the repo has none, say so
 explicitly in the PR body rather than claiming it passed.
 
-If a `reviewer` agent is available, run it over the diff and act on what it finds. Fix everything
-you found, re-run typecheck and the suite, commit.
+- **Default:** typecheck the packages you touched and run the test files that cover the changed
+  code. A one-line fix, a copy change, a constant, a CSS value or a doc edit is a quick ticket —
+  the full suite costs ten-plus minutes of your time and a slice of the quota, and proves nothing
+  the targeted files did not.
+- **Full suite** only when it earns its cost: a change to a shared library, a schema, a compiler
+  rule, routing, or anything whose callers you cannot enumerate; and before a deploy.
+
+Whichever set you ran, the PR body names which tests ran and why that set covers the change.
+
+A `reviewer` agent pass, when one is available, follows the same rule — per-change, not a ritual.
+Run it over the diff when the change has logic, security or contract surface (a new code path, an
+auth or permission boundary, a public API, a data shape) and act on what it finds; a copy, constant,
+styling or doc change does not need one. Fix everything you found, re-run the same set, commit.
 
 ## 9. Pull request
 
@@ -189,8 +200,10 @@ git -C <primary> fetch origin main          # offline is tolerable; a real failu
 git merge main                              # in your worktree
 ```
 
-Resolve any conflicts yourself, then **re-run typecheck and the full suite on the merged tip** —
-a green branch plus a green main is not a green merge. Commit the merge.
+Resolve any conflicts yourself, then **re-run on the merged tip the same proportionate set you ran
+in §8**, plus the checks covering anything main's merge-in touched near your change — a green
+branch plus a green main is not a green merge. Full suite only if the merge-in crossed into the
+changed area or the change is in §8's full-suite class. Commit the merge.
 
 ```bash
 git push
@@ -200,8 +213,8 @@ sha=$(git -C <primary> rev-parse HEAD)
 ```
 
 If `--ff-only` is refused, main moved under you: `git merge main` again in your worktree, re-run
-the checks, push, retry. Then report `status=merged sha=<sha> pr=<url>` (§13), add one short line,
-and stop.
+the same checks, push, retry. Then report `status=merged sha=<sha> pr=<url>` (§13), add one short
+line, and stop.
 
 **Do not remove your worktree and do not close the issue.** The manager retires you — the one
 exception is the §3 case, where the worktree is yours to remove because your cwd is the primary
