@@ -50,8 +50,10 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   a burn projection the manager reports to the operator. It never dials pace: the cap is the
   operator's alone.
 - **One overview block.** `mgr overview` ends every turn with `quota`, `work` and `next`: `quota`
-  is machine-wide, because every manager on the machine draws down one subscription; `work` and
-  `next` are scoped to the repo the command was run in. Read-only: nothing paces on it.
+  is scoped to the calling manager's own provider — its effective house's subscription — because a
+  manager on Anthropic cannot spend an OpenAI quota; `work` and `next` are scoped to the repo the
+  command was run in. `--json` (and `mgr guard status`) stay machine-wide by design — every
+  provider the guard polled, for other tooling to read. Read-only: nothing paces on it.
 - **Issue hygiene** on every request: dedupe, union overlapping asks, split multi-deliverable
   requests, wire dependencies.
 - **Harness config per repo.** `mgr config` stores extra omp CLI args, environment variables for
@@ -108,7 +110,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
 | pause the project | `mgr pause` — a launch gate: a persisted cap 0 for this repo until `mgr unpause`, so nothing new launches. The builders already running keep going to their report; nothing is retired, no tab, worktree or issue is touched |
 | unpause / resume the project | `mgr unpause` (alias `mgr resume`) — the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the ready issues launch |
-| quota status / overview / what's coming | `mgr overview` — one block: quota (machine-wide), this repo's work and queue (see **Overview**) |
+| quota status / overview / what's coming | `mgr overview` — one block: quota (the calling manager's own provider), this repo's work and queue (see **Overview**) |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Headless use
@@ -196,26 +198,36 @@ operator. Nothing acts on the projection.
   is available. It never claims a quota is back over a 100% reading. Managers are reignited exactly
   like builders — that is what breaks the deadlock, and no agent is involved. A reignite is also the
   guard's only desktop toast (`MGR_GUARD_NOTIFY`).
-- **The projection.** The builder provider comes from `omp config list --json`
-  (`modelRoles.value.default`, falling back to `anthropic`). Every tick invalidates and re-reads
-  `omp usage --json --provider <p>` and records, per limit, `used`, `resets_at`, a least-squares
-  `burn_per_hour` over the last `MGR_GUARD_SLOPE_WINDOW_S`,
-  `projected_at_reset = used + burn × hours_to_reset`, `fits` (`projected_at_reset ≤ 1`) and the
-  `{t, used}` samples the fit used. Samples are matched to a limit by *window*, not by the raw
-  stamp — `omp usage` reports `resets_at` with per-call millisecond jitter, so a sample belongs to
-  the current window when its `resets_at` is within 120 s of the limit's (both null matches too),
-  and the slope is fitted over every matched sample instead of the two that happened to collide on
-  the same millisecond. A sample span shorter than `MGR_GUARD_MIN_SLOPE_SPAN_S` counts as zero burn;
-  samples older than 24h are pruned. The guard also writes one sentence per provider about the worst
-  limit — `anthropic:5h at 20% burning 0.2/h → 2.56× the window by 17:00Z`, `anthropic:5h
-  exhausted, resets at 17:00Z`, or `fits`.
-- **Surfacing it.** `mgr board` passes the projection through as `quota.limits[]` and
-  `quota.reason`, and compares it with the projection it last returned for this manager
-  (`MGR_STATE_DIR/managers/<manager_id>.last_report.json`). When some limit's `fits` flipped, its
-  `projected_at_reset` moved by `0.1` or more, or it is new, the board returns `quota.changed: true`
-  with `quota.delta` describing it — `anthropic:5h 1.04× → 2.56× (now over)`. That is change
-  detection for the operator's benefit, nothing more: what the manager actually says at the end of
-  every turn is the `mgr overview` block, which carries the same limits with their `exhaust_at`.
+- **The projection.** Each tick polls the union of every live manager's registered provider and
+  every stalled pane's provider — a machine running an Anthropic manager and an OpenAI manager
+  samples both subscriptions every tick. Only when that union is empty (no manager registered, or
+  none of them resolved a provider) does it fall back to the machine default from
+  `omp config list --json` (`modelRoles.value.default`, falling back to `anthropic`) — the same
+  value `state.builder_provider` always carries, informational once managers are registered. Every
+  polled provider invalidates and re-reads `omp usage --json --provider <p>` and records, per
+  limit, `used`, `resets_at`, a least-squares `burn_per_hour` over the last
+  `MGR_GUARD_SLOPE_WINDOW_S`, `projected_at_reset = used + burn × hours_to_reset`, `fits`
+  (`projected_at_reset ≤ 1`) and the `{t, used}` samples the fit used. Samples are matched to a
+  limit by *window*, not by the raw stamp — `omp usage` reports `resets_at` with per-call
+  millisecond jitter, so a sample belongs to the current window when its `resets_at` is within
+  120 s of the limit's (both null matches too), and the slope is fitted over every matched sample
+  instead of the two that happened to collide on the same millisecond. A sample span shorter than
+  `MGR_GUARD_MIN_SLOPE_SPAN_S` counts as zero burn; samples older than 24h are pruned. The guard
+  also writes one sentence per provider about the worst limit — `anthropic:5h at 20% burning 0.2/h
+  → 2.56× the window by 17:00Z`, `anthropic:5h exhausted, resets at 17:00Z`, or `fits`.
+- **Surfacing it.** `mgr board` resolves the calling manager's own provider — its effective house's
+  subscription (`$MGR config get house`, else the session's own house) — and passes that
+  provider's projection through as `quota.provider`, `quota.status`, `quota.limits[]` and
+  `quota.reason`; a provider the guard has not sampled yet reads `status: null`, `limits: []`,
+  exactly the existing no-reading path, never another provider's numbers. `quota.managers[]`
+  carries `provider` per manager, so cross-provider attribution stays inspectable even though the
+  summary itself is scoped. The board also compares the projection with the one it last returned
+  for this manager (`MGR_STATE_DIR/managers/<manager_id>.last_report.json`). When some limit's
+  `fits` flipped, its `projected_at_reset` moved by `0.1` or more, or it is new, the board returns
+  `quota.changed: true` with `quota.delta` describing it — `anthropic:5h 1.04× → 2.56× (now over)`.
+  That is change detection for the operator's benefit, nothing more: what the manager actually says
+  at the end of every turn is the `mgr overview` block, which carries the same limits with their
+  `exhaust_at`.
 - **Backlog for the overview.** Every `MGR_GUARD_BACKLOG_INTERVAL_S` (default 120 s) the guard also
   refreshes each live manager's repo itself (`gh issue list`, the same ready/blocked/in-flight rules
   `mgr board` uses) into `managers[].backlog` with `backlog_at`, and recomputes that repo's
@@ -232,7 +244,8 @@ operator. Nothing acts on the projection.
 - **Multi-manager ledger.** `~/.local/state/mgr-guard` (`MGR_STATE_DIR`) holds `guard.pid`,
   `guard.log`, `state.json`, `samples.jsonl`, `exit.json`, one `managers/<id>.json` per manager —
   heartbeated by every `mgr` call (`mgr board` writes the full registration: manager id, repo, pane,
-  cap, in-flight and `paused_by_operator`, for attribution and for the status line only — the guard
+  cap, in-flight, `paused_by_operator`, and its effective `house`/`provider` — both `null` when
+  unresolvable — for attribution, for the guard's poll set and for the status line only; the guard
   never reads the pause; every other subcommand stamps `seen_at`) — and the
   `managers/<id>.last_report.json` the board writes for change detection. One daemon serves every
   manager on the machine.
@@ -248,13 +261,15 @@ exit it records why, and `mgr guard status` and `mgr board` report it as
 ## Overview
 
 `mgr overview` is the one block the manager prints at the end of every turn — every turn, including
-the ones that only answered a question. `quota` stays **machine-wide** by design: every manager on
-the machine draws down the same subscription, so the burn projection covers the whole quota, not
-just this project. `work` and `next` are scoped to the repo the command was run in — the queue, the
-running builders and the per-issue ETAs it lists are this repo's own, never another manager's.
-`--json` returns the full object behind the block — the machine-wide quota plus every manager's
-queue, unchanged — `mgr board` embeds the same object as `overview`, and `--limit N` decides how
-much of this repo's own queue is listed.
+the ones that only answered a question. `quota` is scoped to **the calling manager's own
+provider** — its effective house's subscription — so the burn projection it prints is the quota
+this manager actually draws on, not every subscription sampled on the machine. `work` and `next`
+are scoped to the repo the command was run in — the queue, the running builders and the per-issue
+ETAs it lists are this repo's own, never another manager's. `--json` returns the full object
+behind the block, and it stays **machine-wide by design**: every provider the guard polled, plus
+every manager's queue, unfiltered — other tooling reads it, and `mgr guard status` is the same
+daemon-wide record. `mgr board` embeds the same machine-wide object as `overview`; only the text
+render above filters it. `--limit N` decides how much of this repo's own queue is listed.
 
 ```
 quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · weekly 20% used · shared with 1 other project
@@ -263,16 +278,22 @@ next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2
          #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · #15 in 6h30 · +2 more
 ```
 
-- **`quota`** — machine-wide, one entry per provider limit that has a reading, worst first: a limit
-  that does not fit before its own reset comes first (earliest run-out first), then the rest by
-  most used. Plain limit names come from the id: the provider prefix is dropped and the window
-  token mapped (`5h` → `5-hour`, `week`/`weekly`/`7d` → `weekly`, `1d`/`day`/`24h` → `daily`, `1h` →
-  `hourly`, `<N>h` → `<N>-hour`, `<N>d` → `<N>-day`, anything else kept verbatim); a further id
-  segment is appended in parentheses, so `anthropic:7d:fable` reads `weekly (fable)`. The first
-  limit gets the full sentence — percent used, when it runs out, when the window resets; every
-  other limit gets a short one. Other managers on the machine show up only as `shared with N other
-  project(s)` — never by name, never with their own queue. No reading at all: `no quota reading
-  yet`.
+- **`quota`** — scoped to the calling manager's own provider, one entry per limit of that provider
+  that has a reading, worst first: a limit that does not fit before its own reset comes first
+  (earliest run-out first), then the rest by most used. Plain limit names come from the id: the
+  provider prefix is dropped and the window token mapped (`5h` → `5-hour`, `week`/`weekly`/`7d` →
+  `weekly`, `1d`/`day`/`24h` → `daily`, `1h` → `hourly`, `<N>h` → `<N>-hour`, `<N>d` → `<N>-day`,
+  anything else kept verbatim); a further id segment is appended in parentheses, so
+  `anthropic:7d:fable` reads `weekly (fable)`. The first limit gets the full sentence — percent
+  used, when it runs out, when the window resets; every other limit gets a short one. Other
+  managers on the **same provider**, in a different repo, show up only as `shared with N other
+  project(s)` — never by name, never with their own queue; a manager on a different provider is not
+  drawing on this quota and is never counted. That provider having no reading yet renders `no
+  quota reading yet` — never another provider's numbers. A caller with no resolvable house or
+  provider (no pane, no stored house) is not a manager on any subscription, so the line falls back
+  to today's unfiltered rendering — every sampled provider's limits, sharers counted regardless of
+  provider — because filtering to nothing would hide readings that do exist; its board still
+  reports `quota.provider: null`.
 - **`work`** — this repo only: how many builders are running out of the cap, how many issues are
   ready / blocked / awaiting approval, whether a slot is free right now — and if so, whether
   nothing is ready to fill it (`N free slot(s), nothing ready to launch`) — or when the last slot

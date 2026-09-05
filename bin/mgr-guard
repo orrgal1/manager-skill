@@ -4,6 +4,10 @@
 # stopped on a provider rate limit once the quota renews; keep a per-limit burn projection
 # that `mgr board` surfaces; and collect every registered manager's backlog and measured
 # throughput each tick so `mgr-guard overview` can project the machine-wide timeline.
+# Each tick polls the union of live managers' registered providers and stalled panes'
+# providers — never a single machine-wide default — so a mixed-house fleet samples every
+# subscription it actually runs on. `builder_provider()` (the machine's omp default) only
+# fills in when that union is empty.
 # It never dials pace: concurrency is the operator's `cap` and `mgr` alone enforces it.
 # No agent, no LLM: pure bash + jq.
 # Deps: jq (hard), omp + herdr (soft: their failures degrade a single entry).
@@ -337,14 +341,16 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
            stalled: $stalled,
            events: ((($prev.events // []) + $new) | .[-50:])},
    toasts: [ $new[] | select(.kind == "reignite") | (.kind + ": " + .detail) ],
-   log: ("tick provider=" + $policy.builder_provider
-         + " status=" + ((($policy.providers[$policy.builder_provider] // null)
-                          | if . == null then "unknown" else .status end))
-         + " managers=" + (($policy.managers | length) | tostring)
-         + " stalled=" + (($stalled | length) | tostring)
-         + " reignited=" + (($rev | length) | tostring)
-         + " reason=" + ((($policy.providers[$policy.builder_provider] // null)
-                          | if . == null then "n/a" else .reason end)))}'
+   log: (($policy.providers | keys) as $ps
+         | ($ps | join(",")) as $csv
+         | ($ps | map(. as $p | $p + ":" + (($policy.providers[$p].status) // "unknown")) | join(",")) as $status
+         | ($ps | map(. as $p | $p + ":" + (($policy.providers[$p].reason) // "n/a")) | join("; ")) as $reason
+         | "tick providers=" + $csv
+           + " status=" + $status
+           + " managers=" + (($policy.managers | length) | tostring)
+           + " stalled=" + (($stalled | length) | tostring)
+           + " reignited=" + (($rev | length) | tostring)
+           + " reason=" + $reason)}'
 
 # open issues of one repo -> the backlog snapshot state.json carries for that manager.
 # The ready/blocked/in_flight/awaiting rules mirror `mgr board` (bin/mgr JQ_BLOCKERS plus
@@ -512,7 +518,7 @@ def sim($m):
     | (($b.counts // {ready: ($m.ready // 0), in_flight: ($m.in_flight // 0)})) as $c
     | (($c.ready // 0)) as $nready
     | (if ($snap != null) and ($nready == 0) then ($b.slots_free // 0) else 0 end) as $idle
-    | {row: {manager_id: $mid, repo: $repo, cap: $cap, ready: $nready,
+    | {row: {manager_id: $mid, repo: $repo, provider: ($m.provider // null), cap: $cap, ready: $nready,
              blocked: ($c.blocked // 0), in_flight: ($c.in_flight // 0),
              awaiting_approval: ($c.awaiting_approval // 0),
              idle_slots: $idle, starving: ($idle > 0),
@@ -557,6 +563,10 @@ read_state() {
   else printf '{}'; fi
 }
 
+# machine-wide default provider (omp config's modelRoles.default prefix). Retained for
+# exactly two roles now that the poll set follows live managers' own providers: the
+# fallback poll target when no live manager and no stalled pane names a provider, and the
+# value of state.builder_provider (informational only — it no longer decides what gets polled).
 builder_provider() {
   local d=""
   if command -v omp >/dev/null 2>&1; then
@@ -885,8 +895,15 @@ cmd_tick() {
   facts=$(scan_agents "$agents" "$now")
   managers=$(managers_json)
 
-  providers=$(jq -r --arg bp "$bp" \
-    '([$bp] + [.[] | select(.stall != null) | (.stall.provider // empty)]) | unique | .[]' <<<"$facts")
+  # the poll set is every provider a live manager or a stalled pane actually needs sampled —
+  # never a single machine-wide default; builder_provider() only fills in when that's empty
+  providers=$(jq -r --arg bp "$bp" --argjson managers "$managers" --argjson panes "$panes" \
+    '([$managers[] | select((.pane_id // "") | IN($panes[])) | .provider
+         | select(type == "string" and . != "")]
+       + [.[] | select(.stall != null) | (.stall.provider // empty)])
+      | unique
+      | if length == 0 then [$bp] else . end
+      | .[]' <<<"$facts")
 
   for p in $providers; do
     rep=$(fetch_provider "$p" "$prev")
@@ -1148,6 +1165,7 @@ the machine-wide timeline. Concurrency is the operator's `cap`, enforced by `mgr
   mgr-guard tick                      run one tick in the foreground, print state
   mgr-guard run                       foreground tick loop (what start daemonizes)
   mgr-guard register '<json>'         upsert managers/<manager_id>.json with seen_at
+                                      (provider/house are optional; they steer the poll set)
   mgr-guard touch <manager_id> <pane_id>
                                       refresh seen_at when the pane still matches
   mgr-guard stall <session.jsonl>     stall object for one omp session, or null

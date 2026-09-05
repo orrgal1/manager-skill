@@ -370,6 +370,21 @@ eff_house() { # eff_house <explicit-or-empty> -> the house ("" when unknown)
   printf '%s' "$h"
 }
 
+# What a launch on this house actually burns. The house's package sets the
+# default model, and its provider prefix is exactly the id `omp usage` reports
+# and the guard keys its ledger by — so the package file, not a second static
+# table, is the source of truth here; `house_of()` stays the only static map.
+# An unknown house, a missing package or a reformatted one is empty output and
+# never a failure: a manager that cannot name its provider reports no reading,
+# which is honest, rather than another subscription's numbers.
+provider_of_house() { # provider_of_house <house> -> provider ("" when unknown)
+  local h="${1:-}" p=""
+  [ -n "$h" ] || return 0
+  p=$(sed -n '/^  default:/{s|^  default:[[:space:]]*\([^/]*\)/.*|\1|p;q;}' \
+    "$MGR_OMP_DIR/packages/$h.yml" 2>/dev/null) || p=""
+  printf '%s' "$p"
+}
+
 agent_git() { # agent_git <cwd> -> "<worktree>\t<branch>"  (empty fields when n/a)
   local cwd="$1" wt="" br=""
   if [ -n "$cwd" ] && [ -d "$cwd" ]; then
@@ -634,7 +649,8 @@ guard_heartbeat() { # guard_heartbeat <board-json>
   local reg
   reg=$(jq -c --arg ws "$HERDR_WORKSPACE_ID" --arg pane "$HERDR_PANE_ID" '
     {manager_id:("ws-" + $ws), workspace_id:$ws, pane_id:$pane,
-     repo:.repo, primary:.primary, cap:.cap,
+     repo:.repo, primary:.primary,
+     house:.house, provider:.quota.provider, cap:.cap,
      paused_by_operator:.paused_by_operator,
      in_flight:(.in_flight|length), adopting:(.adopting|length),
      ready:(.ready|length)}' <<<"$1") \
@@ -886,7 +902,7 @@ cmd_board() {
   # primary is resolved (and cached) here for the same reason: the operator's
   # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
-  local b_manager b_overview b_house b_rigor board
+  local b_manager b_overview b_house b_prov b_rigor board
   primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
@@ -901,11 +917,15 @@ cmd_board() {
   b_config=$(config_json "$cap" "$b_rigor")
   b_manager=$(manager_json "$b_agents")
   # the house a `mgr launch` would pick right now: the flag is the only input
-  # the board cannot see
+  # the board cannot see. Its package names the provider that house burns, and
+  # that is the subscription `quota.*` below reports — this manager's own, never
+  # whatever the machine happens to default to
   b_house=$(eff_house "")
+  b_prov=$(provider_of_house "$b_house")
   # the machine-wide overview travels with the board so one call serves both a
-  # manager's own state and the picture it ends its turn with; a guard that
-  # cannot answer is a null field, never a failed board
+  # manager's own state and the picture it ends its turn with; it stays the
+  # record of every provider the guard polled, whatever this manager's own is,
+  # and a guard that cannot answer is a null field, never a failed board
   b_overview=$(guard_overview 10)
   [ -n "$b_overview" ] || b_overview=null
 
@@ -924,6 +944,7 @@ cmd_board() {
     --argjson config "$b_config" \
     --argjson manager "$b_manager" \
     --arg house "$b_house" \
+    --arg prov "$b_prov" \
     --arg rigor "$b_rigor" \
     --arg repo "$b_repo" \
     --arg primary "$b_primary" \
@@ -982,7 +1003,7 @@ cmd_board() {
                  reason:"agent-without-label"})
      ] | unique_by([.number,.reason]) | sort_by(.number)) as $orphans |
     ($guard.guard // "stopped") as $gs |
-    ($guard.builder_provider // null) as $prov |
+    (if $prov == "" then null else $prov end) as $prov |
     (if $prov == null then null else ($guard.providers[$prov] // null) end) as $pv |
     # the builders of this workspace on the 429 list: the guard reignites them
     # itself once the quota renews, the board only names them
@@ -1016,6 +1037,7 @@ cmd_board() {
             # seen_at is only the last time that manager ran an `mgr` command
             managers:([($guard.managers // {}) | to_entries[]
                        | {manager_id:(.value.manager_id // .key), repo:(.value.repo // null),
+                          provider:(.value.provider // null),
                           cap:(.value.cap // null), in_flight:(.value.in_flight // null),
                           live:(.value.live // false),
                           pane_alive:(.value.pane_alive // false),
@@ -1023,10 +1045,13 @@ cmd_board() {
                       | sort_by(.manager_id)),
             # filled in below, so that only a top-level `mgr board` records
             changed:false, delta:null},
-     # the machine-wide picture at the default limit, verbatim from the guard
+     # the machine-wide record at the default limit — every provider the guard
+     # polled, verbatim from it, unlike the caller-scoped `quota` above
      overview:$overview}')
 
-  local b_lims b_prov b_delta
+  # b_prov is already the caller's provider (resolved above); reading it back
+  # off the board keeps the delta keyed on exactly what the board reported
+  local b_lims b_delta
   b_lims=$(jq -c '.quota.limits' <<<"$board")
   b_prov=$(jq -r '.quota.provider // ""' <<<"$board")
   b_delta=$(report_delta "$b_lims" "$b_prov")
@@ -1041,10 +1066,12 @@ cmd_board() {
 # ---------------------------------------------------------------- overview
 
 # The rendered block: `quota`, `work`, `next` — each label padded to 9 columns,
-# 2 to 4 physical lines total, no line over 120 columns. `quota` is
-# machine-wide (one subscription): the worst limit gets a full sentence,
-# the rest a short one, plus a `shared with N other projects` tail
-# acknowledging other managers without naming them. `work` and `next` are
+# 2 to 4 physical lines total, no line over 120 columns. `quota` is the calling
+# manager's own subscription — only the limits of the provider its house burns:
+# the worst limit gets a full sentence, the rest a short one, plus a `shared
+# with N other projects` tail acknowledging the other managers on that same
+# provider without naming them (`mgr overview --json` remains the machine-wide
+# record of every provider). `work` and `next` are
 # scoped to the calling repo only — how many builders are running against
 # the cap, the queue counts, when a slot frees up or the queue clears, then
 # the in-flight/queued issues themselves with their ETAs, wrapped at most
@@ -1170,7 +1197,12 @@ def limitshort($l):
   | "\($name) \($pct)% used"
   + (if ($l.fits == false) and $l.exhaust_at != null then ", " + runoutclause($l) else "" end);
 def quotaline:
-  (.burn.limits // []) as $L
+  # only the provider the caller burns: a manager must never read the numbers
+  # of another subscription as its own. A caller with no resolvable provider is
+  # not a manager on any of them, and the readings do exist, so it keeps the
+  # machine-wide list rather than being told there is nothing to see.
+  ( (.burn.limits // [])
+    | if $prov == "" then . else [ .[] | select((.provider // "") == $prov) ] end ) as $L
   | if ($L|length) == 0 then ("quota" | pad9) + "no quota reading yet"
     else
       ($L | sort_by([ (if .fits == false then 0 else 1 end),
@@ -1180,7 +1212,8 @@ def quotaline:
       | (fititems($items; 0; true; 0; true)) as $lines
       | (("quota"|pad9) + $lines[0]) as $base
       | ( if ($repo // "") == "" then 0
-          else ([.backlog.managers[] | select((.repo // "") != $repo)] | length)
+          else ([.backlog.managers[] | select((.repo // "") != $repo)
+                 | select($prov == "" or ((.provider // "") == $prov))] | length)
           end ) as $k
       | (if $k > 0 then " · shared with \($k) other project" + (if $k == 1 then "" else "s" end) else "" end) as $tail
       | if $tail != "" and (($base + $tail) | length) <= 120 then $base + $tail else $base end
@@ -1292,17 +1325,24 @@ cmd_overview() {
   local ov
   ov=$(guard_overview "$limit")
   [ -n "$ov" ] || die 1 "mgr-guard overview failed"
+  # --json is the machine-wide record: every provider the guard polled, exactly
+  # as the guard wrote it, so nothing here filters it
   [ "$json" = true ] && { printf '%s\n' "$ov"; return; }
 
-  # the own repo scopes the `work` and `next` lines to the calling repo alone
-  # — no other repo's name, issue number, or queue ever appears in them — so
-  # a run outside a repo still answers with the block's plain-language
-  # fallbacks, and the guard's clock is the one the block is rendered against
-  local rp tz_set now
+  # the text block is this manager's own view of that same data: the own repo
+  # scopes the `work` and `next` lines to the calling repo alone — no other
+  # repo's name, issue number, or queue ever appears in them — and the caller's
+  # provider scopes the `quota` line to the subscription its house burns, so a
+  # run outside a repo, or with no house at all, still answers with the block's
+  # plain-language fallbacks, and the guard's clock is the one the block is
+  # rendered against
+  local rp hs pv tz_set now
   rp=$(own_repo)
+  hs=$(eff_house "")
+  pv=$(provider_of_house "$hs")
   if [ -n "${TZ:-}" ]; then tz_set=true; else tz_set=false; fi
   now=$(jq -r '.at // 0' <<<"$ov")
-  jq -r --arg repo "$rp" --argjson tz_set "$tz_set" --argjson now "$now" \
+  jq -r --arg repo "$rp" --arg prov "$pv" --argjson tz_set "$tz_set" --argjson now "$now" \
     "$JQ_RENDER_OVERVIEW" <<<"$ov"
 }
 
@@ -1924,11 +1964,13 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
                                       blocked / orphans / adopting / unmanaged / quota /
                                       overview
-  mgr overview [--json] [--limit N]   the machine-wide picture every manager turn ends
-                                      with: burn, backlog and the projected timeline of
-                                      every live manager on this machine, as a text
-                                      block (--json for the data; --limit caps the
-                                      queued items shown, default 10)
+  mgr overview [--json] [--limit N]   the picture every manager turn ends with: the burn
+                                      of this manager's own subscription, then the
+                                      backlog and projected timeline of every live
+                                      manager on this machine, as a text block (--json
+                                      for the data, machine-wide over every provider
+                                      the guard polled; --limit caps the queued items
+                                      shown, default 10)
   mgr launch <N> [--cap N] [--house <anthropic|openai|gemini>]
                                       worktree + tab + omp builder for issue N; issue N
                                       must carry exactly one size: label, which picks
