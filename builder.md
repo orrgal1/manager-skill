@@ -13,22 +13,22 @@ This file is your complete contract. Follow it in order, top to bottom, until yo
 
 ## 1. Identity and ground rules
 
-- **One issue.** You build issue #N and nothing else. Requests outside its acceptance go on the
+- **One issue.** You build issue #N and nothing else; anything outside its acceptance goes on the
   issue as a comment, not into your diff.
-- **Your cwd is your worktree.** Every path you read, edit or run is under it. Confirm with
+- **Your cwd is your worktree.** Every path you read, edit or run is under it — confirm with
   `git worktree list` and `git rev-parse --show-toplevel`.
-- **The primary checkout is read-only and shared.** In it these are prohibited without exception:
-  any edit or write, `git add`, `git commit`, `git stash`, `git reset`, `git checkout`/`switch`,
-  `git pull`, `git merge` (except the `--ff-only` in §11), `git rebase`, installs, builds.
-  A global pre-commit hook refuses commits on `main`; never bypass it.
-- **Stay in your tab.** Never open, focus, rename or close a tab. Never read or write another
+- **The primary checkout is read-only and shared.** Prohibited there without exception: any edit or
+  write, `git add`, `git commit`, `git stash`, `git reset`, `git checkout`/`switch`, `git pull`,
+  `git merge` (except the `--ff-only` in §10), `git rebase`, installs, builds.
+- **Never bypass the global pre-commit hook** that refuses commits on `main`.
+- **Stay in your tab.** Never open, focus, rename or close a tab, and never read or write another
   builder's worktree — other builders are live in this workspace right now.
-- **Commit early, commit often**, on your branch, in scoped commits. Never go idle with
-  uncommitted work: if you stop to report, everything you have is committed first.
+- **Commit early, commit often**, on your branch, in scoped commits; never go idle with uncommitted
+  work.
 - **You are not the manager.** Do not load the manager skill, do not run `mgr board`, `launch`,
-  `adopt`, `prompt`, `retire`, do not create tabs or dispatch anything. The only `mgr` command you
+  `adopt`, `prompt` or `retire`, do not create tabs or dispatch anything; the only `mgr` command you
   may run is `bind`, in §2.
-- **"Report back to the manager" means §13 and nothing else.** No other channel exists. Saying
+- **"Report back to the manager" means §12 and nothing else.** No other channel exists; saying
   "done" in your pane is not reporting.
 
 ## 2. Adopted with no issue — self-register
@@ -84,14 +84,14 @@ List the snapshotted paths in the PR body so the operator can see what was rescu
 
 **You own that worktree's cleanup.** The manager resolves a worktree from your agent's cwd, which
 here is still the primary checkout, so `mgr retire` will not remove the one you made. After
-landing (§11) and *before* you report, remove it yourself:
+landing (§10) and *before* you report, remove it yourself:
 `git worktree remove <primary>-issue-<N>-<slug>` then `git branch -d issue-<N>-<slug>`.
 
 ## 4. Adopted mid-work
 
 Keep going. Nothing you have done is wasted and you do not restart. This contract only adds what
-comes after the code: self-review (§8), a PR (§9), landing or approval (§10–11), and the report
-(§13).
+comes after the code: build and verify at your size (§7), a PR (§8), landing or approval (§9–10),
+and the report (§12).
 
 ## 5. Read the spec
 
@@ -103,7 +103,7 @@ The `## Acceptance` list is your definition of done — every box, nothing beyon
 comments too: the manager and the operator put decisions there.
 
 - **Load-bearing ambiguity** (you cannot build the right thing without an answer): report
-  `status=blocked` with the question as `reason` (§13) and stop. Do not guess at the shape of the
+  `status=blocked` with the question as `reason` (§12) and stop. Do not guess at the shape of the
   deliverable.
 - **Trivia** (naming, ordering, anything reversible): decide, proceed, and record the assumption in
   the PR body.
@@ -114,42 +114,28 @@ comments too: the manager and the operator put decisions there.
 gh issue comment <N> --body "builder: started · <one-line plan>"
 ```
 
-## 7. Build
+## 7. Build and verify — your size
 
-Build to acceptance. Follow the repo's existing conventions — read neighbouring code before
-inventing a pattern. Add tests where you changed or added an observable contract; do not add tests
-for plumbing. Commit in scoped steps as you go.
+Your brief named your size and the absolute path of the workflow directory. The file
+`workflows/<size>.md`, beside this one, is your complete build-and-verify process at that size:
+read it before you touch code and follow it exactly. It owns the planning, the delegation, which
+checks run, which checks never run, and whether a `reviewer` pass happens at all — that decision is
+the size file's, not this contract's.
 
-## 8. Self-review — mandatory
+Build to acceptance and nothing beyond it. Follow the repo's existing conventions — read
+neighbouring code before inventing a pattern. Commit in scoped steps as you go.
 
-Not optional and not a formality. Read your own diff as if someone else wrote it:
+**Resize upward only, never down.** The moment the work fails your size file's scope test, or hits
+one of its budget signals, switch up — before you build more, not in the report:
 
 ```bash
-git diff main...HEAD
+gh issue comment <N> --body "builder: resized <from>→<to>"
+gh issue edit <N> --remove-label size:<from> --add-label size:<to>
 ```
 
-Check against acceptance, then for: dead code and leftover scaffolding, unhandled error paths,
-naming, docs/changelog if this repo keeps them, and anything secret that must not be committed.
+Then read `workflows/<to>.md` and continue under it. A size you have outgrown stays outgrown.
 
-Then run the checks **the change warrants**, not the whole suite by reflex. Discover the commands
-from `package.json` scripts, `justfile`, `Makefile` or the CI workflow; if the repo has none, say so
-explicitly in the PR body rather than claiming it passed.
-
-- **Default:** typecheck the packages you touched and run the test files that cover the changed
-  code. A one-line fix, a copy change, a constant, a CSS value or a doc edit is a quick ticket —
-  the full suite costs ten-plus minutes of your time and a slice of the quota, and proves nothing
-  the targeted files did not.
-- **Full suite** only when it earns its cost: a change to a shared library, a schema, a compiler
-  rule, routing, or anything whose callers you cannot enumerate; and before a deploy.
-
-Whichever set you ran, the PR body names which tests ran and why that set covers the change.
-
-A `reviewer` agent pass, when one is available, follows the same rule — per-change, not a ritual.
-Run it over the diff when the change has logic, security or contract surface (a new code path, an
-auth or permission boundary, a public API, a data shape) and act on what it finds; a copy, constant,
-styling or doc change does not need one. Fix everything you found, re-run the same set, commit.
-
-## 9. Pull request
+## 8. Pull request
 
 ```bash
 git push -u origin <branch>
@@ -166,25 +152,28 @@ Closes #<N>
 ## Assumptions
 ```
 
+The body names which checks ran and why that set covers the change — the set your size file called
+for, and, when the repo has no way to run them, that fact instead of a claim that they passed.
+
 Tick the acceptance checkboxes with `gh issue edit <N> --body <updated>` **only** when every one is
 actually met. Any box you cannot tick is named in your report instead.
 
-## 10. Policy switch
+## 9. Policy switch
 
 Your brief told you the policy.
 
-- **auto-merge** → go to §11 and land it yourself.
-- **manual-approve** → report `status=awaiting-approval pr=<url>` (§13), add one short line saying
+- **auto-merge** → go to §10 and land it yourself.
+- **manual-approve** → report `status=awaiting-approval pr=<url>` (§12), add one short line saying
   what is waiting, and stop. Do not merge, do not touch the primary checkout.
 
 While awaiting approval, two things can arrive:
 
 | Message | Do |
 |---|---|
-| `Approved. Land it now per the Landing section of builder.md.` | §11, then `status=merged` |
-| `Changes requested: …` | apply them, redo §8 in full, push, report a **fresh** `status=awaiting-approval pr=<url>`, stop |
+| `Approved. Land it now per the Landing section of builder.md.` | §10, then `status=merged` |
+| `Changes requested: …` | apply them, re-run §7's verification in full, push, report a **fresh** `status=awaiting-approval pr=<url>`, stop |
 
-## 11. Landing
+## 10. Landing
 
 Exactly this order.
 
@@ -200,10 +189,10 @@ git -C <primary> fetch origin main          # offline is tolerable; a real failu
 git merge main                              # in your worktree
 ```
 
-Resolve any conflicts yourself, then **re-run on the merged tip the same proportionate set you ran
-in §8**, plus the checks covering anything main's merge-in touched near your change — a green
-branch plus a green main is not a green merge. Full suite only if the merge-in crossed into the
-changed area or the change is in §8's full-suite class. Commit the merge.
+Resolve any conflicts yourself, then **re-run on the merged tip the same set your size file ran in
+§7**, plus the checks covering anything main's merge-in touched near your change — a green branch
+plus a green main is not a green merge. Escalate to the full suite only if the merge-in crossed
+into the changed area, or if your size file already calls for it. Commit the merge.
 
 ```bash
 git push
@@ -213,14 +202,14 @@ sha=$(git -C <primary> rev-parse HEAD)
 ```
 
 If `--ff-only` is refused, main moved under you: `git merge main` again in your worktree, re-run
-the same checks, push, retry. Then report `status=merged sha=<sha> pr=<url>` (§13), add one short
+the same checks, push, retry. Then report `status=merged sha=<sha> pr=<url>` (§12), add one short
 line, and stop.
 
 **Do not remove your worktree and do not close the issue.** The manager retires you — the one
 exception is the §3 case, where the worktree is yours to remove because your cwd is the primary
 checkout and the manager cannot see it.
 
-## 12. Failure
+## 11. Failure
 
 Push your branch first so nothing is lost, then report and stop:
 
@@ -243,7 +232,7 @@ you took — the command may have half-run, and you want neither to redo it nor 
 it. This stop is not a failure: do not restart your work from the top and do not post a
 `manager-report` for it.
 
-## 13. Report protocol
+## 12. Report protocol
 
 Your **last** command before you stop, every time, in every branch above:
 
