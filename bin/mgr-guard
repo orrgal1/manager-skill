@@ -476,9 +476,12 @@ def sim($m):
     | (if (($t.estimated) == null) then true else $t.estimated end) as $est
     | (($m.repo // null)) as $repo
     | (($m.manager_id // "")) as $mid
-    # a manager with no resolvable provider is on no subscription this guard sampled, so it
-    # gets no window at all rather than another subscription reset it cannot spend against
-    | (($wins[(($m.provider // ""))] // null)) as $mwin
+    # a manager that names a provider is stalled only by that subscription: its own window,
+    # null when that provider has none, never a foreign reset it cannot spend against. One
+    # that names none is on no subscription in particular, so it keeps the machine-wide
+    # window — the same fallback the text quota line makes for an unresolvable caller
+    | (if (($m.provider // "") == "") then $win
+       else ($wins[$m.provider] // null) end) as $mwin
     | ([($b.in_flight // [])[]
         | (.launched_at // null) as $la
         | (if $la == null then ($now + $med)
