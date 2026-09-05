@@ -132,12 +132,13 @@ gh issue comment <N> --body "builder: started · <the plan your size file asks f
 
 ## 7. Build and verify — your size
 
-Your brief named your size and the absolute path of the workflow directory. The file
+Your brief named your size, your rigor and the absolute path of the workflow directory. The file
 `workflows/<size>.md`, beside this one, is your complete build-and-verify process at that size:
 read it before you touch code and follow it exactly. It owns the planning, the delegation, which
-checks run, which checks never run, and whether a review pass happens at all — that decision is
-the size file's, not this contract's. **Which** reviewer runs, and on which rung, is this
-contract's: the diff surface decides it, not your size (below).
+checks exist at your size and which never run, and whether a review pass happens at all — that
+decision is the size file's, not this contract's. **Which** reviewer runs, on which rung, and when
+the full suite fires, is this contract's: the diff surface and your rigor decide it, not your size
+(below).
 
 Build to acceptance and nothing beyond it. Follow the repo's existing conventions — read
 neighbouring code before inventing a pattern. Commit in scoped steps as you go.
@@ -224,25 +225,55 @@ file's scope test is a resize, never a fan-out: the ceiling only moves work that
 And when a fumble trigger and the ceiling fire on the same edit, escalate — a failing step never
 goes to a slice agent on your own rung.
 
+### Which checks, and under which rigor
+
+Your brief named your rigor: `production` or `sprint`, a per-repo dial the operator sets
+(`mgr config set rigor`) and `production` when nothing is set. It is the one dial for how much
+verification a change owes: it moves the gates below and the review list that follows, and
+nothing else. Your size file owns which checks exist at your size; what it does not own is when
+the heavy ones fire. The full suite and the reviewer follow **what the diff touches** and the
+rigor, never your size label. One list, here, read by every size file.
+
+**Shared surface** is a shared library, a schema, routing, or code whose callers you cannot
+enumerate.
+
+- **The touched surface's own tests, and its integration or e2e subset** — every size, either
+  rigor. A focused change proves that surface still works end to end, not only that its units
+  pass. A repo with no such subset for that surface is said so in the PR body, never claimed.
+- **The full suite** — under `production`, whenever the diff touches shared surface, and always
+  at `large`. Under `sprint`, only when the callers genuinely cannot be enumerated: a shared
+  library, a schema or routing whose callers you can list gets its subset, not the suite, and
+  `large` earns the suite the same way as any other size. `tiny` and `small` never run it, under
+  either rigor.
+- **The live or browser walk** — when the change crosses that boundary, either rigor.
+
+A red the diff caused blocks landing under either rigor. A red the diff did not cause — the same
+failure reproduces on `main` without your change — blocks under `production`; under `sprint` it
+does not block, and it is never swallowed: before you land, post
+`gh issue comment <N> --body "builder: pre-existing red · <test name> · <one line>"` and name it
+again in the PR body. If you cannot show the failure is pre-existing, it is yours.
+
 ### Who reviews, and on which rung
 
-Your size file owns whether a review pass happens at all — `large` always, `tiny` never, `small`
-and `medium` when the diff has surface to review. What it does not own is who does it: the
-reviewer and the rung follow **what the diff touches**, never your size label. One list, here,
-read by every size file; where it says no pass, it is answering the conditional your size file
-left open, not overruling it.
+Your size file owns whether a review pass happens at all — `large` always under `production`,
+`tiny` never, `small` and `medium` when the diff has surface to review. What it does not own is
+who does it: the reviewer and the rung follow **what the diff touches** and your rigor, never your
+size label. One list, here, read by every size file; where it says no pass, it is answering the
+conditional your size file left open, not overruling it.
 
-- **auth, permissions, a data shape, a public API, a schema, or routing** → `reviewer`, the top
-  rung — and `security-reviewer` beside it, in the same batch, whenever auth or permissions are in
-  the diff.
+- **auth or permissions** → `reviewer`, the top rung, and `security-reviewer` beside it in the
+  same batch — under either rigor.
+- **a data shape, a public API, a schema, or routing** → `reviewer`, the top rung, under
+  `production`; under `sprint`, `sweep` on the work rung.
 - **Any other logic or contract surface** — a new code path, a behaviour change, a contract a
   caller depends on → `sweep`: the same review contract on the work rung.
 - **Copy, constants, styling or docs alone** → no pass.
 
 This applies at every size above `tiny`. `tiny` never gets a review pass, whatever it touched
-(`workflows/tiny.md`). At `large` the pass is not conditional — the surface picks the reviewer, not
-whether one runs — so a `large` whose diff is only docs or copy still gets its `sweep` pass and its
-fix round: the list floors at the work rung there, never at none.
+(`workflows/tiny.md`). At `large` under `production` the pass is not conditional — the surface
+picks the reviewer, not whether one runs — so a `large` whose diff is only docs or copy still gets
+its `sweep` pass and its fix round: the list floors at the work rung there, never at none. Under
+`sprint` there is no floor: a docs-only `large` gets no pass, like any other size.
 
 A finding is a finding whoever returned it. Fix it or decline it with a reason, re-run the same
 check set, and a decline you intend to keep is the uncounted escalation cause above: it goes to a
@@ -266,7 +297,9 @@ Closes #<N>
 ```
 
 The body names which checks ran and why that set covers the change — the set your size file called
-for, and, when the repo has no way to run them, that fact instead of a claim that they passed.
+for, and, when the repo has no way to run them, that fact instead of a claim that they passed. It
+names the rigor you built under and the check set that rigor and the diff surface produced (§7),
+so the choice reads back after the fact.
 
 Tick the acceptance checkboxes with `gh issue edit <N> --body <updated>` **only** when every one is
 actually met. Any box you cannot tick is named in your report instead.
@@ -305,7 +338,9 @@ git merge main                              # in your worktree
 Resolve any conflicts yourself, then **re-run on the merged tip the same set your size file ran in
 §7**, plus the checks covering anything main's merge-in touched near your change — a green branch
 plus a green main is not a green merge. Escalate to the full suite only if the merge-in crossed
-into the changed area, or if your size file already calls for it. Commit the merge.
+into the changed area, or if your rigor and the diff surface already call for it (§7). A red on
+the merged tip is judged by §7: yours blocks; pre-existing blocks under `production` and is
+commented under `sprint`. Commit the merge.
 
 ```bash
 git push

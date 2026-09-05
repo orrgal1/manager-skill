@@ -199,7 +199,7 @@ check 'primary is the throwaway repo' "$repo" "$("$MGR" board | jq -r '.primary'
 
 printf '\n# 1. mgr config: git-config backed CRUD\n'
 check 'list on a fresh repo' \
-  '{"omp-arg":[],"env":[],"brief-extra":null,"cap":null,"house":null}' \
+  '{"omp-arg":[],"env":[],"brief-extra":null,"cap":null,"house":null,"rigor":null}' \
   "$("$MGR" config list)"
 check 'get unset multi'   '{"key":"omp-arg","value":[]}'   "$("$MGR" config get omp-arg)"
 check 'get unset single'  '{"key":"cap","value":null}'      "$("$MGR" config get cap)"
@@ -226,6 +226,21 @@ check 'a bogus house exit' 2 "$rc"
 check 'a bogus house message' 'house must be one of anthropic|openai|gemini: bogus' \
   "$(jq -r '.error.message' <<<"$err")"
 check 'unset house' '{"key":"house","value":null}' "$("$MGR" config unset house)"
+check 'get rigor unset'   '{"key":"rigor","value":null}' "$("$MGR" config get rigor)"
+check 'set rigor'         '{"key":"rigor","value":"sprint"}' \
+  "$("$MGR" config set rigor sprint)"
+check 'rigor is stored under mgr.rigor' sprint \
+  "$(git -C "$repo" config --local --get-all mgr.rigor)"
+check 'the working tree stays clean after set rigor' '' "$(git -C "$repo" status --porcelain)"
+check 'unset rigor' '{"key":"rigor","value":null}' "$("$MGR" config unset rigor)"
+err=$("$MGR" config set rigor bogus 2>&1 >/dev/null); rc=$?
+check 'a bogus rigor exit' 2 "$rc"
+check 'a bogus rigor message' 'rigor must be one of sprint|production: bogus' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" config add rigor x 2>&1 >/dev/null); rc=$?
+check 'add rigor (single-valued) exit' 2 "$rc"
+check 'add rigor (single-valued) message' 'config key rigor is single-valued: use set' \
+  "$(jq -r '.error.message' <<<"$err")"
 
 check 'get omp-arg'  '{"key":"omp-arg","value":["--extension","/abs/ext.ts"]}' \
   "$("$MGR" config get omp-arg)"
@@ -237,7 +252,7 @@ check 'get cap is a number' '{"key":"cap","value":4}' "$("$MGR" config get cap)"
 check 'list' \
   "$(jq -nc --arg be "$fix/extra.md" \
      '{"omp-arg":["--extension","/abs/ext.ts"],env:["LINK=ws://127.0.0.1:1/link"],
-       "brief-extra":$be,cap:4,house:null}')" \
+       "brief-extra":$be,cap:4,house:null,rigor:null}')" \
   "$("$MGR" config list)"
 
 check 'stored in the primary .git/config' "$(printf -- '--extension\n/abs/ext.ts')" \
@@ -256,7 +271,7 @@ check 'set replaces the whole list' '{"key":"omp-arg","value":["x"]}' \
 err=$("$MGR" config get bogus 2>&1 >/dev/null); rc=$?
 check 'unknown key exit' 2 "$rc"
 check 'unknown key message' \
-  'unknown config key: bogus (omp-arg|env|brief-extra|cap|house)' \
+  'unknown config key: bogus (omp-arg|env|brief-extra|cap|house|rigor)' \
   "$(jq -r '.error.message' <<<"$err")"
 err=$("$MGR" config add cap 3 2>&1 >/dev/null); rc=$?
 check 'add on a single-valued key exit' 2 "$rc"
@@ -289,6 +304,34 @@ check '--cap beats MGR_CAP'   6 "$(MGR_CAP=5 "$MGR" board --cap 6 | jq -r '.cap'
 "$MGR" config unset cap >/dev/null
 check 'default cap'           3 "$("$MGR" board | jq -r '.cap')"
 
+# --------------------------------------------------- 2b. rigor precedence
+
+printf '\n# 2b. rigor: MGR_RIGOR > git config > production, bad values warn to stderr\n'
+"$MGR" config set rigor sprint >/dev/null
+check 'git config rigor'           sprint     "$("$MGR" board | jq -r '.rigor')"
+check 'MGR_RIGOR beats git config' production "$(MGR_RIGOR=production "$MGR" board | jq -r '.rigor')"
+"$MGR" config unset rigor >/dev/null
+check 'default rigor'              production "$("$MGR" board | jq -r '.rigor')"
+
+: >"$tmp/rigor.err"
+out=$(MGR_RIGOR=bogus "$MGR" board 2>"$tmp/rigor.err")
+check 'bad MGR_RIGOR: board stdout still parses as JSON' true \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && printf true || printf false)"
+check 'bad MGR_RIGOR: falls back to production' production "$(jq -r '.rigor' <<<"$out")"
+check 'bad MGR_RIGOR: warns on stderr' true \
+  "$(contains 'mgr: warning: rigor must be one of sprint|production: bogus — verifying as production' \
+     "$(cat "$tmp/rigor.err")")"
+check 'bad MGR_RIGOR: warns exactly once' 1 "$(wc -l <"$tmp/rigor.err" | tr -d ' ')"
+
+git -C "$repo" config --local mgr.rigor bogus
+: >"$tmp/rigor2.err"
+out=$("$MGR" board 2>"$tmp/rigor2.err")
+check 'hand-edited store: falls back to production' production "$(jq -r '.rigor' <<<"$out")"
+check 'hand-edited store: warns exactly once' 1 "$(wc -l <"$tmp/rigor2.err" | tr -d ' ')"
+check 'hand-edited store: config get still echoes the raw value' \
+  '{"key":"rigor","value":"bogus"}' "$("$MGR" config get rigor)"
+"$MGR" config unset rigor >/dev/null
+
 # --------------------------------------------------- 3. launch wiring
 
 printf '\n# 3. launch: --model @builder + the house overlay, then omp-arg after --, one --env per entry, brief-extra appended\n'
@@ -316,7 +359,8 @@ check 'brief head' true \
 check 'brief keeps the original tail' true \
   "$(contains 'Begin with: gh issue view 7 --comments' "$prompt")"
 check 'brief names the size' true "$(contains 'Size: small.' "$prompt")"
-check 'brief names the house' true "$(contains 'Size: small. House: anthropic. Read' "$prompt")"
+check 'brief names the house' true \
+  "$(contains 'Size: small. House: anthropic. Rigor: production. Read' "$prompt")"
 check 'brief sends the builder to its workflow file' true \
   "$(contains "Its Build section sends you to $wf/small.md, which is how you build and verify at your size — read it before you touch code." "$prompt")"
 check 'brief drops the old proportionate-verification sentence' false \
@@ -456,6 +500,24 @@ check 'a bogus --house message' 'house must be one of anthropic|openai|gemini: b
   "$(jq -r '.error.message' <<<"$err")"
 "$MGR" config set house anthropic >/dev/null
 
+# --------------------------------------------------- 3h. rigor in the brief
+
+printf '\n# 3h. rigor: the brief carries the configured value; a bad env value degrades to production\n'
+"$MGR" config set rigor sprint >/dev/null
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
+"$MGR" launch 7 >/dev/null; rc=$?
+check 'launch exit (rigor sprint)' 0 "$rc"
+check 'brief names rigor sprint' true "$(contains 'Rigor: sprint.' "$(cat "$MGR_TEST_PROMPT")")"
+drop_wt
+"$MGR" config unset rigor >/dev/null
+
+: >"$MGR_TEST_PROMPT"
+err=$(MGR_RIGOR=bogus "$MGR" launch 7 2>&1 >/dev/null); rc=$?
+check 'bad MGR_RIGOR: launch still exits 0' 0 "$rc"
+check 'bad MGR_RIGOR: brief still carries production' true \
+  "$(contains 'Rigor: production.' "$(cat "$MGR_TEST_PROMPT")")"
+drop_wt
+
 # --------------------------------------------------- 4. adopt
 
 printf '\n# 4. adopt: brief-extra applies, omp-arg/env do not\n'
@@ -471,7 +533,7 @@ check 'adopt (bound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
 check 'adopt (bound) brief carries the labelled size, the house and its workflow' true \
-  "$(contains "Size: small. House: anthropic. Read $MGR_REAL_BUILDER now and follow it exactly; it is your complete contract. Its Build section sends you to $wf/small.md," \
+  "$(contains "Size: small. House: anthropic. Rigor: production. Read $MGR_REAL_BUILDER now and follow it exactly; it is your complete contract. Its Build section sends you to $wf/small.md," \
      "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (bound) starts no agent' 0 \
   "$(grep -c 'herdr agent start' "$MGR_TEST_LOG" || true)"
@@ -498,7 +560,7 @@ check 'adopt (bound, ambiguous) is briefed as medium' true \
 "$MGR" adopt w9:p3 7 >/dev/null; rc=$?
 check 'adopt (bound, no house) exit' 0 "$rc"
 check 'adopt (bound, no house) omits House' true \
-  "$(contains 'Size: small. Read ' "$(cat "$MGR_TEST_PROMPT")")"
+  "$(contains 'Size: small. Rigor: production. Read ' "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (bound, no house) says House nowhere' false \
   "$(contains 'House: ' "$(cat "$MGR_TEST_PROMPT")")"
 "$MGR" config set house anthropic >/dev/null
@@ -511,7 +573,7 @@ check 'adopt (unbound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
 check 'adopt (unbound) carries the house and no size of its own' true \
-  "$(contains 'Policy: auto-merge. House: anthropic. Resume your work only after bind succeeds.' \
+  "$(contains 'Policy: auto-merge. House: anthropic. Rigor: production. Resume your work only after bind succeeds.' \
      "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (unbound) briefs no size: the session sizes itself' false \
   "$(contains 'Size: ' "$(cat "$MGR_TEST_PROMPT")")"
@@ -532,10 +594,13 @@ out=$("$MGR" board)
 check 'board .config' \
   "$(jq -nc --arg be "$fix/extra.md" \
      '{"omp-arg":["--extension"],env:["LINK=ws://127.0.0.1:1/link"],
-       "brief-extra":$be,cap:4}')" \
+       "brief-extra":$be,cap:4,rigor:"production"}')" \
   "$(jq -c '.config' <<<"$out")"
 check 'board .config.cap == .cap' true \
   "$(jq -r '.config.cap == .cap' <<<"$out")"
+check 'board .config.rigor' production "$(jq -r '.config.rigor' <<<"$out")"
+check 'board .config.rigor == .rigor' true \
+  "$(jq -r 'if .config.rigor == .rigor then "true" else "false" end' <<<"$out")"
 manager=$(jq -nc --arg cwd "$repo" \
   '{pane_id:"w9:p1",tab_id:"w9:t1",agent:"manager",cwd:$cwd}')
 check 'board .manager' "$manager" "$(jq -c '.manager' <<<"$out")"
@@ -606,7 +671,9 @@ check 'headless bind explains why' true \
 printf '\n# 7. usage lists the config surface\n'
 check 'usage lists mgr config' 1 \
   "$("$MGR" --help | grep -c 'mgr config <set|add|get|unset|list>' || true)"
-for v in MGR_OMP_ARGS MGR_ENV MGR_BRIEF_EXTRA MGR_CAP HERDR_WORKSPACE_ID; do
+check 'usage mentions rigor in the config clause' true \
+  "$(if [ "$("$MGR" --help | grep -c 'rigor' || true)" -ge 1 ]; then printf true; else printf false; fi)"
+for v in MGR_OMP_ARGS MGR_ENV MGR_BRIEF_EXTRA MGR_CAP MGR_RIGOR HERDR_WORKSPACE_ID; do
   check "usage lists $v" 1 "$("$MGR" --help | grep -c "$v" || true)"
 done
 

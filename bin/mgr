@@ -62,8 +62,8 @@ sanitize_pane() { printf '%s' "$1" | tr ':' '-' | tr '[:upper:]' '[:lower:]'; }
 # must run as its own simple command: `die` inside $(…) kills only a subshell
 cfg_check_key() { # cfg_check_key <key>
   case "${1:-}" in
-    omp-arg|env|brief-extra|cap|house) ;;
-    *) die 2 "unknown config key: ${1:-} (omp-arg|env|brief-extra|cap|house)";;
+    omp-arg|env|brief-extra|cap|house|rigor) ;;
+    *) die 2 "unknown config key: ${1:-} (omp-arg|env|brief-extra|cap|house|rigor)";;
   esac
 }
 
@@ -85,6 +85,7 @@ cfg_check_value() { # cfg_check_value <key> <value>
     omp-arg) [ -n "$2" ] || die 2 "omp-arg must not be empty";;
     cap) case "$2" in ''|*[!0-9]*) die 2 "cap must be a non-negative integer: $2";; esac;;
     house) house_valid "$2" || die 2 "house must be one of anthropic|openai|gemini: $2";;
+    rigor) rigor_valid "$2" || die 2 "rigor must be one of sprint|production: $2";;
   esac
 }
 
@@ -131,12 +132,34 @@ eff_brief_extra() { # effective brief-extra path ("" when unset)
   cfg_get_one brief-extra
 }
 
-config_json() { # config_json <cap> -> the effective config object
+# The rigor every builder verifies under, in precedence order: the env, the
+# per-repo store, and finally `production`. Never empty and never a refusal: a
+# value that is not one of the two is a warning and `production` — a fresh
+# install must never verify less than it thinks it does, and a bad value must
+# never fail a launch. Unset is the default, not a fault, so it is silent.
+MGR_RIGORS='sprint production'
+
+rigor_valid() { # rigor_valid <word>
+  case " $MGR_RIGORS " in *" $1 "*) return 0;; esac
+  return 1
+}
+
+eff_rigor() { # eff_rigor -> sprint|production (never empty)
+  local r="${MGR_RIGOR:-}"
+  [ -n "$r" ] || r=$(cfg_get_one rigor)
+  if [ -n "$r" ] && ! rigor_valid "$r"; then
+    warn "rigor must be one of sprint|production: $r — verifying as production"
+    r=""
+  fi
+  printf '%s' "${r:-production}"
+}
+
+config_json() { # config_json <cap> <rigor> -> the effective config object
   jq -nc --argjson omp "$(json_lines "$(eff_omp_args)")" \
     --argjson env "$(json_lines "$(eff_env)")" \
-    --arg brief "$(eff_brief_extra)" --argjson cap "$1" \
+    --arg brief "$(eff_brief_extra)" --argjson cap "$1" --arg rigor "$2" \
     '{"omp-arg":$omp, env:$env,
-      "brief-extra":(if $brief=="" then null else $brief end), cap:$cap}'
+      "brief-extra":(if $brief=="" then null else $brief end), cap:$cap, rigor:$rigor}'
 }
 
 # brief-extra is operator prose appended to every builder brief. A path that is
@@ -736,11 +759,12 @@ cfg_list_json() {
   jq -nc --argjson omp "$(json_lines "$(cfg_get_all omp-arg)")" \
     --argjson env "$(json_lines "$(cfg_get_all env)")" \
     --arg brief "$(cfg_get_one brief-extra)" --arg cap "$(cfg_get_one cap)" \
-    --arg house "$(cfg_get_one house)" \
+    --arg house "$(cfg_get_one house)" --arg rigor "$(cfg_get_one rigor)" \
     '{"omp-arg":$omp, env:$env,
       "brief-extra":(if $brief=="" then null else $brief end),
       cap:(if $cap=="" then null else ($cap|tonumber) end),
-      house:(if $house=="" then null else $house end)}'
+      house:(if $house=="" then null else $house end),
+      rigor:(if $rigor=="" then null else $rigor end)}'
 }
 
 # The store, never the effective values: an operator inspecting the config must
@@ -862,7 +886,7 @@ cmd_board() {
   # primary is resolved (and cached) here for the same reason: the operator's
   # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
-  local b_manager b_overview b_house board
+  local b_manager b_overview b_house b_rigor board
   primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
@@ -873,7 +897,8 @@ cmd_board() {
   b_guard=$(guard_state)
   # the config reports the store, so it keeps the configured cap even when the
   # operator's pause has collapsed the effective one to 0
-  b_config=$(config_json "$cap")
+  b_rigor=$(eff_rigor)
+  b_config=$(config_json "$cap" "$b_rigor")
   b_manager=$(manager_json "$b_agents")
   # the house a `mgr launch` would pick right now: the flag is the only input
   # the board cannot see
@@ -899,6 +924,7 @@ cmd_board() {
     --argjson config "$b_config" \
     --argjson manager "$b_manager" \
     --arg house "$b_house" \
+    --arg rigor "$b_rigor" \
     --arg repo "$b_repo" \
     --arg primary "$b_primary" \
     --arg ws "${HERDR_WORKSPACE_ID:-}" \
@@ -967,6 +993,7 @@ cmd_board() {
     {repo:$repo, primary:$primary, workspace_id:(if $ws=="" then null else $ws end),
      self:(if $self=="" then null else $self end), manager:$manager, config:$config,
      house:(if $house=="" then null else $house end),
+     rigor:$rigor,
      paused_by_operator:$paused, cap:$cap,
      slots_free:([0, ($cap - ($inflight|length) - ($adopting|length))] | max),
      in_flight:[$inflight[] | .number as $rn
@@ -1331,6 +1358,8 @@ cmd_launch() {
   [ -n "$house" ] \
     || die 3 "cannot determine the model house; run: mgr config set house <anthropic|openai|gemini>"
 
+  local rigor; rigor=$(eff_rigor)
+
   local bd sf
   bd=$(cmd_board --cap "$cap")
   sf=$(jq -r '.slots_free' <<<"$bd")
@@ -1397,7 +1426,7 @@ cmd_launch() {
   $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
 
   local brief
-  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. House: $house. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. House: $house. Rigor: $rigor. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
   brief=$(brief_with_extra "$brief")
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
@@ -1467,6 +1496,7 @@ cmd_adopt() {
   local house hfrag=""
   house=$(eff_house "")
   [ -n "$house" ] && hfrag=" House: $house."
+  local rigor; rigor=$(eff_rigor)
 
   ensure_labels
 
@@ -1496,7 +1526,7 @@ cmd_adopt() {
       || warn "gh issue comment #$n failed"
 
     local brief
-    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size.$hfrag Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size.$hfrag Rigor: $rigor. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
@@ -1516,7 +1546,7 @@ cmd_adopt() {
     # no issue yet, so nothing carries a size: the session labels the issue it
     # creates and sizes itself from that label, so the brief names no size
     local brief
-    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"). Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/<the size you labelled>.md, which is how you build and verify at your size — read it before you touch code. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge.$hfrag Resume your work only after bind succeeds."
+    brief="The manager has adopted this session as a builder for $rp. Pause your current work now. No GitHub issue exists for what you are doing: create one with gh issue create (imperative title; body with ## Summary, ## Acceptance as a checkbox list, ## Notes containing \"adopted from tab $tab\"). Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run $MGR_SELF bind <new issue number> from this session, then read $MGR_BUILDER_MD and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/<the size you labelled>.md, which is how you build and verify at your size — read it before you touch code. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: auto-merge.$hfrag Rigor: $rigor. Resume your work only after bind succeeds."
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt $newname failed" herdr agent prompt "$newname" "$brief"
 
@@ -1927,7 +1957,9 @@ mgr — manager CLI for herdr-hosted omp builders
                                       env (KEY=VALUE for the builder's tab), brief-extra
                                       (markdown file appended to every brief), cap,
                                       house (anthropic|openai|gemini — the package
-                                      overlay every builder launches with).
+                                      overlay every builder launches with), rigor
+                                      (sprint|production — the verification policy
+                                      every brief names; default production).
                                       Stored in the primary checkout's .git/config
                                       under mgr.*, shared by every worktree
   mgr package [args...]               the omp agent packages in omp/: list, show and
@@ -1946,6 +1978,7 @@ env: MGR_CAP        default concurrency cap
      MGR_ENV        KEY=VALUE tab env (whitespace-split; replaces mgr.env)
      MGR_BRIEF_EXTRA  markdown file appended to every brief (replaces mgr.brief-extra)
      MGR_HOUSE      model house for launches (replaces mgr.house)
+     MGR_RIGOR      verification rigor for builders, sprint|production (replaces mgr.rigor)
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
      MGR_GUARD_BACKLOG_INTERVAL_S  how often the guard refreshes a manager's

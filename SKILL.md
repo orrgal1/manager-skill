@@ -285,6 +285,7 @@ Trust the report, not the idle state.
 | size #N `<size>` / resize #N `<size>` | `$MGR size N <size>` — swaps the `size:` label for the new one. Refused with exit `3` while the issue is `mgr:in-flight`: a live builder resizes itself, upward, and comments when it does. Then `$MGR board` |
 | set the cap to N | `$MGR config set cap N` (persisted in the repo, shared by every worktree), then `$MGR board`. The cap is the only pace dial there is — nothing lowers it behind your back |
 | set the house to X | `$MGR config set house X` (`anthropic`\|`openai`\|`gemini`), then `$MGR board` — every builder launched after it overlays that house's package |
+| set the rigor to X | `$MGR config set rigor X` (`sprint`\|`production`; default `production`), then `$MGR board` — every builder briefed after it verifies under that rigor (`builder.md §7`); the operator's call, never a builder's |
 | switch the package | `$MGR package X` — applies `omp/packages/X.yml` to this machine's omp config, so the roles change for every session started afterwards (yours after a restart) |
 | run builders with extra omp args / env / an extra brief directive | `$MGR config add omp-arg <arg>` (repeat; order kept) / `$MGR config add env KEY=VALUE` / `$MGR config set brief-extra /abs/file.md`. `omp-arg` and `env` reach newly launched builders only; `brief-extra` also reaches adopted ones |
 | show the harness config | `$MGR config list` |
@@ -352,7 +353,7 @@ Trust the report, not the idle state.
 | `$MGR guard status` | the guard's whole state: the provider with its limits and burn projection, the registered managers with the board data the guard collects for them (`managers[].backlog`, `backlog_at`, `backlog_error`, `throughput`), the stalled panes with their reignite attempts, and `last_exit_at`/`last_exit_reason` when the daemon is not running. A manager is live while its herdr pane exists — `managers[].pane_alive` is that pane check and is what `live` means; `managers[].seen_at` is only the last time it ran an `mgr` command |
 | `$MGR pause` | this project's launch gate: a persisted cap 0, machine-wide for this repo (`mgr.paused` in the primary checkout's `.git/config`). `board` reports `paused_by_operator`, `launch` refuses; running builders are untouched. Idempotent |
 | `$MGR unpause` (alias `$MGR resume`) | lift the gate: the cap goes back to `--cap`/`MGR_CAP`/config/`3`. Idempotent, exit `0` when the project is not paused |
-| `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`, `house` (`anthropic`\|`openai`\|`gemini` — the package every launch overlays). Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
+| `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`, `house` (`anthropic`\|`openai`\|`gemini` — the package every launch overlays), `rigor` (`sprint`\|`production` — the verification dial every brief names; default `production`). Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
 | `$MGR setup [--force] [--house <house>]` | once per machine: install the eight agents into the omp agent dir (existing files kept unless `--force`) and apply the house's package — `--house`, else `$MGR config get house`, else `anthropic` |
 | `$MGR package [<house>]` | no argument: `{active, available, dir}`. With one: apply `omp/packages/<house>.yml` to this machine's omp config (`modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains`) and print the role changes. Exit `4` on an unknown house |
 | `$MGR house` | `{provider, model, house}` read off your own session — what a launch falls back to when nothing is configured |
@@ -367,8 +368,9 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `paused_by_operator` | `true` while the operator's launch gate is on (`$MGR pause`); `$MGR unpause` clears it |
 | `cap` | the effective cap: `--cap` > `MGR_CAP` > `$MGR config get cap` > `3` — all of them overridden to `0` while `paused_by_operator` is true, `--cap N` included |
 | `slots_free` | `cap − (in_flight + adopting)`, never below `0` — the only thing `launch` gates on |
-| `config` | the effective harness config: `omp-arg`, `env`, `brief-extra`, `cap` |
+| `config` | the effective harness config: `omp-arg`, `env`, `brief-extra`, `cap`, `rigor` |
 | `house` | the model package a launch would overlay right now: `$MGR config get house`, else this session's own house; `null` when nothing resolves and `launch` refuses |
+| `rigor` | the effective verification rigor every launch verifies under: `sprint` \| `production`, never `null` — `MGR_RIGOR`, else `$MGR config get rigor`, else `production` (builder.md §7) |
 | `manager` | `{pane_id,tab_id,agent,cwd}` of the live agent whose tab is labelled `manager`, or `null` — the detection key external tooling uses to find the manager tab |
 | `self` | the calling pane (`HERDR_PANE_ID`), or `null` outside a herdr pane |
 | `quota.guard` | `running` \| `stale` \| `stopped` — nothing is reignited and no projection moves unless it is `running` |
@@ -412,12 +414,24 @@ by `-`, e.g. `adopt-w26-p3`.
 
 ### Environment
 
+`rigor` is the verification dial every builder is briefed with (`mgr config set rigor`,
+`MGR_RIGOR`); the contract is `builder.md §7`.
+
+| `rigor` | full suite | focused change | red the diff did not cause | review pass |
+|---|---|---|---|---|
+| `production` (default) | on any shared-surface touch, and always at `large` | its tests and its integration/e2e subset | blocks landing | the surface picks the reviewer; `large` always gets a pass |
+| `sprint` | only when the diff's callers cannot be enumerated | same | recorded as an issue comment naming the failing test; does not block | data-shape, API, schema and routing diffs review on the work rung (`sweep`); auth and permissions keep the top rung; no floor at `large` |
+
+A failure the diff caused blocks in both modes. `tiny` and `small` never run the full suite in
+either.
+
 | Variable | Default | Effect |
 |---|---|---|
 | `MGR_CAP` | `3` | concurrency cap; overrides git `mgr.cap` |
 | `MGR_OMP_ARGS` | unset | whitespace-separated extra omp argv; replaces git `mgr.omp-arg` |
 | `MGR_ENV` | unset | whitespace-separated `KEY=VALUE` for builder tabs; replaces git `mgr.env` |
 | `MGR_BRIEF_EXTRA` | unset | path to a markdown file appended to every brief; overrides git `mgr.brief-extra` |
+| `MGR_RIGOR` | `production` | verification rigor for builders, `sprint`\|`production`; overrides git `mgr.rigor` |
 | `MGR_STATE_DIR` | `~/.local/state/mgr-guard` | the guard's ledger: pid, log, `state.json`, manager registrations |
 | `MGR_GUARD_BIN` | `mgr-guard` next to `mgr` | the guard executable `mgr` shells out to |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |

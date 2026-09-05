@@ -46,9 +46,10 @@ Discover the commands from the repo's `CONTRIBUTING.md`, `docs/ops/conventions.m
 scripts, `justfile`, `Makefile` or the CI workflow. None of those exist → say so explicitly; never
 claim a check passed.
 
-- Typecheck every package you touched; run the tests covering every slice.
-- Full suite ONLY if the diff touches a shared library, a schema, routing, or code whose callers you
-  cannot enumerate.
+- Typecheck every package you touched; run the tests covering every slice and the touched
+  surface's integration or e2e subset (builder.md §7).
+- Full suite only when your rigor and the diff surface call for it (builder.md §7); never for
+  size alone.
 - One review pass over the whole diff; the reviewer and the rung follow the diff surface
   (builder.md §7) — `reviewer` on the top rung, with `security-reviewer` beside it for auth or
   permissions; `sweep` on the work rung; or no pass at all. Fix every finding or decline it with a

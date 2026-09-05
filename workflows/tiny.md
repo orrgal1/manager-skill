@@ -22,8 +22,9 @@ Discover the commands from the repo's `CONTRIBUTING.md`, `docs/ops/conventions.m
 scripts, `justfile`, `Makefile` or CI. None exist → say so; never claim a check passed.
 
 - Docs or copy → run nothing.
-- Code → typecheck the touched package only, plus the one test file covering the changed line.
-- Never at this size: a `reviewer` pass, the full suite, a test file you were not handed by name.
+- Code → typecheck the touched package only, plus the one test file covering the changed line and,
+  when the changed surface has one, its integration or e2e subset (builder.md §7).
+- Never at this size: a `reviewer` pass, the full suite, a test file outside those.
 
 ## Done when
 

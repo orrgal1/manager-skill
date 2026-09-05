@@ -21,16 +21,18 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   brief names the size, and `mgr launch` sends the session to `workflows/<size>.md` — the whole
   build-and-verify process at that size: what may be delegated, which checks run and which never
   do. Every session runs on `--model @builder` with the house's `omp/packages/<house>.yml`
-  overlaid, so the size picks the workflow and the agents slices go to, never the model. A builder
-  that outgrows its size resizes upward itself. Its own context is for orchestration and
+  overlaid, so the size picks the workflow and the agents slices go to, never the model. A
+  builder that outgrows its size resizes upward itself. Its own context is for orchestration and
   integration — scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; `small`
   plans in-session, `tiny` does neither) do the reading and the deciding and return compressed,
-  its own in-session implementation capped by the ceiling in the builder contract (builder.md §7)
-  — and it can delegate the planning without resizing. A fumble trigger (builder.md §7) hands one
-  step to a fresh `crux` agent on the top rung instead, with the size, workflow file and checks
-  unchanged. The review pass follows the same rule: the reviewer and the rung follow the diff
-  surface (builder.md §7) — `reviewer`, with `security-reviewer` beside it for auth or
-  permissions, on the top rung; `sweep`, the same review contract, on the work rung.
+  its own in-session implementation capped by the ceiling in the builder contract (builder.md
+  §7) — and it can delegate the planning without resizing. A fumble trigger (builder.md §7)
+  hands one step to a fresh `crux` agent on the top rung instead, with the size, workflow file
+  and checks unchanged. The review pass follows the same rule: the reviewer and the rung follow
+  the diff surface (builder.md §7) — `reviewer`, with `security-reviewer` beside it for auth or
+  permissions, on the top rung; `sweep`, the same review contract, on the work rung. The full
+  suite follows the diff surface too, gated by a per-repo `rigor` dial (`mgr config set rigor`,
+  `MGR_RIGOR`; default `production`) rather than the size (builder.md §7).
 - **One model package per subscription.** `mgr setup` installs the eight agents (`tiny`, `small`,
   `medium`, `large`, `plan`, `sketch`, `crux`, `sweep`) into the omp agent directory and applies
   `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,
@@ -123,6 +125,7 @@ mgr config add omp-arg --extension
 mgr config add omp-arg /abs/ext.ts
 mgr config add env LINK=ws://127.0.0.1:1234/link
 mgr config set brief-extra /abs/directive.md
+mgr config set rigor sprint
 mgr config list
 ```
 
@@ -360,10 +363,21 @@ sessions. A session that gets it both ways loads it twice and activates it once.
 ## Configuration
 
 The guard is all environment. The per-repo harness config — extra omp args, builder-tab env, an
-extra brief file, the cap — lives in the repo's `.git/config` under `mgr.*` (`mgr config`), and the
-`MGR_*` variables below override it. The guard's integer knobs silently fall back to their default
-when the value is not a positive integer; `MGR_CAP` is stricter — a non-numeric cap is a usage
-error (exit `2`).
+extra brief file, the cap, the rigor — lives in the repo's `.git/config` under `mgr.*` (`mgr
+config`), and the `MGR_*` variables below override it. The guard's integer knobs silently fall
+back to their default when the value is not a positive integer; `MGR_CAP` is stricter — a
+non-numeric cap is a usage error (exit `2`).
+
+`rigor` is the verification dial every builder is briefed with (`mgr config set rigor`,
+`MGR_RIGOR`); the contract is `builder.md §7`.
+
+| `rigor` | full suite | focused change | red the diff did not cause | review pass |
+|---|---|---|---|---|
+| `production` (default) | on any shared-surface touch, and always at `large` | its tests and its integration/e2e subset | blocks landing | the surface picks the reviewer; `large` always gets a pass |
+| `sprint` | only when the diff's callers cannot be enumerated | same | recorded as an issue comment naming the failing test; does not block | data-shape, API, schema and routing diffs review on the work rung (`sweep`); auth and permissions keep the top rung; no floor at `large` |
+
+A failure the diff caused blocks in both modes. `tiny` and `small` never run the full suite in
+either.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -371,6 +385,7 @@ error (exit `2`).
 | `MGR_OMP_ARGS` | unset | whitespace-separated extra omp argv; replaces `mgr.omp-arg` |
 | `MGR_ENV` | unset | whitespace-separated `KEY=VALUE` for builder tabs; replaces `mgr.env` |
 | `MGR_BRIEF_EXTRA` | unset | path to a markdown file appended to every brief; overrides `mgr.brief-extra` |
+| `MGR_RIGOR` | `production` | verification rigor for builders, `sprint`\|`production`; overrides `mgr.rigor` |
 | `MGR_GUARD_BIN` | `mgr-guard` next to `bin/mgr` | the guard executable `mgr` shells out to |
 | `MGR_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/mgr-guard` | the guard's ledger directory |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks (`mgr-guard start --interval S` wins) |
