@@ -1,6 +1,5 @@
 You were sized `large`. If the scope test below fails, resize up (see builder.md §7) and switch files.
-Resize only upward, never down. This file is the whole build-and-verify process at your size, and it
-is the largest there is: there is nowhere left to resize to.
+This is the largest size — there is nothing above it. This file is the whole process at your size.
 
 ## Scope test
 
