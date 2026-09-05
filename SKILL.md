@@ -18,8 +18,9 @@ MGR=~/.claude/skills/manager/bin/mgr   # installed via install.sh
 # or, as a dependency: MGR=node_modules/.bin/mgr
 ```
 
-`$MGR paths` prints the absolute `SKILL.md` / `builder.md` / `mgr` locations, and the briefs `mgr`
-sends to builders already carry those absolute paths — you never spell them out yourself.
+`$MGR paths` prints the absolute `SKILL.md` / `builder.md` / `workflows` / `mgr` locations, and the
+briefs `mgr` sends to builders already carry those absolute paths — you never spell them out
+yourself.
 
 Everything else you run is `gh` (issues) and `herdr agent read` / `herdr agent send-keys`
 (looking at and interrupting a builder). Never `git`, except read-only.
@@ -140,6 +141,21 @@ Blocked by: #12, #15
 Acceptance is the builder's definition of done — write outcomes it can verify, not steps.
 Drop `Blocked by:` when nothing blocks it.
 
+Then **size it**. Exactly one `size:` label, at create time — add `--label size:<size>` to the
+`gh issue create` above. The label decides which workflow file the builder builds under and which
+model it runs on, so it is not optional.
+
+| Label | Touches | Judgement | Examples |
+|---|---|---|---|
+| `size:tiny` | 1 file (2 with its test), ≤ ~30 lines, no behaviour change beyond the literal | none | copy, a constant, a CSS value, a doc line, a config value, a rename inside one file |
+| `size:small` | ≤ 3 files, one concern, existing pattern, callers known | local | a bug with a known cause, a flag, an extra field on an existing path |
+| `size:medium` | several files or packages, one feature or bug, may add a contract or a test, callers enumerable | design within an existing pattern | an endpoint plus its UI, a refactor within a package, a new CLI subcommand |
+| `size:large` | cross-cutting, a new subsystem, a schema / shared lib / routing, callers not enumerable, needs a plan before files | architecture | a feature spanning packages, a migration, a new pipeline |
+
+Unsure → **one size up**: under-sizing costs a botched landing, over-sizing costs one review pass.
+A builder that finds itself under-sized resizes upward on its own and comments
+`builder: resized <from>→<to>` — you never resize an in-flight issue yourself.
+
 ### (c) Policy
 
 Default is auto-merge: the builder lands its own work. If the operator wants to approve, review or
@@ -164,9 +180,10 @@ $MGR launch <N>
 The cap comes from `$MGR config get cap` (or `MGR_CAP`), so it survives the session and every
 worktree — nothing to remember. `--cap N` still overrides it for a single call.
 
-Exit 0 → go to **Waiting** for N. Exit 3 → the refusal message says which precondition failed
-(not open, already labelled, open blockers, no free slot, agent live, worktree exists); explain it
-to the operator and pick the next action.
+Exit 0 → go to **Waiting** for N. Exit 3 → the refusal message says which precondition failed (not
+open, already labelled, open blockers, no free slot, agent live, worktree exists, no `size:` label,
+several `size:` labels); explain it to the operator and pick the next action. The two size refusals
+are fixed with `$MGR size <N> <size>` before relaunching.
 
 Never create a tab, a worktree or a branch by hand, never focus or raise a tab, and never read or
 write inside a builder's worktree.
@@ -220,6 +237,7 @@ Trust the report, not the idle state.
 | approve #N | `$MGR prompt N "Approved. Land it now per the Landing section of builder.md."` then wait |
 | request changes on #N | `$MGR prompt N "Changes requested: <verbatim feedback>"` then wait |
 | cancel #N | `herdr agent send-keys issue-N ctrl+c`, then `$MGR retire N` — add `--close` only if the work is dropped, not deferred |
+| size #N `<size>` / resize #N `<size>` | `$MGR size N <size>` — swaps the `size:` label for the new one. Refused with exit `3` while the issue is `mgr:in-flight`: a live builder resizes itself, upward, and comments when it does. Then `$MGR board` |
 | set the cap to N | `$MGR config set cap N` (persisted in the repo, shared by every worktree), then `$MGR board`. The cap is the only pace dial there is — nothing lowers it behind your back |
 | run builders with extra omp args / env / an extra brief directive | `$MGR config add omp-arg <arg>` (repeat; order kept) / `$MGR config add env KEY=VALUE` / `$MGR config set brief-extra /abs/file.md`. `omp-arg` and `env` reach newly launched builders only; `brief-extra` also reaches adopted ones |
 | show the harness config | `$MGR config list` |
@@ -272,7 +290,8 @@ Trust the report, not the idle state.
 
 | Command | Does |
 |---|---|
-| `$MGR labels` | create/update the three `mgr:` labels; idempotent |
+| `$MGR labels` | create/update the three `mgr:` labels and the four `size:` labels; idempotent |
+| `$MGR size <N> <size>` | swap the issue's `size:` label to `tiny`\|`small`\|`medium`\|`large`; exit `3` while `mgr:in-flight` |
 | `$MGR board [--cap N]` | the whole board: issues joined to live agents, with `overview` embedded at the default limit |
 | `$MGR overview [--json] [--limit N]` | machine-wide — every manager on this machine, which is the subscription's burn: the rendered text block by default, `--json` for the object. `--limit` is how many queued issues are listed after the in-flight ones (default `10`); the simulation always covers the whole queue, only the display is capped |
 | `$MGR launch <N> [--cap N]` | worktree + tab + omp builder + brief + label + comment |
@@ -317,6 +336,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `overview.timeline.beyond` | the queued issues not shown: `count`, how many of those are `blocked`, `last_eta`, `drains_at`; `null` when nothing is hidden |
 | `overview.timeline.drains_at` | machine-wide: the ETA of the last queued issue of any manager (`last_eta` is the same number) |
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
+| `in_flight[].size` `ready[].size` `blocked[].size` `awaiting_approval[].size` | that issue's size from its `size:` label — `tiny` \| `small` \| `medium` \| `large`, or `null` when it has none (`launch` refuses on `null`) |
 
 ### Labels
 
@@ -325,6 +345,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `mgr:in-flight` | a builder is live on it; counts against the cap |
 | `mgr:awaiting-approval` | PR open, waiting on the operator; does not count |
 | `mgr:manual-approve` | policy: the operator lands it. Absent → auto-merge |
+| `size:tiny` `size:small` `size:medium` `size:large` | the builder's workflow file and its model; exactly one per issue |
 
 ### Issue body
 
