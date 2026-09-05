@@ -25,7 +25,7 @@ This file is your complete contract. Follow it in order, top to bottom, until yo
   plans in-session, and reaches for a planner only on a §7 trigger; `medium` and `large` hand the
   plan out by default. What must leave your window is countable, not a matter of taste: the map,
   the plan, implementation past the in-session ceiling, and any step a fumble trigger has caught —
-  the numbers for all of them are in §7.
+  the map is your size file's step 1; the numbers for the other three are in §7.
 - **Your cwd is your worktree.** Every path you read, edit or run is under it — confirm with
   `git worktree list` and `git rev-parse --show-toplevel`.
 - **The primary checkout is read-only and shared.** Prohibited there without exception: any edit or
@@ -167,9 +167,9 @@ gh issue comment <N> --body "builder: delegated planning to <planner> · <which 
 ```
 
 **Resize upward** — the other dial: it changes the verification burden — which checks run, whether
-a `reviewer` pass happens — and it is upward only, never down. The moment the work fails your size
-file's scope test, or hits one of its budget signals, switch up — before you build more, not in the
-report:
+a `reviewer` pass happens — and it is upward only, never down. Your branch, your worktree and your
+issue do not change. The moment the work fails your size file's scope test, or hits one of its
+budget signals, switch up — before you build more, not in the report:
 
 ```bash
 gh issue comment <N> --body "builder: resized <from>→<to>"
@@ -188,12 +188,14 @@ escalating the default action, not an option:
 
 - 3 consecutive failed tool calls;
 - the same check or test failing twice;
-- the same file edited 3 times without its check going green;
+- the same file edited 3 times while its check stays red;
 - any check re-run with no intervening change;
-- 3 consecutive edits that do not reduce the failure.
+- 3 consecutive edits after which the check fails with no fewer errors than before.
 
 You count these; you do not judge them. The counts are per step, and what `crux` returns resets
-them — that is a different step. Then post the marker:
+them — that is a different step. A review finding you intend to decline is a sixth cause,
+uncounted — escalate it directly and name it as such in the marker's `<which trigger>`. A resize
+does not reset the counts either. Then post the marker:
 
 ```bash
 gh issue comment <N> --body "builder: escalated <what> · <which trigger>"
@@ -210,6 +212,8 @@ issue**. Cross either and the remainder goes to a size-matched slice agent with 
 — the files, the approach, and the checks it must leave green — while you go back to integrating.
 Crossing the ceiling is neither a resize nor an escalation: same size, same workflow file, same
 checks. The count is per issue and covers only edits you make yourself; a resize does not reset it.
+Closing the seams between returned slices, and resolving §10's merge conflicts, is integration, not
+implementation, and does not count against it.
 
 `tiny` is exempt entirely — it edits its one file in-session and stays that way. `small` implements
 in-session by design, and the ceiling is the only thing that makes it fan out.

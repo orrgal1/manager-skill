@@ -1,8 +1,8 @@
 # Agent package: OpenAI subscription. Apply with: mgr package openai
 # Rungs: Astra (top) > Sol (work) > Terra (mid) > Luna (bottom).
-# plan (deep, for large builders), review and crux (the fumble target: a fresh
-# executor for a step a builder has failed) take the top rung;
-# sketch (light, for medium builders and small escalations) sits with
+# Top rung: plan (deep, for large builders), review, and crux (the fumble
+# target: a fresh executor for a step a builder has failed);
+# sketch (light, for medium builders and small planning triggers) sits with
 # default/builder/large/medium on the work rung; small and smol (scouts feed the plan)
 # the mid rung; tiny (omp's own role) and commit the bottom rung at low.
 # Effort: high for everything that writes or decides code, medium for the roles

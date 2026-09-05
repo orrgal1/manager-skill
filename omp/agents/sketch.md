@@ -1,6 +1,6 @@
 ---
 name: sketch
-description: Light planner - the plan agent's contract at the work rung, for medium builders and small escalations; writes no code.
+description: Light planner - the plan agent's contract at the work rung, for medium builders and small planning triggers; writes no code.
 model: "@sketch"
 thinkingLevel: high
 spawns: "scout"

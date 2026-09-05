@@ -28,9 +28,9 @@ Any of these true → this is your file. Do not resize down: work already sized 
    is wrong, then post or state it.
 3. **Execute** — independent slices in ONE parallel batch to the size-matched agent (`tiny`,
    `small`, `medium`); dependent waves in dependency order, one wave at a time. Subagents run no
-   suites. You integrate after each wave and commit.
-4. **Integrate** — typecheck everything touched; run the covering tests for every slice; your own
-   edits here stay within the ceiling (builder.md §7).
+   suites. You integrate after each wave and commit; anything you would type yourself rather than
+   dispatch falls under the ceiling (builder.md §7).
+4. **Integrate** — typecheck everything touched; run the covering tests for every slice.
 5. **Review** — one `reviewer` pass over the whole diff against acceptance, design and risk.
    Summarise the findings where the work is tracked.
 6. **Fix round** — at least one, always. Every finding is fixed or explicitly declined with a

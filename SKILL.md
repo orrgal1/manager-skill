@@ -181,17 +181,18 @@ A builder that finds itself under-sized resizes upward on its own and comments
 
 The size also decides where the thinking happens. A builder's own context is for orchestration and
 integration: scouts map the code, its size's planner — `sketch` at `medium`, `plan` at `large` —
-decides the approach, and both return compressed; the builder reads code when it integrates. `tiny`
-is the one exemption and stays in-session; `small` maps with a scout but plans in-session unless a
-trigger fires. A builder that finds real meat in a correctly-sized issue has a cheaper move than
-resizing: it delegates the planning to its size's planner (`sketch` at `small` too), keeps its size,
-workflow file and checks, and comments `builder: delegated planning to <planner> · <which trigger>`.
-A builder that hits a fumble trigger (builder.md §7) hands that one step to a fresh `crux` agent on
-the top rung instead — its size label, workflow file and verification set do not change, and the
-marker it posts, `builder: escalated <what> · <which trigger>`, is your only visibility into it and
-needs no action. Every escalation posts one for the same reason: so the fumble rate becomes
-something you can measure, not something you have to guess at. None of the three comments needs
-anything from you.
+decides the approach, and both return compressed; the builder reads code when it integrates.
+`tiny` is the one exemption and stays in-session; `small` maps with a scout but plans in-session
+unless a trigger fires, and in-session implementation is bounded by the ceiling in the builder
+contract (builder.md §7). A builder that finds real meat in a correctly-sized issue has a cheaper
+move than resizing: it delegates the planning to its size's planner (`sketch` at `small` too),
+keeps its size, workflow file and checks, and comments `builder: delegated planning to <planner> ·
+<which trigger>`. A builder that hits a fumble trigger (builder.md §7) hands that one step to a
+fresh `crux` agent on the top rung instead — its size label, workflow file and verification set do
+not change, and the marker it posts, `builder: escalated <what> · <which trigger>`, is your only
+visibility into it and needs no action. Every escalation posts one for the same reason: so the
+fumble rate becomes something you can measure, not something you have to guess at. None of the
+three comments needs anything from you.
 
 ### (c) Policy
 

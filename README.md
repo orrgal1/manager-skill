@@ -17,16 +17,18 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 - **One builder per issue**, in a [herdr](https://herdr.dev) tab named `#N <slug>`, on branch
   `issue-N-<slug>`, in worktree `<repo>-issue-N-<slug>`. The primary checkout stays clean.
 - **Every issue is sized.** Intake puts exactly one `size:tiny` / `size:small` / `size:medium` /
-  `size:large` label on the issue (`mgr size N <size>` changes one that is not in flight), the brief
-  names the size, and `mgr launch` sends the session to `workflows/<size>.md` — the whole
+  `size:large` label on the issue (`mgr size N <size>` changes one that is not in flight), the
+  brief names the size, and `mgr launch` sends the session to `workflows/<size>.md` — the whole
   build-and-verify process at that size: what may be delegated, which checks run and which never
-  do. Every session runs on `--model @builder` with the house's `omp/packages/<house>.yml` overlaid,
-  so the size picks the workflow and the agents slices go to, never the model. A builder that
-  outgrows its size resizes upward itself. Its own context is for orchestration and integration —
-  scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; `small` plans in-session,
-  `tiny` does neither) do the reading and the deciding and return compressed — and it can delegate
-  the planning without resizing. A fumble trigger (builder.md §7) hands one step to a fresh `crux`
-  agent on the top rung instead, with the size, workflow file and checks unchanged.
+  do. Every session runs on `--model @builder` with the house's `omp/packages/<house>.yml`
+  overlaid, so the size picks the workflow and the agents slices go to, never the model. A builder
+  that outgrows its size resizes upward itself. Its own context is for orchestration and
+  integration — scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; `small`
+  plans in-session, `tiny` does neither) do the reading and the deciding and return compressed,
+  its own in-session implementation capped by the ceiling in the builder contract (builder.md §7)
+  — and it can delegate the planning without resizing. A fumble trigger (builder.md §7) hands one
+  step to a fresh `crux` agent on the top rung instead, with the size, workflow file and checks
+  unchanged.
 - **One model package per subscription.** `mgr setup` installs the seven agents (`tiny`, `small`,
   `medium`, `large`, `plan`, `sketch`, `crux`) into the omp agent directory and applies
   `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,
