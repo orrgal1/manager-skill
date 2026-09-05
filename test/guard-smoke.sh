@@ -1418,7 +1418,7 @@ assert_jq "(v) once polled again a failing fetch just holds (not the not-polled 
   '.providers.anthropic.reason | startswith("unknown: holding last verdict")'
 # tick4: the reset has now passed, still no usage -- the reignite must fire, and it must
 # name anthropic:5h, not the bare word "quota"
-ST_V4="$(MGR_STATE_DIR="$SD_V" MGR_GUARD_NOW_MS=$(( T0 + 1801000 )) "$GUARD" tick)"
+MGR_STATE_DIR="$SD_V" MGR_GUARD_NOW_MS=$(( T0 + 1801000 )) "$GUARD" tick >/dev/null
 assert_eq "(v) exactly one reignite prompt fires at the reset" 1 "$(lines_of "$FAKE_PROMPTS")"
 EXP_V="mgr-guard: anthropic:5h reset at $(iso_of "$RECOV_V") has passed (no fresh usage reading)"
 case "$(cut -f2 <"$FAKE_PROMPTS")" in

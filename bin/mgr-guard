@@ -454,7 +454,18 @@ JQ_OVERVIEW='
       then (((($now + ((1 - .used) / .burn_per_hour * 3600000)) | round) as $e
              | if .resets_at == null then $e else ([$e, .resets_at] | min) end))
       else null end)}]) as $limits
-| ([$limits[] | select((.exhaust_at != null) and (.resets_at != null) and (.resets_at > $now))]) as $stalling
+| ([$limits[] | select((.exhaust_at != null) and (.resets_at != null) and (.resets_at > $now))]) as $sampled
+# a held verdict carries no limits on purpose, but the provider it names is still dead until
+# its reset: with no window of its own the manager on it would project straight through a
+# stall this same state calls exhausted. Synthesise one from the verdict — burn.limits is
+# untouched, so the board still renders no quota reading yet. Sampled rows stay first, so a
+# real limit wins any tie for the same provider.
+| ([($st.providers // {}) | to_entries[]
+    | select((.value.status == "exhausted") and ((.value.recovers_at // null) != null)
+             and ($now < .value.recovers_at))
+    | {id: (.value.exhausted_limit // null), provider: .key,
+       exhaust_at: $now, resets_at: .value.recovers_at}]) as $held
+| (($sampled + $held)) as $stalling
 | ($stalling | sort_by(.exhaust_at) | first) as $worst
 | (if $worst == null then null
    else {from: $worst.exhaust_at, to: $worst.resets_at, limit: $worst.id} end) as $win
@@ -495,8 +506,10 @@ def sim($m):
     # a manager that names a provider is stalled only by that subscription: its own window,
     # null when that provider has none, never a foreign reset it cannot spend against. One
     # that names none is on no subscription in particular, so it keeps the machine-wide
-    # window — the same fallback the text quota line makes for an unresolvable caller
-    | (if (($m.provider // "") == "") then $win
+    # window — the same fallback the text quota line makes for an unresolvable caller.
+    # The type test is load-bearing: a state written before register validated the key can
+    # carry a number or an array here, and indexing $wins with one aborts the whole program
+    | (if (($m.provider | type) != "string") or ($m.provider == "") then $win
        else ($wins[$m.provider] // null) end) as $mwin
     | ([($b.in_flight // [])[]
         | (.launched_at // null) as $la
@@ -872,7 +885,7 @@ cmd_register() {
   local input="${1:-}"
   [ -n "$input" ] || die 2 "usage: mgr-guard register '<json>'"
   ensure_state_dir
-  local obj missing badnum mid now out
+  local obj missing badnum badid mid now out
   obj=$(jq -c 'select(type == "object")' <<<"$input" 2>/dev/null) || die 2 "register: argument is not valid JSON"
   [ -n "$obj" ] || die 2 "register: argument must be a JSON object"
   missing=$(jq -nr --argjson o "$obj" \
@@ -882,6 +895,17 @@ cmd_register() {
   badnum=$(jq -nr --argjson o "$obj" \
     '["cap","in_flight","adopting","ready"] | map(select(($o[.] | type) != "number")) | join(",")')
   [ -z "$badnum" ] || die 2 "register: not numbers: $badnum"
+  # house/provider come from the callers house resolution and stay optional: an older `mgr`
+  # sends neither key, and the current one sends provider: null when the house cannot be
+  # resolved. A value that is there is an id though, and the projection indexes providers by
+  # it — a number or an array here used to abort `overview` for every manager on the machine
+  badid=$(jq -nr --argjson o "$obj" \
+    '["house","provider"]
+     | map(select((($o[.] | type) != "null")
+                  and (if ($o[.] | type) != "string" then true
+                       else ($o[.] | test("^[A-Za-z0-9._:-]+$") | not) end)))
+     | join(",")')
+  [ -z "$badid" ] || die 2 "register: must match [A-Za-z0-9._:-]+ : $badid"
   mid=$(jq -r '.manager_id' <<<"$obj")
   case "$mid" in
     ''|*[!A-Za-z0-9_.:-]*) die 2 "register: manager_id must match [A-Za-z0-9_.:-]+ : $mid";;
@@ -929,17 +953,19 @@ cmd_tick() {
   managers=$(managers_json)
 
   # the poll set is every provider a live manager or a stalled pane actually needs sampled —
-  # never a single machine-wide default; builder_provider() only fills in when that's empty
+  # never a single machine-wide default; builder_provider() only fills in when that is empty.
+  # The charset gate covers every branch, the fallback included: whatever a manager filed, a
+  # session line reported or omp config named, only an id ever reaches `omp usage`
   providers=$(jq -r --arg bp "$bp" --argjson managers "$managers" --argjson panes "$panes" \
-    '([$managers[] | select((.pane_id // "") | IN($panes[])) | .provider
-         | select(type == "string" and test("^[A-Za-z0-9._:-]+$"))]
-       + [.[] | select(.stall != null) | (.stall.provider // empty)])
-      | unique
-      | if length == 0 then [$bp] else . end
-      | .[]' <<<"$facts")
+    'def usable: select(type == "string" and test("^[A-Za-z0-9._:-]+$"));
+     (([$managers[] | select((.pane_id // "") | IN($panes[])) | .provider]
+        + [.[] | select(.stall != null) | (.stall.provider // empty)])
+      | map(usable) | unique) as $set
+     | (if ($set | length) == 0 then ([$bp] | map(usable)) else $set end)
+     | .[]' <<<"$facts")
 
-  # cmd_register takes the registration as filed, so the provider is whatever a manager wrote:
-  # read it a line at a time, never as an unquoted word list a glob could multiply
+  # the gate above is the only door, so nothing carrying a glob character or a newline can
+  # reach here: read it a line at a time all the same, never as an unquoted word list
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     rep=$(fetch_provider "$p" "$prev")

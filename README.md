@@ -349,9 +349,26 @@ quota resumes at the reset instead of finishing through it. A manager with no re
 falls back to the machine-wide earliest-exhausting limit across every polled provider, the same
 fallback the text `quota` line already makes for an unresolvable caller. Each manager's own window
 rides along as `overview.backlog.managers[].stall_window` (`{from,to,limit}`, `null` when nothing
-stalls it); `overview.burn.stall_window` stays the machine-wide record — unchanged in shape or
-meaning, and still what `mgr guard status` and other tooling read — even though each manager's own
-ETAs no longer use it directly.
+stalls it) — a provider currently held on a stripped verdict (see **Quota guard**) synthesizes one
+too, `{from: now, to: recovers_at, limit: exhausted_limit}`, `limit: null` when the held verdict
+never named one, which `next` then marks as `(after the quota reset)`; `overview.burn.stall_window`
+stays the machine-wide record — unchanged in shape or meaning, folding in the same held providers,
+and still what `mgr guard status` and other tooling read — even though each manager's own ETAs no
+longer use it directly.
+The `quota` line and the `work`/`next` lines are scoped to two different providers on
+purpose. `quota` resolves the caller's house **fresh at render time** — whatever `$MGR config
+get house` or this session's own house says right now. `work` and `next` project against the
+window of the provider on **the registration the guard last saw** for this manager
+(`overview.backlog.managers[].stall_window`), because those ETAs were simulated against that
+registration and the window has to follow the same subscription the simulation used, not
+whatever the caller resolves to a moment later. For up to one guard tick after `mgr config set
+house`, or when `mgr overview` runs under a different `MGR_HOUSE` than the last `mgr board`
+registered, the two can disagree — the `quota` line can name a limit the `work`/`next` ETAs do
+not yet account for. It is self-healing: the next heartbeat re-registers the new provider and
+the ETAs catch up. A held provider splits the same two lines on purpose too, even with no house
+change at all: `quota.limits` for it is `[]` (a hold carries no fresh reading, so `quota` reads
+`no quota reading yet`), while `work`/`next` still mark the synthesized reset above — both
+readings are correct for what each line promises.
 `idle_slots` are free slots with nothing ready to fill them, and `starves_at` is when a manager's
 queue empties while it still has slots: that is the "work for the next ~3h, then it idles" reading
 behind `work`'s own `out of work in …`.
