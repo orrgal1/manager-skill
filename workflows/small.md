@@ -21,8 +21,10 @@ failure resizes at every setting.
 
 1. Map first. Dispatch one `scout` for the map — where the change goes, with `file:line` refs —
    and implement from it; skip it only when the issue Notes already name the exact files and
-   lines. No planner by default at this size: a planning trigger (builder.md §7) is the only way
-   you get one, and it is `sketch`.
+   lines, or an `### Intake map` in the Notes does. That map is evidence, not a contract: where it
+   disagrees with the code the code wins, and you say so on the issue. Covering only part of the
+   change, it narrows your scout to the rest rather than retiring it. No planner by default at
+   this size: a planning trigger (builder.md §7) is the only way you get one, and it is `sketch`.
 2. Implement in-session, within the ceiling (builder.md §7) — crossing it fans the remainder out,
    and nothing else does.
 3. Add or update the covering test only if an observable contract changed. No tests for plumbing.

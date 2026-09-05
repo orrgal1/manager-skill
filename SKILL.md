@@ -158,11 +158,38 @@ What and why, in the operator's terms.
 ## Notes
 Constraints, files, prior art, decisions already made.
 
+### Intake map
+Where this lands, from a read-only scout at intake — evidence, not a contract. Wrong on a detail →
+follow the code and say so on the issue.
+- `path/to/file.ts:120-160` — what is there, why it is in scope
+- callers: <roughly how many; enumerable or not> · crosses: <schema / shared lib / routing, or none>
+- slices: <roughly how many independent pieces> · pattern: <the existing one that covers it, or none>
+
 Blocked by: #12, #15
 ```
 
 Acceptance is the builder's definition of done — write outcomes it can verify, not steps.
 Drop `Blocked by:` when nothing blocks it.
+
+**Explore before you size, and not in your own context.** Dispatch one read-only `scout` and size
+from what it returns — you do not read repo files to size an issue; intake is bound by the same
+orchestration principle the builder is (builder.md §1). Skip the scout in two cases and only these
+two: the request is obviously `size:tiny` under the table below — one file, ≤ ~30 lines, no
+behaviour change beyond the literal — or the operator named the files the change lives in.
+Anything else gets exactly one scout, and it runs before the `gh issue create` above fires: the
+label and the map both land at create time.
+
+Ask it the table's own questions, so what comes back maps onto a row — which files and areas the
+change touches, with `file:line` refs; whether the callers are enumerable and roughly how many;
+whether it crosses a schema, a shared library or routing; roughly how many independent slices it
+falls into; whether an existing pattern in the repo already covers it. Cap it in the brief: a
+compressed map with `file:line` refs, not a survey, and nothing about how to build the thing — the
+approach belongs to the builder's planner, not to intake. **The scout returns evidence; you return
+the size.** It never names a label, and a map that smells `medium` decides nothing on its own: the
+table, the bias and the tie-break below are still yours.
+
+Paste that map into the body's `## Notes` under `### Intake map`, that heading verbatim — the
+builder's own step 1 reads it there and narrows or skips its scouting against it.
 
 Then **size it**. Exactly one `size:` label, at create time — add `--label size:<size>` to the
 `gh issue create` above. The label decides which workflow file the builder builds under, and the
@@ -428,7 +455,8 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 
 ### Issue body
 
-`## Summary`, `## Acceptance` (checkboxes), `## Notes`, optional `Blocked by: #12, #15`.
+`## Summary`, `## Acceptance` (checkboxes), `## Notes` — carrying `### Intake map` when intake
+ran a scout (§3(b)) — optional `Blocked by: #12, #15`.
 Only **open** referenced issues block.
 
 ### Naming
