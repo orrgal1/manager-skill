@@ -1013,17 +1013,19 @@ cmd_board() {
 
 # ---------------------------------------------------------------- overview
 
-# The rendered block: five lines — four when nothing is hidden — each label
-# padded to 9 columns, with `next` wrapped greedily at 100 columns and never
-# more than three physical lines. Times are HH:MM in the operator's zone (UTC
-# with a `Z` when TZ is unset) and carry the weekday when they are not today's;
-# durations are rounded to 5 minutes; `~` marks every number that came from an
-# estimate rather than a measurement.
+# The rendered block: `quota`, `work`, `next` — each label padded to 9 columns,
+# 2 to 4 physical lines total, no line over 120 columns. `quota` is
+# machine-wide (one subscription): the worst limit gets a full sentence,
+# the rest a short one, plus a `shared with N other projects` tail
+# acknowledging other managers without naming them. `work` and `next` are
+# scoped to the calling repo only — how many builders are running against
+# the cap, the queue counts, when a slot frees up or the queue clears, then
+# the in-flight/queued issues themselves with their ETAs, wrapped at most
+# one continuation line and capped with `+N more`. Times read `in 2h
+# (14:00Z)` or a plain `15m left`; `~` marks a number built on an estimated
+# task duration rather than a measurement.
 JQ_RENDER_OVERVIEW='
 def pad9: (. + "         ") | .[0:9];
-def dec1: (. * 10 | round) as $c | "\($c / 10 | floor).\($c % 10)";
-def dec2: (. * 100 | round) as $c |
-  "\($c / 100 | floor)." + (($c % 100) | if . < 10 then "0\(.)" else "\(.)" end);
 def fmt($ms; $f):
   ($ms / 1000 | floor) as $s
   | if $tz_set then ($s | strflocaltime($f)) else ($s | gmtime | strftime($f)) end;
@@ -1044,87 +1046,204 @@ def D($ms; $est):
             + ((($r % 3600) / 60 | floor) | if . < 10 then "0\(.)" else "\(.)" end)
        else "\($r / 60 | floor)m" end)
   end;
-def shortname: if . == null or . == "" then "" else (split("/") | last) end;
-def mname: if (.repo // "") == "" then (.manager_id // "?") else (.repo | shortname) end;
-def burnline:
-  ((.burn.limits // [])
-   | [ foreach .[] as $l ([]; . + [$l.provider // ""];
-       (if (.[0:(length - 1)] | index($l.provider // "")) == null then ($l.id // "")
-        else (($l.id // "") | ltrimstr(($l.provider // "") + ":")) end)
-       + " \((($l.used // 0) * 100 | round))% @\((($l.burn_per_hour // 0) | dec2))/h"
-       + " → \((($l.projected_at_reset // 0) | dec1))× by \(T($l.resets_at; false))"
-       + (if $l.exhaust_at == null then ""
-          else " (exhausts \(T($l.exhaust_at; true)), stalls "
-               + (if $l.resets_at == null then "—"
-                  else D($l.resets_at - $l.exhaust_at; false) end) + ")" end) ) ]
-   | join(" · ")) as $s
-  | if $s == "" then "no reading" else $s end;
-def backlogline:
-  .backlog.totals as $t
-  | ([.backlog.managers[] | select((.idle_slots // 0) > 0) | mname] | join(", ")) as $idle
-  | ([.backlog.managers[] | select(.starves_at != null)
-      | mname as $n
-      | if .starves_at <= $now then "\($n) starves NOW"
-        else "\($n) in \(D(.starves_at - $now; (.throughput.estimated // false)))" end]
-     | join(", ")) as $starve
-  | "open \($t.open // 0) · ready \($t.ready // 0) · blocked \($t.blocked // 0)"
-    + " · in flight \($t.in_flight // 0)/\($t.cap // 0) slots · idle \($t.idle_slots // 0)"
-    + (if $idle == "" then "" else " (\($idle))" end)
-    + (if $starve == "" then "" else " — \($starve)" end);
-def nextitems:
-  .burn.stall_window as $w
-  | (.timeline.shown // []) as $S
-  | (if $w == null then null
-     else ([range(0; $S | length) as $i
-            | select(($S[$i].eta // null) != null and $S[$i].eta >= $w.to)
-            | $i] | .[0] // null)
-     end) as $mark
-  | [ range(0; $S | length) as $i
-      | $S[$i] as $it
-      | (if ($it.repo // "") == "" or ($it.repo // "") == $repo then ""
-         else ($it.repo | shortname) end)
-        + "#\($it.number)"
-        + (if $it.state == "in_flight" then " in flight" else "" end)
-        + ([($it.blocked_by // [])[] | " ⊘#\(.)"] | join(""))
-        + " → \(T($it.eta; ($it.estimated // false)))"
-        + (if $mark != null and $i == $mark
-           then " (after \($w.limit | split(":") | last) reset)" else "" end) ];
-def beyondline:
-  .timeline.beyond as $b
-  | (.timeline.shown // []) as $S
-  | ([.backlog.managers[] | . as $m
-      | {hidden: ((($m.ready // 0) + ($m.blocked // 0))
-                  - ([$S[] | select(.manager_id == $m.manager_id and .state != "in_flight")]
-                     | length)),
-         name: mname, tp: ($m.throughput // {})}]
-     | map(select(.hidden > 0)) | sort_by([- .hidden, .name]) | .[0]) as $top
-  | ($top.tp // {}) as $tp
-  | (if $tp.estimated == null then true else $tp.estimated end) as $est
-  | "+\($b.count // 0) queued (\($b.blocked // 0) blocked), last \(T($b.last_eta; $est))"
-    + " · \(D((($tp.median_s // 0) * 1000); $est))/task (n=\($tp.n // 0))";
-def drainsline:
-  ([.backlog.managers[] | {name: mname, at: .backlog_drains_at}] | sort_by(.name)) as $ms
-  | if ($ms | length) == 0 then "no managers"
-    else [$ms[] | "\(.name) \(T(.at; false))"] | join(" · ") end;
-def wrapnext($items):
-  reduce $items[] as $it ({lines: [], cur: ("next" | pad9), n: 0, done: false};
-    if .done then .
-    else (if .n == 0 then .cur + $it else .cur + " · " + $it end) as $try
-    | if (.n == 0) or (($try | length) <= 100) then (.cur = $try | .n = (.n + 1))
-      elif (.lines | length) >= 2 then (.done = true)
-      else (.lines = (.lines + [.cur]) | .cur = ("         " + $it) | .n = 1)
+def WHEN($ms; $est):
+  if $ms == null then "unknown"
+  elif $ms <= $now then "now"
+  else "in " + D($ms - $now; $est) + " (" + T($ms; false) + ")"
+  end;
+def windowname($tok):
+  if $tok == "5h" then "5-hour"
+  elif ($tok == "week" or $tok == "weekly" or $tok == "7d") then "weekly"
+  elif ($tok == "1d" or $tok == "day" or $tok == "24h") then "daily"
+  elif $tok == "1h" then "hourly"
+  elif ($tok | test("^[0-9]+h$")) then "\($tok | rtrimstr("h"))-hour"
+  elif ($tok | test("^[0-9]+d$")) then "\($tok | rtrimstr("d"))-day"
+  else $tok
+  end;
+def limitname($id; $provider):
+  ($id // "") as $raw
+  | if $raw == "" then "quota"
+    else ($raw | split(":")) as $segs
+    | (if ($segs | length) > 1 and ($provider == null or $segs[0] == $provider)
+       then $segs[1:] else $segs end) as $rest
+    | (windowname($rest[0])) as $head
+    | (if ($rest | length) > 1 then $head + " (" + ($rest[1:] | join(":")) + ")" else $head end)
+    end;
+# greedy width-aware joiner: always takes the first item even if over-long,
+# joins with " · ", spills onto one continuation line when $allowCont == 1,
+# and reserves 12 columns on the final permitted line for a possible
+# " · +N more" once no further continuation is allowed.
+def fititems($items; $allowCont; $showMore; $extra):
+  ($items | length) as $total
+  | if $total == 0 then []
+    else
+    ( reduce range(0; $total) as $i
+        ( {lines: [[]], li: 0, shown: 0, contsUsed: 0, stopped: false};
+          if .stopped then .
+          else
+            ($items[$i]) as $it
+            | ((.lines[.li] | length) == 0) as $isFirstOnLine
+            | (.contsUsed == $allowCont) as $isLastLine
+            | (($total - $i - 1) > 0) as $itemsAfter
+            | if $isFirstOnLine then
+                (.lines[.li] = [$it] | .shown = (.shown + 1))
+              else
+                (.lines[.li] + [$it] | join(" · ")) as $cand
+                | (if ($isLastLine and $itemsAfter) then 12 else 0 end) as $reserve
+                | (111 - $reserve) as $lim
+                | if ($cand | length) <= $lim then
+                    (.lines[.li] = (.lines[.li] + [$it]) | .shown = (.shown + 1))
+                  elif (.contsUsed < $allowCont) then
+                    (.lines = (.lines + [[$it]]) | .li = (.li + 1) | .contsUsed = (.contsUsed + 1) | .shown = (.shown + 1))
+                  else
+                    (.stopped = true)
+                  end
+              end
+          end)
+    ) as $st
+    | ($total - $st.shown) as $dropped
+    | ($extra + $dropped) as $more
+    | ($st.lines | map(join(" · "))) as $lineTexts
+    | if $showMore and $more > 0 then
+        ($lineTexts | .[length-1] |= (. + " · +\($more) more"))
+      else $lineTexts
       end
-    end)
-  | (if .done then (.lines + [.cur + " · …"]) else (.lines + [.cur]) end)
-  | join("\n");
-[ ("burn" | pad9) + burnline,
-  ("backlog" | pad9) + backlogline,
-  (nextitems as $items
-   | if ($items | length) == 0 then ("next" | pad9) + "nothing queued"
-     else wrapnext($items) end),
-  (if .timeline.beyond == null then empty else ("beyond" | pad9) + beyondline end),
-  ("drains" | pad9) + drainsline ]
-| join("\n")'
+    end;
+def buildlines($label; $lines):
+  if ($lines | length) == 0 then empty
+  else
+    ([ ($label|pad9) + $lines[0] ] + [ $lines[1:][] | ("         " + .) ]) | join("\n")
+  end;
+def runoutclause($l):
+  if ($l.exhaust_at // null) == null then null
+  else "runs out " + (if $l.exhaust_at <= $now then "already out" else "in " + D($l.exhaust_at - $now; true) end)
+  end;
+def limitfull($l):
+  (limitname($l.id; $l.provider)) as $name
+  | (($l.used // 0)*100 | round) as $pct
+  | if ($l.fits == false) then
+      (runoutclause($l)) as $ro
+      | if $ro != null then
+          "\($name) \($pct)% used, \($ro)" + (if $l.resets_at == null then "" else ", resets " + WHEN($l.resets_at; false) end)
+        else
+          if $l.resets_at == null then "\($name) \($pct)% used"
+          else "\($name) \($pct)% used, resets " + WHEN($l.resets_at; false) end
+        end
+    else
+      if $l.resets_at == null then "\($name) \($pct)% used"
+      else "\($name) \($pct)% used, on pace until reset " + WHEN($l.resets_at; false) end
+    end;
+def limitshort($l):
+  (limitname($l.id; $l.provider)) as $name
+  | (($l.used // 0)*100 | round) as $pct
+  | "\($name) \($pct)% used"
+  + (if ($l.fits == false) and $l.exhaust_at != null then ", " + runoutclause($l) else "" end);
+def quotaline:
+  (.burn.limits // []) as $L
+  | if ($L|length) == 0 then ("quota" | pad9) + "no quota reading yet"
+    else
+      ($L | sort_by([ (if .fits == false then 0 else 1 end),
+                      (if .fits == false then (.exhaust_at // 9223372036854775807) else -((.used // 0)) end) ]))
+       as $sorted
+      | ([ limitfull($sorted[0]) ] + [ $sorted[1:][] | limitshort(.) ]) as $items
+      | (fititems($items; 0; true; 0)) as $lines
+      | (("quota"|pad9) + $lines[0]) as $base
+      | ( if ($repo // "") == "" then 0
+          else ([.backlog.managers[] | select((.repo // "") != $repo)] | length)
+          end ) as $k
+      | (if $k > 0 then " · shared with \($k) other project" + (if $k == 1 then "" else "s" end) else "" end) as $tail
+      | if $tail != "" and (($base + $tail) | length) <= 120 then $base + $tail else $base end
+    end;
+def ownrow:
+  (.backlog.managers // []) as $M
+  | ([ $M[] | select((.repo // "") == $repo) ] | .[0]) as $m
+  | $m;
+def workline:
+  if ($repo // "") == "" then ("work"|pad9) + "not inside a repo, so there is no queue to show"
+  else
+    ownrow as $m
+    | if $m == null then ("work"|pad9) + "this repo is not registered with the guard"
+      else
+        ($m.in_flight // 0) as $inf | ($m.ready // 0) as $rd
+        | ($m.blocked // 0) as $bl | ($m.awaiting_approval // 0) as $aa
+        | if ($inf + $rd + $bl + $aa) == 0 then ("work"|pad9) + "nothing running, nothing queued"
+          else
+            ( (if ($m.cap // 0) > 0 then "\($inf) of \($m.cap) builders running"
+               else (if $inf == 1 then "1 builder running" else "\($inf) builders running" end) end)
+              + (if $rd > 0 then ", \($rd) ready" else "" end)
+              + (if $bl > 0 then ", \($bl) blocked" else "" end)
+              + (if $aa > 0 then ", \($aa) waiting for approval" else "" end)
+            ) as $item1
+            | ( if ($m.idle_slots // 0) > 0 then
+                  "\($m.idle_slots) free slot" + (if $m.idle_slots == 1 then "" else "s" end) + ", nothing ready to launch"
+                elif ($m.starves_at // null) != null then
+                  "out of work " + WHEN($m.starves_at; ($m.throughput.estimated // false))
+                else null end
+            ) as $item2
+            | ( if ($m.backlog_drains_at // null) != null then
+                  "queue clear " + WHEN($m.backlog_drains_at; ($m.throughput.estimated // false))
+                else null end
+            ) as $item3
+            | ([$item1] + (if $item2 != null then [$item2] else [] end) + (if $item3 != null then [$item3] else [] end)) as $items
+            | (fititems($items; 0; false; 0)) as $lines
+            | ("work"|pad9) + $lines[0]
+          end
+      end
+  end;
+def stallmark($items; $sw):
+  if $sw == null then null
+  else ([range(0; $items|length) as $i
+         | select(($items[$i].eta // null) != null and $items[$i].eta >= $sw.to)
+         | $i] | .[0] // null)
+  end;
+def nextitemtext($it; $isMark; $sw):
+  ( if $it.state == "in_flight" then
+      if ($it.eta // null) == null then "#\($it.number) running"
+      elif $it.eta <= $now then "#\($it.number) running, due now"
+      else "#\($it.number) running, " + D($it.eta - $now; ($it.estimated // false)) + " left"
+      end
+    else
+      if ($it.eta // null) == null then "#\($it.number) no ETA yet"
+      elif $it.eta <= $now then "#\($it.number) due now"
+      else "#\($it.number) in " + D($it.eta - $now; ($it.estimated // false))
+      end
+    end
+  ) as $base
+  | ( if $it.state != "in_flight" and (($it.blocked_by // []) | length) > 0 then
+        " (needs " + (($it.blocked_by // []) | map("#\(.)") | join(", ")) + ")"
+      else "" end
+  ) as $needs
+  | ( if $isMark then " (after the " + limitname($sw.limit; null) + " reset)" else "" end
+  ) as $mark
+  | $base + $needs + $mark;
+def nextline:
+  if ($repo // "") == "" then empty
+  else
+    ownrow as $m
+    | if $m == null then empty
+      else
+        ($m.in_flight // 0) as $inf | ($m.ready // 0) as $rd
+        | ($m.blocked // 0) as $bl | ($m.awaiting_approval // 0) as $aa
+        | if ($inf + $rd + $bl + $aa) == 0 then empty
+          else
+            (.timeline.shown // []) as $S
+            | [ $S[] | select((.repo // "") == $repo) ] as $own
+            | (.burn.stall_window) as $sw
+            | (stallmark($own; $sw)) as $markIdx
+            | [ range(0; $own|length) as $i
+                | nextitemtext($own[$i]; ($markIdx != null and $i == $markIdx); $sw) ] as $texts
+            | ([ $own[] | select(.state != "in_flight") ] | length) as $shownQueued
+            | ([0, ($rd + $bl - $shownQueued)] | max) as $extra
+            | if ($own|length) == 0 then
+                if $extra > 0 then ("next"|pad9) + "\($extra) queued, none listed at this limit" else empty end
+              else
+                (fititems($texts; 1; true; $extra)) as $lines
+                | buildlines("next"; $lines)
+              end
+          end
+      end
+  end;
+[ quotaline, workline, nextline ] | join("\n")'
 
 cmd_overview() {
   local json=false limit=10
@@ -1144,9 +1263,10 @@ cmd_overview() {
   [ -n "$ov" ] || die 1 "mgr-guard overview failed"
   [ "$json" = true ] && { printf '%s\n' "$ov"; return; }
 
-  # the own repo is a rendering detail alone — issues of this repo print a bare
-  # `#N`, everything else is prefixed `repo#N` — so a run outside a repo still
-  # answers, and the guard's clock is the one the block is rendered against
+  # the own repo scopes the `work` and `next` lines to the calling repo alone
+  # — no other repo's name, issue number, or queue ever appears in them — so
+  # a run outside a repo still answers with the block's plain-language
+  # fallbacks, and the guard's clock is the one the block is rendered against
   local rp tz_set now
   rp=$(own_repo)
   if [ -n "${TZ:-}" ]; then tz_set=true; else tz_set=false; fi

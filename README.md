@@ -39,9 +39,9 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   died on a provider rate limit once the quota renews, the manager's own session included, and keep
   a burn projection the manager reports to the operator. It never dials pace: the cap is the
   operator's alone.
-- **One overview block.** `mgr overview` is machine-wide — every manager, every builder, which is
-  the whole subscription: the burn and where it lands at reset, the backlog per repo, and an ETA per
-  issue in flight and queued. The manager ends every turn with it. Read-only: nothing paces on it.
+- **One overview block.** `mgr overview` ends every turn with `quota`, `work` and `next`: `quota`
+  is machine-wide, because every manager on the machine draws down one subscription; `work` and
+  `next` are scoped to the repo the command was run in. Read-only: nothing paces on it.
 - **Issue hygiene** on every request: dedupe, union overlapping asks, split multi-deliverable
   requests, wire dependencies.
 - **Harness config per repo.** `mgr config` stores extra omp CLI args, environment variables for
@@ -98,7 +98,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
 | pause the project | `mgr pause` — a launch gate: a persisted cap 0 for this repo until `mgr unpause`, so nothing new launches. The builders already running keep going to their report; nothing is retired, no tab, worktree or issue is touched |
 | unpause / resume the project | `mgr unpause` (alias `mgr resume`) — the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the ready issues launch |
-| quota status / overview / what's coming | `mgr overview` — one block: burn, backlog, per-issue ETAs (see **Overview**) |
+| quota status / overview / what's coming | `mgr overview` — one block: quota (machine-wide), this repo's work and queue (see **Overview**) |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Headless use
@@ -237,44 +237,59 @@ exit it records why, and `mgr guard status` and `mgr board` report it as
 ## Overview
 
 `mgr overview` is the one block the manager prints at the end of every turn — every turn, including
-the ones that only answered a question. It is **machine-wide** by design: every manager registered
-with the guard and every builder they have running, because the quota is one subscription and not
-one project. `--json` returns the object behind the block, `mgr board` embeds the same object as
-`overview`, and `--limit N` decides how much of the queue is listed.
+the ones that only answered a question. `quota` stays **machine-wide** by design: every manager on
+the machine draws down the same subscription, so the burn projection covers the whole quota, not
+just this project. `work` and `next` are scoped to the repo the command was run in — the queue, the
+running builders and the per-issue ETAs it lists are this repo's own, never another manager's.
+`--json` returns the full object behind the block — the machine-wide quota plus every manager's
+queue, unchanged — `mgr board` embeds the same object as `overview`, and `--limit N` decides how
+much of this repo's own queue is listed.
 
 ```
-burn     anthropic:5h 80% @0.46/h → 2.2× by 17:00 (exhausts ~15:10, stalls 1h50) · week 20% @0.02/h → 12.6× by Sat 09:00
-backlog  open 31 · ready 14 · blocked 3 · in flight 2/4 slots · idle 2 (shape) — shape starves NOW, manager-skill in ~3h10
-next     #23 in flight → 15:05 · #24 → 15:40 · #25 ⊘#23 → 16:30 · #26 → 18:20 (after 5h reset) · #27 → 19:05
-beyond   +17 queued (3 blocked), last ~Sat 09:40 · ~1h05/task (n=12)
-drains   manager-skill Sat 09:40 · shape — · livinglore 16:10
+quota    5-hour 80% used, runs out in ~30m, resets in 2h (14:00Z) · weekly 20% used · shared with 1 other project
+work     1 of 2 builders running, 10 ready, 1 blocked · out of work in 6h45 (18:45Z) · queue clear in 7h30 (19:30Z)
+next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30 · #10 in 3h45
+         #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · #15 in 6h30 · +2 more
 ```
 
-- **`burn`** — one entry per provider limit: how much of the window is used, the measured burn rate,
-  where that lands at reset (`2.2×` is 2.2 windows' worth) and when the window resets. A limit that
-  does not fit also says when it runs out and how long the stall to the reset is. The first limit of
-  a provider prints its full id, the rest only the window (`week`). No reading at all: `no reading`.
-- **`backlog`** — the true totals across every live manager: open issues, `ready` (launchable now),
-  `blocked`, in flight over the sum of the caps, and idle slots with the repos holding them. After
-  the dash, per manager, when it runs out of queue: `starves NOW` or `in ~3h10`.
-- **`next`** — every in-flight issue first, then the queued ones by ETA. `⊘#23` means it waits on
-  #23; an issue in another repo is prefixed with that repo (`shape#12`); `(after 5h reset)` marks
-  the first issue that only finishes after the quota window reopens. It wraps to at most three
-  lines, and a trailing `· …` means more items than fit.
-- **`beyond`** — the queue that is not listed: how many, how many of those are blocked, the ETA of
-  the last one, and the per-task median and sample count of the repo holding most of them. The line
-  is omitted when nothing is hidden.
-- **`drains`** — per manager, when its queue empties; `—` when it does not (empty queue, or nothing
-  schedulable).
+- **`quota`** — machine-wide, one entry per provider limit that has a reading, worst first: a limit
+  that does not fit before its own reset comes first (earliest run-out first), then the rest by
+  most used. Plain limit names come from the id: the provider prefix is dropped and the window
+  token mapped (`5h` → `5-hour`, `week`/`weekly`/`7d` → `weekly`, `1d`/`day`/`24h` → `daily`, `1h` →
+  `hourly`, `<N>h` → `<N>-hour`, `<N>d` → `<N>-day`, anything else kept verbatim); a further id
+  segment is appended in parentheses, so `anthropic:7d:fable` reads `weekly (fable)`. The first
+  limit gets the full sentence — percent used, when it runs out, when the window resets; every
+  other limit gets a short one. Other managers on the machine show up only as `shared with N other
+  project(s)` — never by name, never with their own queue. No reading at all: `no quota reading
+  yet`.
+- **`work`** — this repo only: how many builders are running out of the cap, how many issues are
+  ready / blocked / awaiting approval, whether a slot is free right now — and if so, whether
+  nothing is ready to fill it (`N free slot(s), nothing ready to launch`) — or when the last slot
+  runs out of work, and when this repo's own queue clears. Nothing to report at all renders as
+  `nothing running, nothing queued` (no `next` line follows); an unregistered repo reads `this repo
+  is not registered with the guard`; outside a repo entirely it reads `not inside a repo, so there
+  is no queue to show`.
+- **`next`** — this repo's issues only: the in-flight ones first with the time left, then the
+  queued ones with the wait. `(needs #7, #9)` marks one or more blockers, `(after the <window>
+  reset)` marks the first issue that only lands once the exhausting quota window reopens — the
+  window's plain name, e.g. `5-hour` or `weekly` — and `+N more` is the true remainder of this
+  repo's own queue. A queue that has issues but nothing left to show at the current `--limit` reads
+  `N queued, none listed at this limit` instead of being omitted. It wraps to at most one
+  continuation line — the block is 2 to 4 lines total, and detail is dropped rather than run long.
+  No other repo's name, issue number, title, starvation time or drain time appears anywhere in it.
 
-Times are in the local zone, with a `Z` suffix when `TZ` is unset and a weekday prefix when the day
-is not today. Durations are rounded to 5 minutes. A `~` anywhere means the number rests on an
-estimated duration.
+Times are relative with a clock in parentheses — `in 2h (14:00Z)` — or a plain duration where that
+reads better, `15m left`. Clocks are in the local zone, with a `Z` suffix when `TZ` is unset and a
+weekday prefix when the day is not today. Durations are rounded to 5 minutes. A `~` anywhere means
+the number rests on an estimated duration.
 
 **Ten by default.** `next` lists every in-flight issue and then the next 10 queued; `--limit N`
-changes that (`--limit 50` for the whole queue, which is what the manager runs when the operator
-asks to see all of it). The simulation itself always covers every queued issue of every manager —
-only the display is capped, and `beyond` carries the size and shape of what it left out.
+changes that. The cap applies to the machine-wide list the guard builds, before it is filtered down
+to this repo's own issues — so a busy sibling project can leave fewer of your own issues on the
+page than the limit suggests. `+N more` always states the true remainder of this repo's own queue,
+never an estimate. `--limit 50` is still what the manager runs when the operator asks to see the
+whole queue. The simulation itself always covers every queued issue of every manager — only the
+display is capped.
 
 **Where the ETAs come from.** Each repo's task duration is the median of its own history:
 `mgr launch`, `mgr adopt <pane> N` and `mgr bind N` record `launched_at` in
@@ -293,11 +308,13 @@ an issue nothing can schedule (a dependency cycle) gets no ETA. Projected work s
 window** — the `[exhaust_at, resets_at]` of the earliest-exhausting limit in the burn projection —
 so a task that would straddle a dead quota resumes at the reset instead of finishing through it.
 `idle_slots` are free slots with nothing ready to fill them, and `starves_at` is when a manager's
-queue empties while it still has slots: that is the "work for the next ~3h, then it idles" reading.
+queue empties while it still has slots: that is the "work for the next ~3h, then it idles" reading
+behind `work`'s own `out of work in …`.
 
 The data is the guard's: it refreshes every live manager's repo on its own tick (see **Quota
-guard**), so the block is machine-wide and fresh even for a manager that has been quiet, and it
-works whenever `state.json` exists — `mgr overview` reads it with `mgr-guard overview`, no daemon
+guard**), collecting quota and queue data machine-wide even for a manager that has been quiet — the
+block above is only this manager's own slice of it, `work` and `next` scoped to its repo. It works
+whenever `state.json` exists — `mgr overview` reads it with `mgr-guard overview`, no daemon
 required. The ledger row keeps at most 50 ready and 50 blocked entries per repo (with the true
 counts); the full queue lives in `MGR_STATE_DIR/backlog/<owner>__<repo>.json`, and that is what
 the simulation runs over — a repo with 200 open issues gets 200 ETAs and shows ten. A guard that

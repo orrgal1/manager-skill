@@ -158,6 +158,19 @@ jq '.managers["ws-w9"].ready = 34
   | .managers["ws-w9"].backlog.counts.open = 36' \
   "$ovstate/state.json" >"$ovmany/state.json"
 
+# and with this repo registered but empty: nothing running, nothing queued, so
+# the block has nothing to list and must say so instead of printing blanks
+ovidle="$tmp/ovidle"; mkdir -p "$ovidle"
+jq '.managers["ws-w9"].ready = 0
+  | .managers["ws-w9"].in_flight = 0
+  | .managers["ws-w9"].backlog.ready = []
+  | .managers["ws-w9"].backlog.blocked = []
+  | .managers["ws-w9"].backlog.in_flight = []
+  | .managers["ws-w9"].backlog.slots_free = 2
+  | .managers["ws-w9"].backlog.counts =
+      {ready:0, blocked:0, in_flight:0, awaiting_approval:0, open:0}' \
+  "$ovstate/state.json" >"$ovidle/state.json"
+
 # guard stopped: the same ledger, now stale and exhausted — the cap must not
 # move because of it. A stopped guard also carries the exit record it wrote on
 # its way out, plus the recovery time of the limit that ran out.
@@ -1004,26 +1017,31 @@ check 'beyond summarises the rest' \
   "$(jq -c '.timeline.beyond' <<<"$ovj")"
 
 printf '\n# 9b. the rendered block, byte for byte\n'
+# `quota` is machine-wide — one subscription — and says so only as a count of
+# the other projects sharing it. `work` and `next` are this repo's alone:
+# `other/shape` owns issue #101 and a drain time of its own, and neither may
+# appear anywhere in the text.
 cat >"$fix/expect-overview.txt" <<'EOF'
-burn     anthropic:5h 80% @0.40/h → 2.2× by 14:00Z (exhausts ~12:30Z, stalls 1h30) · week 20% @0.02/h → 12.6× by Mon 09:00Z
-backlog  open 13 · ready 10 · blocked 2 · in flight 1/3 slots · idle 1 (shape) — shape starves NOW, name in 6h45
-next     #49 in flight → 12:15Z · shape#101 ⊘#999 → ~12:25Z · #7 → 14:30Z (after 5h reset)
-         #8 → 14:45Z · #9 → 15:30Z · #10 → 15:45Z · #11 → 16:30Z · #12 → 16:45Z · #13 → 17:30Z
-         #14 → 17:45Z · #15 → 18:30Z
-beyond   +2 queued (1 blocked), last 19:30Z · 1h00/task (n=5)
-drains   name 19:30Z · shape 12:25Z
+quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · weekly 20% used · shared with 1 other project
+work     1 of 2 builders running, 10 ready, 1 blocked · out of work in 6h45 (18:45Z) · queue clear in 7h30 (19:30Z)
+next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30 · #10 in 3h45
+         #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · #15 in 6h30 · +2 more
 EOF
 blk=$(ov "$ovstate"); rc=$?
 check 'overview exit'             0 "$rc"
 check 'the rendered block' "$(cat "$fix/expect-overview.txt")" "$blk"
-check 'seven lines, no trailing blank' 7 "$(printf '%s\n' "$blk" | wc -l | tr -d ' ')"
+check 'four lines, no trailing blank' 4 "$(printf '%s\n' "$blk" | wc -l | tr -d ' ')"
 check 'every line starts with its padded label' \
-  'burn     |backlog  |next     |         |         |beyond   |drains   |' \
+  'quota    |work     |next     |         |' \
   "$(printf '%s\n' "$blk" | cut -c1-9 | sed 's/$/|/' | tr -d '\n')"
-check 'next wraps within three physical lines' 2 \
-  "$(nextlines "$blk" | wc -l | tr -d ' ')"
-check 'no line is wider than 100 columns' 0 \
-  "$(printf '%s\n' "$blk" | sed -n '3,5p' | jq -R 'select(length > 100)' | wc -l | tr -d ' ')"
+check 'no line is wider than 120 columns' 0 \
+  "$(printf '%s\n' "$blk" | jq -R 'select(length > 120)' | wc -l | tr -d ' ')"
+check 'the other manager explains the shared quota and nothing else' 1 \
+  "$(printf '%s\n' "$blk" | grep -c 'shared with 1 other project' || true)"
+check 'no other repo, issue or drain time in the text' 0 \
+  "$(printf '%s\n' "$blk" | grep -c -e shape -e '#101' -e '#999' -e '12:25' || true)"
+check 'none of the old notation either' 0 \
+  "$(printf '%s\n' "$blk" | grep -c -e '×' -e '⊘' -e '/h' -e '—' || true)"
 
 printf '\n# 9c. Z only when TZ is unset\n'
 blktz=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID TZ=UTC \
@@ -1032,15 +1050,12 @@ blktz=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID TZ=UTC \
 check 'a set TZ drops the Z suffix' 0 \
   "$(printf '%s\n' "$blktz" | grep -c '[0-9][0-9]:[0-9][0-9]Z' || true)"
 check 'an unset TZ keeps it' 1 \
-  "$(printf '%s\n' "$blk" | grep -c 'by 14:00Z (exhausts ~12:30Z' || true)"
-# a shorter time (no Z) fits more items per line, so only the labelled lines
-# are the same in both zones
-check 'the same five labelled lines in either zone' \
-  'burn|backlog|next|beyond|drains' \
+  "$(printf '%s\n' "$blk" | grep -c 'resets in 2h00 (14:00Z)' || true)"
+check 'the same three labelled lines in either zone' 'quota|work|next' \
   "$(printf '%s\n' "$blktz" | sed -n 's/^\([a-z][a-z]*\) .*/\1/p' | tr '\n' '|' \
      | sed 's/|$//')"
 
-printf '\n# 9d. --limit 3: three queued shown, the rest summarised\n'
+printf '\n# 9d. --limit 3: three queued shown, the rest counted\n'
 ovj3=$(ov "$ovstate" --json --limit 3)
 check 'shown is the in-flight issue plus three' 4 \
   "$(jq -r '.timeline.shown | length' <<<"$ovj3")"
@@ -1048,27 +1063,34 @@ check 'beyond counts every hidden issue' 9 \
   "$(jq -r '.timeline.beyond.count' <<<"$ovj3")"
 check 'and how many of those are blocked' 1 \
   "$(jq -r '.timeline.beyond.blocked' <<<"$ovj3")"
+# the machine-wide cap is applied before the text is filtered to this repo, so
+# the sibling project eats one of the three slots; `+N more` still counts this
+# repo's own remainder — all eleven of its queued issues less the two listed
 blk3=$(ov "$ovstate" --limit 3)
-check 'the beyond line' \
-  'beyond   +9 queued (1 blocked), last 19:30Z · 1h00/task (n=5)' \
-  "$(printf '%s\n' "$blk3" | sed -n '/^beyond/p')"
+check 'the next line, capped and counted' \
+  'next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · +9 more' \
+  "$(printf '%s\n' "$blk3" | sed -n '/^next/p')"
+check 'three lines at this limit' 3 "$(printf '%s\n' "$blk3" | wc -l | tr -d ' ')"
 
-printf '\n# 9e. nothing hidden: no beyond at all\n'
+printf '\n# 9e. a short queue: everything listed, nothing left to count\n'
 ovjs=$(ov "$ovsmall" --json)
 check 'beyond is null' null "$(jq -r '.timeline.beyond' <<<"$ovjs")"
 check 'shown is the whole machine' 5 "$(jq -r '.timeline.shown | length' <<<"$ovjs")"
 blks=$(ov "$ovsmall")
-check 'no beyond line' 0 "$(printf '%s\n' "$blks" | grep -c '^beyond' || true)"
-check 'the block is five lines with no beyond among them' \
-  'burn     |backlog  |next     |         |drains   |' \
-  "$(printf '%s\n' "$blks" | cut -c1-9 | sed 's/$/|/' | tr -d '\n')"
+check 'three lines, no continuation' 3 "$(printf '%s\n' "$blks" | wc -l | tr -d ' ')"
+check 'no remainder marker' 0 "$(printf '%s\n' "$blks" | grep -c 'more' || true)"
+check 'a blocked issue names its blocker in words' 1 \
+  "$(printf '%s\n' "$blks" | grep -c '#17 in 3h30 (needs #7)' || true)"
 
-printf '\n# 9f. a backlog too long for three lines ends in an ellipsis\n'
+printf '\n# 9f. a queue too long for two lines ends in a count\n'
 blkm=$(ov "$ovmany" --limit 30)
-check 'next still wraps to three lines' 2 \
+check 'next spills onto exactly one continuation line' 1 \
   "$(nextlines "$blkm" | wc -l | tr -d ' ')"
-check 'the third line says there is more' 1 \
-  "$(nextlines "$blkm" | sed -n '2p' | grep -c ' · …$' || true)"
+check 'the continuation ends with the remainder' 1 \
+  "$(nextlines "$blkm" | grep -c ' · +24 more$' || true)"
+check 'four lines at most' 4 "$(printf '%s\n' "$blkm" | wc -l | tr -d ' ')"
+check 'and still nothing over 120 columns' 0 \
+  "$(printf '%s\n' "$blkm" | jq -R 'select(length > 120)' | wc -l | tr -d ' ')"
 
 printf '\n# 9g. mgr board embeds the very same document\n'
 ovb=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u TZ \
@@ -1101,8 +1123,18 @@ mkdir -p "$tmp/ovempty"
 blke=$(ov "$tmp/ovempty"); rc=$?
 check 'empty overview exit'       0 "$rc"
 check 'the empty block' \
-  'burn     no reading|backlog  open 0 · ready 0 · blocked 0 · in flight 0/0 slots · idle 0|next     nothing queued|drains   no managers' \
+  'quota    no quota reading yet|work     this repo is not registered with the guard' \
   "$(printf '%s\n' "$blke" | tr '\n' '|' | sed 's/|$//')"
+
+printf '\n# 9j. this repo idle: one plain line, and no next line at all\n'
+blki=$(ov "$ovidle")
+check 'two lines' 2 "$(printf '%s\n' "$blki" | wc -l | tr -d ' ')"
+check 'the work line says it plainly' 'work     nothing running, nothing queued' \
+  "$(printf '%s\n' "$blki" | sed -n '/^work/p')"
+check 'no placeholder dashes anywhere' 0 \
+  "$(printf '%s\n' "$blki" | grep -c '—' || true)"
+check 'the shared quota is still reported' 1 \
+  "$(printf '%s\n' "$blki" | grep -c 'shared with 1 other project' || true)"
 
 # ------------------------------- 10. launch stamps and throughput rows
 

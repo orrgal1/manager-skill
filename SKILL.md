@@ -71,7 +71,8 @@ you are the one being found.
 
 Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `blocked`,
 `orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, `house`, and `quota` — `guard`, `limits`,
-`reason`, `stalled`. Then close the turn with the `$MGR overview` block, as every turn ends (§7).
+`reason`, `stalled`. Then close the turn with the `$MGR overview` block — `quota` machine-wide,
+`work`/`next` scoped to this repo — as every turn ends (§7).
 
 `house` is the package every launch overlays. `null` → run `$MGR house`, which reads the house off
 your own session; still nothing → `$MGR config set house <anthropic|openai|gemini>` before any
@@ -267,7 +268,7 @@ Trust the report, not the idle state.
 | pause this project | `$MGR pause` — a launch gate: a persisted cap 0 for this repo, machine-wide, so it survives the session. `$MGR board` then reports `paused_by_operator: true` with `cap` and `slots_free` `0`, and `$MGR launch` refuses (exit `3`) even when `--cap N` is passed — the pause wins. Builders already running are **not** touched: they keep working to their report. Tabs, worktrees, issues and labels are untouched; this is not `cancel` |
 | unpause / resume this project | `$MGR unpause` (alias `$MGR resume`) — lifts the gate: the cap goes back to `--cap` / `MGR_CAP` / `$MGR config get cap` / `3`. Then `$MGR board` and report the restored `cap` / `slots_free`, and launch what is `ready`. Idempotent — running it on a project that is not paused is fine |
 | status / what's on the board | `$MGR board`, reported as a short table — then the overview block, as always |
-| quota status | `$MGR overview` — the block *is* the answer, nothing of your own on top of it. Name the builders in `quota.stalled` if there are any: the guard is reigniting those, there is nothing to do about them |
+| quota status | `$MGR overview` — the block *is* the answer, nothing of your own on top of it. `quota` is the whole subscription; `work`/`next` are this repo's own. Name the builders in `quota.stalled` if there are any: the guard is reigniting those, there is nothing to do about them |
 | show the whole queue / what's coming | `$MGR overview --limit 50` |
 | dedupe the issues | Intake (a) over the whole open list |
 | adopt the other tabs | **Adoption** |
@@ -316,7 +317,7 @@ Trust the report, not the idle state.
 | `$MGR labels` | create/update the three `mgr:` labels and the four `size:` labels; idempotent |
 | `$MGR size <N> <size>` | swap the issue's `size:` label to `tiny`\|`small`\|`medium`\|`large`; exit `3` while `mgr:in-flight` |
 | `$MGR board [--cap N]` | the whole board: issues joined to live agents, with `overview` embedded at the default limit |
-| `$MGR overview [--json] [--limit N]` | machine-wide — every manager on this machine, which is the subscription's burn: the rendered text block by default, `--json` for the object. `--limit` is how many queued issues are listed after the in-flight ones (default `10`); the simulation always covers the whole queue, only the display is capped |
+| `$MGR overview [--json] [--limit N]` | the rendered text block by default: `quota` machine-wide (one subscription, shared by every manager on this machine), `work`/`next` scoped to the repo you run it in. `--json` returns the full object, machine-wide and unchanged. `--limit` is how many queued issues are listed after the in-flight ones (default `10`); the simulation always covers the whole queue, only the display is capped |
 | `$MGR launch <N> [--cap N] [--house <anthropic\|openai\|gemini>]` | worktree + tab + omp builder + brief + label + comment; `--house` overlays that house's package for this launch only |
 | `$MGR adopt <pane_id\|tab_id> [N]` | make a live session a builder; without N it self-registers |
 | `$MGR bind <N>` | builder-side only; you never run this |
