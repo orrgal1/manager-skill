@@ -10,9 +10,10 @@ Resize only upward, never down. This file is the whole build-and-verify process 
 Any box fails → resize to `small`.
 
 Your brief named your sizing bias — `lean`, `balanced` or `careful` (builder.md §7). It decides
-which way a box you cannot call goes: under `lean` a borderline box passes and you stay here,
-under `careful` it fails and you resize up, and under `balanced` a genuine toss-up resizes up.
-It never rescues a box that is plainly false — a clear-cut failure resizes at every setting.
+which way a box you cannot call goes: under `lean` it resolves in your favour and you stay here,
+under `balanced` it fails and you resize up, and under `careful` so does a box you could pass but
+whose next size up is merely plausible. It never rescues a box that is plainly false — a clear-cut
+failure resizes at every setting.
 
 ## Steps
 

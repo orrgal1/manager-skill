@@ -170,7 +170,7 @@ size of the agents it dispatches slices to, so it is not optional. Every builder
 `@builder` whatever its size.
 
 `$MGR board` surfaces the repo's effective sizing bias as `config.sizing` (`lean|balanced|careful`;
-default `balanced`) — read it before you judge; it never changes a decided size, only
+default `balanced`) — read it before you judge; it never demotes a decided size, only
 which way an unsure one falls (see the tie-break below the table).
 
 | Label | Touches | Judgement | Examples |
@@ -181,17 +181,18 @@ which way an unsure one falls (see the tie-break below the table).
 | `size:large` | cross-cutting, a new subsystem, a schema / shared lib / routing, callers not enumerable, needs a plan before files | architecture | a feature spanning packages, a migration, a new pipeline |
 
 Unsure → apply the repo's sizing bias (`config.sizing` from `$MGR board`; default `balanced`).
-Under-sizing still costs a botched landing; over-sizing no longer costs one review pass — at
-`medium`/`large` it buys a planner round-trip, a slice table, subagents dispatched to run it, a
-mandatory review pass with its fix round, and at `large` the full suite. `lean` resolves an unsure
-call **down** (under-sizing self-corrects, see below); `balanced` resolves it **up**, today's
-default; `careful` resolves it **up**, and a size merely plausible one rung higher takes the
-higher rung.
+Under-sizing still costs a botched landing; over-sizing costs far more than one review pass — at
+`medium`/`large` it spends a planner round-trip, a slice table, subagents dispatched to run it, a
+mandatory review pass with its fix round, and at `large` the full suite. `lean` resolves an
+unsure call **down** (under-sizing self-corrects, see below); `balanced` resolves it **up**,
+today's default, for any call you cannot make outright, not only an even split; `careful`
+resolves it **up**, and takes the higher rung whenever that rung is merely plausible — not only
+when the call is undecidable.
 A builder that finds itself under-sized resizes upward on its own and comments
 `builder: resized <from>→<to>` — you never resize an in-flight issue yourself.
 
-The dial moves the tie-break and where the borderline thresholds fall — never a decided
-classification. Work that genuinely touches a schema, a shared library or routing, or whose
+The dial moves the tie-break and where the borderline thresholds fall — it never demotes a
+decided classification. Work that genuinely touches a schema, a shared library or routing, or whose
 callers cannot be enumerated is `size:large` at every setting, and the same holds at each rung
 below it. That is exactly why the dial is not a numeric offset applied after classification: an
 offset would demote a decided `large` and hand a migration to a builder with no plan step.
@@ -395,7 +396,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `config` | the effective harness config: `omp-arg`, `env`, `brief-extra`, `cap`, `rigor`, `sizing` |
 | `house` | the model package a launch would overlay right now: `$MGR config get house`, else this session's own house; `null` when nothing resolves and `launch` refuses |
 | `rigor` | the effective verification rigor every launch verifies under: `sprint` \| `production`, never `null` — `MGR_RIGOR`, else `$MGR config get rigor`, else `production` (builder.md §7) |
-| `sizing` | the effective sizing bias every issue is sized and every builder's tie-break applies under: `lean` \| `balanced` \| `careful`, never `null` — `MGR_SIZING`, else `$MGR config get sizing`, else `balanced` (§3(b)) |
+| `sizing` | the effective sizing bias — every issue is sized under it, and every builder's tie-break resolves under it: `lean` \| `balanced` \| `careful`, never `null` — `MGR_SIZING`, else `$MGR config get sizing`, else `balanced` (§3(b)) |
 | `manager` | `{pane_id,tab_id,agent,cwd}` of the live agent whose tab is labelled `manager`, or `null` — the detection key external tooling uses to find the manager tab |
 | `self` | the calling pane (`HERDR_PANE_ID`), or `null` outside a herdr pane |
 | `quota.guard` | `running` \| `stale` \| `stopped` — nothing is reignited and no projection moves unless it is `running` |
@@ -451,11 +452,13 @@ intake and builders apply (`mgr config set sizing`, `MGR_SIZING`); the rule is �
 A failure the diff caused blocks in both modes. `tiny` and `small` never run the full suite in
 either.
 
+`sizing` biases the scope-test tie-break when intake or a builder can't call it outright.
+
 | `sizing` | tie-break (§3(b)) |
 |---|---|
 | `lean` | an unsure call resolves down |
 | `balanced` (default) | an unsure call resolves up |
-| `careful` | resolves up; a merely plausible size one rung higher takes it |
+| `careful` | an unsure call resolves up, and the higher rung is taken whenever it is merely plausible |
 
 | Variable | Default | Effect |
 |---|---|---|

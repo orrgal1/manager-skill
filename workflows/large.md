@@ -11,8 +11,8 @@ This is the largest size — there is nothing above it. This file is the whole p
 
 Any of these true → this is your file. Do not resize down: work already sized large stays large.
 
-Your brief named your sizing bias — `lean`, `balanced` or `careful` (builder.md §7). It biases
-borderline boxes at the sizes below this one; here it changes nothing. No setting resizes work
+Your brief named your sizing bias — `lean`, `balanced` or `careful` (builder.md §7). It biases a
+box you cannot call at the sizes below this one; here it changes nothing. No setting resizes work
 downward, and a box that is plainly true keeps you here whatever the dial says.
 
 ## Steps

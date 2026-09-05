@@ -34,8 +34,8 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   suite follows the diff surface too, gated by a per-repo `rigor` dial (`mgr config set rigor`,
   `MGR_RIGOR`; default `production`) rather than the size (builder.md §7).
   A per-repo `sizing` dial (`mgr config set sizing`, `MGR_SIZING`; `lean|balanced|careful`,
-  default `balanced`) biases only that tie-break when intake or a builder cannot decide a size
-  outright — it never overrides a decided size.
+  default `balanced`) biases the size call when intake or a builder cannot decide a size
+  outright — it never demotes a decided classification.
 - **One model package per subscription.** `mgr setup` installs the eight agents (`tiny`, `small`,
   `medium`, `large`, `plan`, `sketch`, `crux`, `sweep`) into the omp agent directory and applies
   `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,
@@ -419,10 +419,10 @@ sessions. A session that gets it both ways loads it twice and activates it once.
 ## Configuration
 
 The guard is all environment. The per-repo harness config — extra omp args, builder-tab env, an
-extra brief file, the cap, the rigor — lives in the repo's `.git/config` under `mgr.*` (`mgr
-config`), and the `MGR_*` variables below override it. The guard's integer knobs silently fall
-back to their default when the value is not a positive integer; `MGR_CAP` is stricter — a
-non-numeric cap is a usage error (exit `2`).
+extra brief file, the cap, the rigor, the sizing bias — lives in the repo's `.git/config` under
+`mgr.*` (`mgr config`), and the `MGR_*` variables below override it. The guard's integer knobs
+silently fall back to their default when the value is not a positive integer; `MGR_CAP` is
+stricter — a non-numeric cap is a usage error (exit `2`).
 
 `rigor` is the verification dial every builder is briefed with (`mgr config set rigor`,
 `MGR_RIGOR`); the contract is `builder.md §7`.
@@ -435,6 +435,15 @@ non-numeric cap is a usage error (exit `2`).
 A failure the diff caused blocks in both modes. `tiny` and `small` never run the full suite in
 either.
 
+`sizing` is the classification dial intake and every builder's scope test are briefed with
+(`mgr config set sizing`, `MGR_SIZING`); the rule is `SKILL.md §3(b)`.
+
+| `sizing` | tie-break |
+|---|---|
+| `lean` | an unsure call resolves down |
+| `balanced` (default) | an unsure call resolves up |
+| `careful` | an unsure call resolves up, and the higher rung is taken whenever it is merely plausible |
+
 | Variable | Default | Effect |
 |---|---|---|
 | `MGR_CAP` | `3` | concurrency cap when `--cap N` is not passed; overrides `mgr.cap` |
@@ -442,6 +451,7 @@ either.
 | `MGR_ENV` | unset | whitespace-separated `KEY=VALUE` for builder tabs; replaces `mgr.env` |
 | `MGR_BRIEF_EXTRA` | unset | path to a markdown file appended to every brief; overrides `mgr.brief-extra` |
 | `MGR_RIGOR` | `production` | verification rigor for builders, `sprint`\|`production`; overrides `mgr.rigor` |
+| `MGR_SIZING` | `balanced` | issue-size classification bias for builders, `lean`\|`balanced`\|`careful`; overrides `mgr.sizing` |
 | `MGR_GUARD_BIN` | `mgr-guard` next to `bin/mgr` | the guard executable `mgr` shells out to |
 | `MGR_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/mgr-guard` | the guard's ledger directory |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks (`mgr-guard start --interval S` wins) |

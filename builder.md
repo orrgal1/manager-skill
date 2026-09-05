@@ -231,17 +231,18 @@ goes to a slice agent on your own rung.
 
 Your brief named your sizing bias: `lean`, `balanced` or `careful`, a per-repo dial the operator
 sets (`mgr config set sizing`) and `balanced` when nothing is set. It decides which way a
-scope-test box you cannot call falls — under `lean` it falls down and you stay at this size,
-under `careful` it falls up, and under `balanced` a genuine toss-up falls up. No setting ever
-resizes work downward.
+scope-test box you cannot call goes — under `lean` it resolves in your favour and you stay at
+this size, under `balanced` it resolves up and you resize, and under `careful` so does a box you
+could pass but whose next size up is merely plausible. No setting ever resizes work downward.
 
 **The floor** — the dial never rescues a box that is plainly false; a clear-cut failure resizes
 at every setting. It also never demotes a decided classification: work that touches a shared
 library, a schema or routing, or whose callers you cannot enumerate, is `large` at every setting,
 and the same holds at each rung below. That is why the dial is not a numeric offset applied after
 classification — an offset would demote a decided `large` and hand a migration to a builder with
-no plan step. `sizing` and `rigor` are orthogonal dials: one biases classification, the other
-sets verification strictness.
+no plan step. The three dials above are moves the builder makes; `sizing` and `rigor` are
+settings it is handed, orthogonal to each other — one biases classification, the other sets
+verification strictness.
 
 ### Which checks, and under which rigor
 

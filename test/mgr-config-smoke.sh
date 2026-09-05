@@ -361,6 +361,7 @@ printf '\n# 2c. sizing: MGR_SIZING > git config > balanced, bad values warn to s
 "$MGR" config set sizing careful >/dev/null
 check 'git config sizing'           careful  "$("$MGR" board | jq -r '.sizing')"
 check 'MGR_SIZING beats git config' lean     "$(MGR_SIZING=lean "$MGR" board | jq -r '.sizing')"
+check 'board .config.sizing tracks a non-default' careful "$("$MGR" board | jq -r '.config.sizing')"
 "$MGR" config unset sizing >/dev/null
 check 'default sizing'              balanced "$("$MGR" board | jq -r '.sizing')"
 
@@ -589,7 +590,6 @@ check 'bad MGR_SIZING: brief still carries balanced' true \
   "$(contains 'Sizing: balanced.' "$(cat "$MGR_TEST_PROMPT")")"
 check 'bad MGR_SIZING: launch warns exactly once' 1 \
   "$(printf '%s\n' "$err" | grep -c 'mgr: warning: sizing must be one of lean|balanced|careful: bogus' || true)"
-"$MGR" config unset sizing >/dev/null
 drop_wt
 
 # --------------------------------------------------- 4. adopt
@@ -750,8 +750,8 @@ check 'usage lists mgr config' 1 \
   "$("$MGR" --help | grep -c 'mgr config <set|add|get|unset|list>' || true)"
 check 'usage mentions rigor in the config clause' true \
   "$(if [ "$("$MGR" --help | grep -c 'rigor' || true)" -ge 1 ]; then printf true; else printf false; fi)"
-check 'usage mentions sizing in the config clause' true \
-  "$(if [ "$("$MGR" --help | grep -c 'sizing' || true)" -ge 1 ]; then printf true; else printf false; fi)"
+check 'usage mentions sizing in the config clause' 1 \
+  "$("$MGR" --help | grep -c '(lean|balanced|careful' || true)"
 for v in MGR_OMP_ARGS MGR_ENV MGR_BRIEF_EXTRA MGR_CAP MGR_RIGOR MGR_SIZING HERDR_WORKSPACE_ID; do
   check "usage lists $v" 1 "$("$MGR" --help | grep -c "$v" || true)"
 done
