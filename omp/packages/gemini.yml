@@ -2,7 +2,8 @@
 # Rungs: Gemini Pro (top, and the work rung — nothing sits between Pro and
 # Flash) > Gemini Flash (mid) > Gemini Flash Lite (bottom).
 # plan/review take the top rung; default/builder/large/medium the work rung;
-# small the mid rung; tiny/smol/commit the bottom rung at low.
+# small and smol (scouts feed the plan) the mid rung; tiny (omp's own role) and commit
+# the bottom rung at low.
 # Effort: high for everything that writes or decides code, medium for the roles
 # that decide nothing, low for the bottom rung. Pro exposes only low and high,
 # so high is the ceiling everywhere, never a tier above it.
@@ -21,7 +22,7 @@ modelRoles:
   builder: google-antigravity/gemini-3.1-pro:high
   small: google-antigravity/gemini-3.7-flash:high
   tiny: google-antigravity/gemini-3.1-flash-lite:low
-  smol: google-antigravity/gemini-3.1-flash-lite:low
+  smol: google-antigravity/gemini-3.7-flash:high
   slow: "@large"
   task: "@medium"
   complex: "@large"
