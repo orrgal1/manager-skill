@@ -1049,8 +1049,8 @@ assert_jq "(p) the stall window is that limit to its reset" "$OV" \
 assert_jq "(p) manager row shape" "$OV" \
   '(.backlog.managers[0] | keys)
    == ["awaiting_approval","backlog_at","backlog_drains_at","backlog_error","blocked","cap",
-       "idle_slots","in_flight","manager_id","provider","ready","repo","starves_at","starving",
-       "throughput"]'
+       "idle_slots","in_flight","manager_id","provider","ready","repo","stall_window",
+       "starves_at","starving","throughput"]'
 assert_jq "(p) only live managers, sorted by repo" "$OV" \
   '[.backlog.managers[] | .manager_id] == ["ws-a","ws-b"]'
 assert_jq "(p) shown item shape" "$OV" \
@@ -1233,6 +1233,130 @@ ST_SF="$(MGR_STATE_DIR="$SD_SF" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
 assert_eq "(s) no managers at all: exactly one fetch, the fallback target" 1 "$(lines_of "$FAKE_FETCHES")"
 assert_eq "(s) the fallback target is builder_provider()'s value" "anthropic" "$(cat "$FAKE_FETCHES")"
 assert_jq "(s) providers keys are just the fallback" "$ST_SF" '(.providers | keys) == ["anthropic"]'
+unset FAKE_FETCHES
+
+printf '\n== (t) two providers, one stalling: a foreign window must not bend a fitting caller ==\n'
+# review finding on the fix round: widening the poll set means $win alone can no longer be
+# handed to every manager -- a hand-authored ledger (like (p)'s) with anthropic fitting and
+# openai-codex stalling, so the assertions below can tell "my own window" from "someone else's".
+SD_T="$TMP/s-t"; mkdir -p "$SD_T"
+# anthropic fits (flat 50%, burn 0); openai-codex is (p)'s fixture verbatim: 80% of a 5h
+# window burning 0.4/h with 2h to reset -> exhausts in 30 min, resets 2h out
+jq -n --argjson t "$T0" '
+  {version:2, tick_at:$t, interval_s:60, builder_provider:"anthropic",
+   providers:{
+     anthropic:{status:"ok", ok:true, recovers_at:null, exhausted_limit:null,
+       limits:[{id:"anthropic:5h", label:"5h", status:"ok", used:0.5,
+                resets_at:($t + 7200000), burn_per_hour:0, projected_at_reset:0.5,
+                fits:true, hours_to_reset:2, sample_count:1, samples:[]}]},
+     "openai-codex":{status:"warning", ok:true, recovers_at:null, exhausted_limit:null,
+       limits:[{id:"openai-codex:5h", label:"5h", status:"warning", used:0.8,
+                resets_at:($t + 7200000), burn_per_hour:0.4, projected_at_reset:2.2,
+                fits:false, hours_to_reset:2, sample_count:4, samples:[]}]}},
+   managers:{
+     "ws-fit":{manager_id:"ws-fit", repo:"acme/fit", provider:"anthropic",
+               live:true, pane_alive:true, cap:1, adopting:0,
+               backlog_at:$t, backlog_error:null,
+               throughput:{n:5, median_s:600, p80_s:700, last_10_mean_s:650,
+                           estimated:false, source:"repo"},
+               backlog:{ready:[range(1;6) | {number:., title:("f" + (. | tostring)), blocked_by:[]}],
+                        blocked:[], in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+                        counts:{ready:5, blocked:0, in_flight:0, awaiting_approval:0, open:5}}},
+     "ws-stall":{manager_id:"ws-stall", repo:"acme/stall", provider:"openai-codex",
+                 live:true, pane_alive:true, cap:1, adopting:0,
+                 backlog_at:$t, backlog_error:null,
+                 throughput:{n:5, median_s:600, p80_s:700, last_10_mean_s:650,
+                             estimated:false, source:"repo"},
+                 backlog:{ready:[range(1;6) | {number:., title:("s" + (. | tostring)), blocked_by:[]}],
+                          blocked:[], in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+                          counts:{ready:5, blocked:0, in_flight:0, awaiting_approval:0, open:5}}},
+     "ws-none":{manager_id:"ws-none", repo:"acme/none",
+                live:true, pane_alive:true, cap:1, adopting:0,
+                backlog_at:$t, backlog_error:null,
+                throughput:{n:5, median_s:600, p80_s:700, last_10_mean_s:650,
+                            estimated:false, source:"repo"},
+                backlog:{ready:[range(1;6) | {number:., title:("n" + (. | tostring)), blocked_by:[]}],
+                         blocked:[], in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+                         counts:{ready:5, blocked:0, in_flight:0, awaiting_approval:0, open:5}}}},
+   stalled:[], events:[]}' >"$SD_T/state.json"
+OV_T="$(MGR_STATE_DIR="$SD_T" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 50)"
+assert_json "(t) overview output" "$OV_T"
+assert_jq "(t) burn.stall_window stays machine-wide, naming the stalling provider's limit" "$OV_T" \
+  '.burn.stall_window
+   == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
+# THE regression assertion: before the fix every row got $win uniformly, so the fitting
+# anthropic manager would have carried openai-codex's window here. Now it gets none.
+assert_jq "(t) the fitting provider's manager carries no window (acceptance box 5)" "$OV_T" \
+  '[.backlog.managers[] | select(.manager_id == "ws-fit")] | first | .stall_window == null'
+assert_jq "(t) the stalling provider's manager carries its own window" "$OV_T" \
+  '[.backlog.managers[] | select(.manager_id == "ws-stall")] | first | .stall_window
+   == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
+assert_jq "(t) the provider-less manager keeps the machine-wide fallback window" "$OV_T" \
+  '[.backlog.managers[] | select(.manager_id == "ws-none")] | first | .stall_window
+   == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
+# the window actually reaches the simulation, not just the row: cap 1, five 10-minute
+# items with no window drain by T0+3000000 (50m); with the 30m/2h window in effect the
+# fourth item's slot opens inside the window and gets bumped to the reset, landing the
+# queue's drain at T0+8400000 (2h20m) -- past the 2h reset, unlike the fitting manager
+assert_jq "(t) the fitting manager's queue drains well inside the window, untouched" "$OV_T" \
+  '[.backlog.managers[] | select(.manager_id == "ws-fit")] | first
+   | .backlog_drains_at == '"$(( T0 + 3000000 ))"' and .backlog_drains_at < '"$(( T0 + 7200000 ))"
+assert_jq "(t) the stalling manager's queue is pushed past its own reset" "$OV_T" \
+  '[.backlog.managers[] | select(.manager_id == "ws-stall")] | first
+   | .backlog_drains_at == '"$(( T0 + 8400000 ))"' and .backlog_drains_at > '"$(( T0 + 7200000 ))"
+assert_jq "(t) the provider-less manager is bent by the same machine-wide window" "$OV_T" \
+  '[.backlog.managers[] | select(.manager_id == "ws-none")] | first | .backlog_drains_at
+   == '"$(( T0 + 8400000 ))"
+assert_jq "(t) relationally: the stalling and fallback managers drain identically, past the fitting one" "$OV_T" \
+  '(([.backlog.managers[] | select(.manager_id == "ws-stall")] | first | .backlog_drains_at)
+    == ([.backlog.managers[] | select(.manager_id == "ws-none")] | first | .backlog_drains_at))
+   and (([.backlog.managers[] | select(.manager_id == "ws-stall")] | first | .backlog_drains_at)
+        > ([.backlog.managers[] | select(.manager_id == "ws-fit")] | first | .backlog_drains_at))'
+
+printf '\n== (u) poll-loop hardening: a malformed provider string contributes nothing ==\n'
+# review finding (MEDIUM): the old `for p in $providers` over an unquoted variable both
+# word-split and glob-expanded each line. A registration carrying "zzz-*" used to make the
+# tick fetch whatever files matching that glob sat in the daemon's cwd; a registration
+# carrying a space used to split into two bogus provider fetches.
+SD_U1="$TMP/s-u-glob"
+GLOBDIR="$TMP/poll-glob-cwd"; mkdir -p "$GLOBDIR"
+: >"$GLOBDIR/zzz-alpha"; : >"$GLOBDIR/zzz-beta"
+agents_file "$TMP/agents-u1.json" \
+  "$(mk_agent manager wu1:p1 wu1 idle '')" \
+  "$(mk_agent manager wu2:p1 wu2 idle '')"
+export FAKE_AGENTS="$TMP/agents-u1.json"
+mk_usage2 "$TMP/usage-u1.json" ok 0.10 $(( T0 + 3600000 )) ok 0.15 $(( T0 + 3600000 ))
+export FAKE_USAGE="$TMP/usage-u1.json" FAKE_FETCHES="$TMP/fetches-u1.log"; : >"$FAKE_FETCHES"
+reg "$SD_U1" "$T0" ws-u1zzz wu1 wu1:p1 3 1 0 0 acme/u1 "zzz-*" >/dev/null
+reg "$SD_U1" "$T0" ws-u1ok wu2 wu2:p1 3 1 0 0 acme/u2 anthropic >/dev/null
+# the daemon's actual cwd matters only to the vulnerable old code; the fix makes it inert
+ST_U1="$(cd "$GLOBDIR" && MGR_STATE_DIR="$SD_U1" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(u) the glob-shaped provider is filtered out; the legitimate one is fetched" "$ST_U1" \
+  '(.providers | keys) == ["anthropic"]'
+assert_eq "(u) exactly one fetch happened" 1 "$(lines_of "$FAKE_FETCHES")"
+assert_eq "(u) the fetch log names only the legitimate provider" "anthropic" "$(cat "$FAKE_FETCHES")"
+if grep -q 'zzz' "$FAKE_FETCHES"; then
+  fail "(u) the glob-vulnerable provider leaked into the fetch log: $(cat "$FAKE_FETCHES")"
+else
+  pass "(u) no zzz-anything was ever fetched (no glob expansion, no literal '*' fetch)"
+fi
+SD_U2="$TMP/s-u-space"
+agents_file "$TMP/agents-u2.json" \
+  "$(mk_agent manager wu3:p1 wu3 idle '')" \
+  "$(mk_agent manager wu4:p1 wu4 idle '')"
+export FAKE_AGENTS="$TMP/agents-u2.json" FAKE_FETCHES="$TMP/fetches-u2.log"; : >"$FAKE_FETCHES"
+reg "$SD_U2" "$T0" ws-u2sp wu3 wu3:p1 3 1 0 0 acme/u3 "anthropic openai-codex" >/dev/null
+reg "$SD_U2" "$T0" ws-u2ok wu4 wu4:p1 3 1 0 0 acme/u4 openai-codex >/dev/null
+ST_U2="$(MGR_STATE_DIR="$SD_U2" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(u) a provider with a space is filtered out; the legitimate one is fetched" "$ST_U2" \
+  '(.providers | keys) == ["openai-codex"]'
+assert_eq "(u) exactly one fetch happened" 1 "$(lines_of "$FAKE_FETCHES")"
+assert_eq "(u) the fetch log names only the legitimate provider" "openai-codex" "$(cat "$FAKE_FETCHES")"
+if grep -qx 'anthropic' "$FAKE_FETCHES"; then
+  fail "(u) the space-separated provider word-split into a spurious anthropic fetch"
+else
+  pass "(u) no spurious anthropic fetch from word-splitting"
+fi
 unset FAKE_FETCHES
 
 printf '\n== nothing in the guard ever interrupts a builder ==\n'

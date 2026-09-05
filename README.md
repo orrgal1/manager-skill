@@ -245,7 +245,9 @@ operator. Nothing acts on the projection.
   `guard.log`, `state.json`, `samples.jsonl`, `exit.json`, one `managers/<id>.json` per manager —
   heartbeated by every `mgr` call (`mgr board` writes the full registration: manager id, repo, pane,
   cap, in-flight, `paused_by_operator`, and its effective `house`/`provider` — both `null` when
-  unresolvable — for attribution, for the guard's poll set and for the status line only; the guard
+  unresolvable — for attribution, for the guard's poll set (only a `provider` matching
+  `^[A-Za-z0-9._:-]+$` is ever polled; anything else is dropped, not fetched) and for the status
+  line only; the guard
   never reads the pause; every other subcommand stamps `seen_at`) — and the
   `managers/<id>.last_report.json` the board writes for change detection. One daemon serves every
   manager on the machine.
@@ -265,7 +267,10 @@ the ones that only answered a question. `quota` is scoped to **the calling manag
 provider** — its effective house's subscription — so the burn projection it prints is the quota
 this manager actually draws on, not every subscription sampled on the machine. `work` and `next`
 are scoped to the repo the command was run in — the queue, the running builders and the per-issue
-ETAs it lists are this repo's own, never another manager's. `--json` returns the full object
+ETAs it lists are this repo's own, never another manager's, and those ETAs are projected against
+this manager's own stall window too: a limit on a subscription it cannot spend never shifts
+`work`'s or `next`'s timing and never appears in a `(after the ... reset)` mark (see **Quota
+guard**). `--json` returns the full object
 behind the block, and it stays **machine-wide by design**: every provider the guard polled, plus
 every manager's queue, unfiltered — other tooling reads it, and `mgr guard status` is the same
 daemon-wide record. `mgr board` embeds the same machine-wide object as `overview`; only the text
@@ -303,8 +308,9 @@ next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2
   is no queue to show`.
 - **`next`** — this repo's issues only: the in-flight ones first with the time left, then the
   queued ones with the wait. `(needs #7, #9)` marks one or more blockers, `(after the <window>
-  reset)` marks the first issue that only lands once the exhausting quota window reopens — the
-  window's plain name, e.g. `5-hour` or `weekly` — and `+N more` is the true remainder of this
+  reset)` marks the first issue that only lands once the exhausting quota window of this manager's
+  own provider reopens — never a window on a provider it doesn't draw on — the window's plain
+  name, e.g. `5-hour` or `weekly` — and `+N more` is the true remainder of this
   repo's own queue. A queue that has issues but nothing left to show at the current `--limit` reads
   `N queued, none listed at this limit` instead of being omitted. It wraps to at most one
   continuation line — the block is 2 to 4 lines total, and detail is dropped rather than run long.
@@ -337,8 +343,15 @@ From there, per manager: an in-flight issue is due at
 not predicted to land this second. The queue is FIFO by issue number over `cap` parallel slots; a
 queued issue starts when a slot frees and every open blocker of its own has an ETA in the past, and
 an issue nothing can schedule (a dependency cycle) gets no ETA. Projected work skips the **stall
-window** — the `[exhaust_at, resets_at]` of the earliest-exhausting limit in the burn projection —
-so a task that would straddle a dead quota resumes at the reset instead of finishing through it.
+window** — the `[exhaust_at, resets_at]` of the earliest-exhausting limit of that manager's own
+provider, never a limit on a subscription it cannot spend — so a task that would straddle a dead
+quota resumes at the reset instead of finishing through it. A manager with no resolvable provider
+falls back to the machine-wide earliest-exhausting limit across every polled provider, the same
+fallback the text `quota` line already makes for an unresolvable caller. Each manager's own window
+rides along as `overview.backlog.managers[].stall_window` (`{from,to,limit}`, `null` when nothing
+stalls it); `overview.burn.stall_window` stays the machine-wide record — unchanged in shape or
+meaning, and still what `mgr guard status` and other tooling read — even though each manager's own
+ETAs no longer use it directly.
 `idle_slots` are free slots with nothing ready to fill them, and `starves_at` is when a manager's
 queue empties while it still has slots: that is the "work for the next ~3h, then it idles" reading
 behind `work`'s own `out of work in …`.

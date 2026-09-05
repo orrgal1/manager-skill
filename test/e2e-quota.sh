@@ -240,8 +240,29 @@ is "registration carries the manager's house" \
   "$(jq -r '.house' "$MGR_STATE_DIR/managers/ws-w3.json")" anthropic
 is "registration carries the provider that house burns" \
   "$(jq -r '.provider' "$MGR_STATE_DIR/managers/ws-w3.json")" anthropic
-is "the provider polled is the registered one" \
-  "$(jq -r '.providers | keys | join(",")' <<<"$st")" anthropic
+# the assertion this replaced ("the provider polled is the registered one" == anthropic)
+# passed byte-identically under the old machine-wide poll set too: the fake `omp config
+# list` is hardcoded to anthropic (:91) and MGR_HOUSE=anthropic for this whole scenario
+# (:169), so it never distinguished "the manager's own provider" from "the machine
+# default" -- both are anthropic here. Prove the real discriminator in an isolated state
+# dir, so the running scenario's own ledger and registrations are untouched: a manager
+# whose MGR_HOUSE is openai gets openai-codex polled, never the fake machine default.
+CH_STATE="$T/state-crosshouse"
+# $AGENTS is the one fixture the whole script's fake herdr reads regardless of
+# MGR_STATE_DIR, and it still carries issue-49's live anthropic 429 stall -- that alone
+# would poll anthropic no matter which state dir the tick targets. Swap it out for just
+# the w9 pane for this one isolated check, then restore it exactly.
+CH_AGENTS_SAVE=$(cat "$AGENTS")
+jq -nc '{result:{agents:[
+  {name:"manager-shape",pane_id:"w9:p1",tab_id:"w9:t1",workspace_id:"w9",cwd:"/s",agent:"omp",agent_status:"idle"}]}}' >"$AGENTS"
+MGR_HOUSE=openai HERDR_WORKSPACE_ID=w9 HERDR_PANE_ID=w9:p1 HERDR_TAB_ID=w9:t1 \
+  MGR_STATE_DIR="$CH_STATE" "$ROOT/bin/mgr" board --cap 3 >/dev/null
+is "an openai house registers the openai-codex provider" \
+  "$(jq -r '.provider' "$CH_STATE/managers/ws-w9.json")" openai-codex
+st_ch=$(MGR_STATE_DIR="$CH_STATE" MGR_GUARD_NOW_MS=$NOW0 "$ROOT/bin/mgr-guard" tick)
+printf '%s\n' "$CH_AGENTS_SAVE" >"$AGENTS"
+is "the tick polls that manager's own provider, never the fake anthropic machine default" \
+  "$(jq -r '.providers | keys | join(",")' <<<"$st_ch")" openai-codex
 is "the guard skips the board's report file" "$(jq -r '.managers | keys | join(",")' <<<"$st")" ws-w3,ws-w9
 
 echo "# 5. mgr launch is refused on the cap alone, and its internal board records nothing"

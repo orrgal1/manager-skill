@@ -247,7 +247,23 @@ def same_window($a; $b):
                usage_fetch_failures: (if $r.ok then 0 else (($r.prev_failures // 0) + 1) end),
                recovers_at: $v.recovers_at, exhausted_limit: $v.exhausted_limit,
                reason: $v.reason, limits: $limits}}
-  ) | from_entries) as $providers
+  ) | from_entries) as $polled
+
+# ---- a provider nobody polled this tick keeps its hold. The poll set follows live panes, so a
+# manager pane missing from one `herdr agent list` must not make the guard forget an exhausted
+# window it is still waiting out: a builder that 429s on it during a usage outage would otherwise
+# have no recovers_at and miss its reset. Only the verdict travels, never the numbers: limits is
+# empty, so the board says no reading, and the entry drops the moment the reset has passed.
+| ((($prev.providers // {}) | with_entries(
+      select(((.key | IN($polled | keys[])) | not)
+             and ((.value.recovers_at // null) != null) and ($now < .value.recovers_at))
+      | .value |= {status: "exhausted", ok: false, fetched_at: (.fetched_at // null),
+                   usage_fetch_failures: (.usage_fetch_failures // 0),
+                   recovers_at, exhausted_limit: (.exhausted_limit // null),
+                   reason: ("unknown: not polled this tick, holding last verdict (exhausted until "
+                            + iso(.recovers_at) + ")"),
+                   limits: []}))
+   + $polled) as $providers
 
 # ---- the 429 ledger, upserted against the previous tick. Nothing else lands here: a builder
 # is only ever in this list because its own turn died on a provider rate limit.
@@ -287,7 +303,7 @@ def same_window($a; $b):
      # the prompt names the limit whose reset we were waiting for when it is known,
      # otherwise the fullest one — the 429 came from the window closest to full
      | ((($ls | map(select(.id == ($st.limit // ""))) | first) // ($ls | max_by(.used)))) as $l
-     | (($l | if . == null then "quota" else .id end)) as $lid
+     | (($l | if . == null then ($st.limit // "quota") else .id end)) as $lid
      | (($st.recovers_at // ($l | if . == null then null else (.resets_at // null) end))) as $rat
      | {pane_id: $st.pane_id, provider: ($st.provider // "unknown"), limit: $lid,
         text: ((if $positive

@@ -204,6 +204,40 @@ jq '.managers["ws-w9"].ready = 0
       {ready:0, blocked:0, in_flight:0, awaiting_approval:0, open:0}' \
   "$ovstate/state.json" >"$ovidle/state.json"
 
+# the same machine with nothing stalling anywhere: the anthropic 5h limit fits
+# too, so no provider has a window and every ETA is plain work time. This is
+# the control the foreign-stall ledger below is compared against — its block is
+# what an anthropic manager reads when the machine holds no stall at all.
+ovnostall="$tmp/ovnostall"; mkdir -p "$ovnostall"
+jq '.providers.anthropic.status = "ok"
+  | .providers.anthropic.limits[0].fits = true
+  | .providers.anthropic.limits[0].projected_at_reset = 0.9
+  | .providers.anthropic.reason =
+      "anthropic:5h at 80% burning 0.4/h → 0.9× the window by 14:00Z"' \
+  "$ovstate/state.json" >"$ovnostall/state.json"
+
+# ... and the same machine again with the *other* subscription stalling: the
+# openai-codex 5h limit is at 80% burning 0.4/h, so it runs out 30 min in and
+# reopens at the 14:00Z reset, while both anthropic limits still fit. It is the
+# only stalling limit on the machine, so it is also the machine-wide record —
+# and `owner/name` and `other/shape` burn anthropic and can never wait it out.
+ovforeign="$tmp/ovforeign"; mkdir -p "$ovforeign"
+jq '.providers["openai-codex"].status = "warning"
+  | .providers["openai-codex"].limits[0].used = 0.8
+  | .providers["openai-codex"].limits[0].burn_per_hour = 0.4
+  | .providers["openai-codex"].limits[0].projected_at_reset = 2.2
+  | .providers["openai-codex"].limits[0].fits = false
+  | .providers["openai-codex"].reason =
+      "openai-codex:5h at 80% burning 0.4/h → 2.2× the window by 14:00Z"' \
+  "$ovnostall/state.json" >"$ovforeign/state.json"
+
+# and once more with this repo's own manager registered on openai-codex: same
+# stall, but now it is the caller's own subscription that holds it
+ovcodex="$tmp/ovcodex"; mkdir -p "$ovcodex"
+jq '.managers["ws-w9"].house = "openai"
+  | .managers["ws-w9"].provider = "openai-codex"' \
+  "$ovforeign/state.json" >"$ovcodex/state.json"
+
 # guard stopped: the same ledger, now stale and exhausted — the cap must not
 # move because of it. A stopped guard also carries the exit record it wrote on
 # its way out, plus the recovery time of the limit that ran out.
@@ -1205,6 +1239,92 @@ check 'which is every provider the guard sampled' 2 \
   "$(printf '%s\n' "$blkn" | sed -n '/^quota/p' | grep -o '5-hour' | wc -l | tr -d ' ')"
 check 'and still inside 120 columns' 0 \
   "$(printf '%s\n' "$blkn" | jq -R 'select(length > 120)' | wc -l | tr -d ' ')"
+
+printf '\n# 9b3. a stall on a subscription this manager cannot spend on\n'
+# The whole point of a per-provider window. On `ovforeign` the openai-codex 5h
+# limit is the machine's only stalling limit; `owner/name` burns anthropic, so
+# that window is not a wait it can ever serve — the reset is not its reset and
+# the minutes lost to it are not its minutes. Its block must therefore read
+# exactly as it does on `ovnostall`, where nothing stalls at all: same ETAs,
+# and no reset named anywhere. (Before the per-provider window the machine-wide
+# one drove every simulation: this same block read `out of work in 6h45` and
+# `#7 in 2h30 (after the 5-hour reset)` — the foreign limit's 90 minutes and
+# the foreign limit's name, on an anthropic manager's screen.)
+blkq=$(ov "$ovnostall"); rc=$?
+check 'control overview exit'     0 "$rc"
+blkf=$(ov "$ovforeign"); rc=$?
+check 'overview exit with a foreign stall' 0 "$rc"
+check "a foreign stall leaves the caller's block byte-identical" "$blkq" "$blkf"
+# ... and identical to a block that is itself unstalled, spelled out, so the
+# pair cannot pass by being bent the same wrong way twice
+check 'which is the unstalled projection' \
+  'next     #49 running, 15m left · #7 in 1h00 · #8 in 1h15 · #9 in 2h00 · #10 in 2h15 · #11 in 3h00 · #12 in 3h15' \
+  "$(printf '%s\n' "$blkf" | sed -n '/^next/p')"
+check 'and its unstalled work line' \
+  'work     1 of 2 builders running, 10 ready, 1 blocked · out of work in 5h15 (17:15Z) · queue clear in 6h00 (18:00Z)' \
+  "$(printf '%s\n' "$blkf" | sed -n '/^work/p')"
+check "no reset the caller cannot wait out is named" 0 \
+  "$(printf '%s\n' "$blkf" | grep -c 'after the' || true)"
+check "and the foreign limit is nowhere in the block" 0 \
+  "$(printf '%s\n' "$blkf" | grep -c -e 'runs out' -e codex || true)"
+
+# the same ledger read by an openai house: the quota line is that
+# subscription's, because that is what the caller burns — but `work` and `next`
+# stay the registered row's, which is still on anthropic. The window follows the
+# registration, never the env.
+blkfo=$(OV_HOUSE=openai ov "$ovforeign")
+check "the openai house reads its own limit running out" \
+  'quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · shared with 1 other project' \
+  "$(printf '%s\n' "$blkfo" | sed -n '/^quota/p')"
+check 'while the rows keep the projection of the provider they registered' \
+  "$(printf '%s\n' "$blkf" | sed -n '/^quota/!p')" \
+  "$(printf '%s\n' "$blkfo" | sed -n '/^quota/!p')"
+
+# and the same stall on the ledger where this repo's manager *is* the one
+# burning openai-codex: the window reaches the manager it belongs to, so the
+# ETAs step over it and the reset is named. Nothing is being suppressed.
+blkc=$(OV_HOUSE=openai ov "$ovcodex")
+check 'the manager that owns the stall reads it on its quota line' \
+  'quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · shared with 1 other project' \
+  "$(printf '%s\n' "$blkc" | sed -n '/^quota/p')"
+check 'and its next line names the reset it is waiting for' 1 \
+  "$(printf '%s\n' "$blkc" | grep -c '#7 in 2h30 (after the 5-hour reset)' || true)"
+# the window is the same 30-min-to-14:00Z shape the anthropic ledger holds, so
+# the projection it produces must be the same to the byte — a stall costs the
+# manager it binds exactly as much, whichever subscription it sits on
+check 'the stalled projection matches the anthropic one, minute for minute' \
+  "$(printf '%s\n' "$blk" | sed -n '/^quota/!p')" \
+  "$(printf '%s\n' "$blkc" | sed -n '/^quota/!p')"
+
+# the record stays machine-wide: `burn.stall_window` is the earliest-exhausting
+# limit on the machine whoever asks, and each manager row carries the window of
+# its own provider beside it
+ovjf=$(ov "$ovforeign" --json)
+check 'burn.stall_window is still the machine-wide earliest' \
+  "{\"from\":$((pin + 1800000)),\"to\":$((pin + 7200000)),\"limit\":\"openai-codex:5h\"}" \
+  "$(jq -c '.burn.stall_window' <<<"$ovjf")"
+check "and it names a limit no anthropic manager's row does" \
+  'other/shape=anthropic/null owner/name=anthropic/null zed/paused=openai-codex/openai-codex:5h' \
+  "$(jq -r '[.backlog.managers[]
+             | "\(.repo)=\(.provider)/\(if .stall_window == null then "null" else .stall_window.limit end)"]
+            | join(" ")' <<<"$ovjf")"
+check "the row that does carries the window itself" \
+  "{\"from\":$((pin + 1800000)),\"to\":$((pin + 7200000)),\"limit\":\"openai-codex:5h\"}" \
+  "$(jq -c '.backlog.managers[] | select(.repo == "zed/paused") | .stall_window' <<<"$ovjf")"
+check 'stall_window sits right after the provider it belongs to' 'provider,stall_window' \
+  "$(jq -r '.backlog.managers[0] | keys_unsorted as $k
+            | ($k | index("provider")) as $i | $k[$i:$i+2] | join(",")' <<<"$ovjf")"
+# the rule points the other way on the ledger where anthropic is the one
+# stalling: same document, opposite attribution
+check 'each row gets its own provider window on the anthropic-stalling ledger' \
+  'other/shape=anthropic:5h owner/name=anthropic:5h zed/paused=null' \
+  "$(jq -r '[.backlog.managers[]
+             | "\(.repo)=\(if .stall_window == null then "null" else .stall_window.limit end)"]
+            | join(" ")' <<<"$ovj")"
+# and a machine with no stalling limit at all has no window to hand anyone
+check 'no stalling limit, no window anywhere' 'null/null null null' \
+  "$(ov "$ovnostall" --json \
+     | jq -r '"\(.burn.stall_window)/\([.backlog.managers[].stall_window] | map(tostring) | join(" "))"')"
 
 printf '\n# 9c. Z only when TZ is unset\n'
 blktz=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID TZ=UTC \
