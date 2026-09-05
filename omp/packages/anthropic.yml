@@ -1,7 +1,8 @@
 # Agent package: Anthropic subscription. Apply with: mgr package anthropic
 # Rungs: Fable (top) > Opus (work) > Sonnet (mid) > Haiku (bottom, no Haiku 5 id
 # exists here, so the bottom rung collapses onto Sonnet at low).
-# Two planner rungs: plan (deep, for large builders) and review take the top rung;
+# plan (deep, for large builders), review and crux (the fumble target: a fresh
+# executor for a step a builder has failed) take the top rung;
 # sketch (light, for medium builders and small escalations) sits with
 # default/builder/large/medium on the work rung; small and smol (scouts feed the plan)
 # the mid rung; tiny (omp's own role) and commit the bottom rung at low.
@@ -14,6 +15,7 @@ modelRoles:
   default: anthropic/claude-opus-5:high
   plan: anthropic/claude-fable-5-1:high
   review: anthropic/claude-fable-5-1:high
+  crux: anthropic/claude-fable-5-1:high
   large: anthropic/claude-opus-5:high
   medium: anthropic/claude-opus-5:high
   builder: anthropic/claude-opus-5:high
