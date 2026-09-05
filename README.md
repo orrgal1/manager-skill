@@ -282,7 +282,12 @@ queue empties while it still has slots: that is the "work for the next ~3h, then
 The data is the guard's: it refreshes every live manager's repo on its own tick (see **Quota
 guard**), so the block is machine-wide and fresh even for a manager that has been quiet, and it
 works whenever `state.json` exists — `mgr overview` reads it with `mgr-guard overview`, no daemon
-required. Nothing in the harness acts on any of it: the cap is still the operator's only pace dial.
+required. The ledger row keeps at most 50 ready and 50 blocked entries per repo (with the true
+counts); the full queue lives in `MGR_STATE_DIR/backlog/<owner>__<repo>.json`, and that is what
+the simulation runs over — a repo with 200 open issues gets 200 ETAs and shows ten. A guard that
+predates this feature has no snapshot yet: restart it (`mgr guard stop`, `mgr guard start`) and
+the next tick fills the backlog in. Nothing in the harness acts on any of it: the cap is still the
+operator's only pace dial.
 
 ## Status line
 
