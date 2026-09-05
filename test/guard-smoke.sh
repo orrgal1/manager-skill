@@ -108,6 +108,7 @@ iso_ms() { # iso_ms <ms>
 }
 
 mk_usage() { # mk_usage <file> <status> <used-fraction> <resets-at-ms>
+  # written whole then renamed: scenario (u) flips this file under a live daemon's fake `omp`
   jq -n --arg st "$2" --argjson uf "$3" --argjson r "$4" '
     {generatedAt: 0,
      reports: [{provider: "anthropic", fetchedAt: 0,
@@ -117,7 +118,7 @@ mk_usage() { # mk_usage <file> <status> <used-fraction> <resets-at-ms>
                  amount: {used: ($uf * 100), limit: 100, remaining: ((1 - $uf) * 100),
                           usedFraction: $uf, remainingFraction: (1 - $uf), unit: "percent"},
                  status: $st}],
-       metadata: {}}]}' >"$1"
+       metadata: {}}]}' >"$1.tmp" && mv -f "$1.tmp" "$1"
 }
 
 mk_agent() { # mk_agent <name|null> <pane> <ws> <status> <session>
@@ -1264,6 +1265,8 @@ else
 fi
 # the scenarios below inherit FAKE_AGENTS: hand back the two-manager fixture, not the empty one
 export FAKE_AGENTS="$TMP/agents-a.json"
+# a daemon that failed to idle-exit must not outlive the suite
+MGR_STATE_DIR="$DAEMON_STATE" "$GUARD" stop >/dev/null 2>&1
 DAEMON_STATE=""
 
 printf '\n== degraded providers (omp/herdr unusable) ==\n'
