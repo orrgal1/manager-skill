@@ -33,6 +33,9 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   permissions, on the top rung; `sweep`, the same review contract, on the work rung. The full
   suite follows the diff surface too, gated by a per-repo `rigor` dial (`mgr config set rigor`,
   `MGR_RIGOR`; default `production`) rather than the size (builder.md §7).
+  A per-repo `sizing` dial (`mgr config set sizing`, `MGR_SIZING`; `lean|balanced|careful`,
+  default `balanced`) biases only that tie-break when intake or a builder cannot decide a size
+  outright — it never overrides a decided size.
 - **One model package per subscription.** `mgr setup` installs the eight agents (`tiny`, `small`,
   `medium`, `large`, `plan`, `sketch`, `crux`, `sweep`) into the omp agent directory and applies
   `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,
@@ -128,6 +131,7 @@ mgr config add omp-arg /abs/ext.ts
 mgr config add env LINK=ws://127.0.0.1:1234/link
 mgr config set brief-extra /abs/directive.md
 mgr config set rigor sprint
+mgr config set sizing lean
 mgr config list
 ```
 

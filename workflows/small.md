@@ -11,6 +11,11 @@ Resize only upward, never down. This file is the whole build-and-verify process 
 
 Any box fails → resize to `medium`.
 
+Your brief named your sizing bias — `lean`, `balanced` or `careful` (builder.md §7). It decides
+which way a box you cannot call goes: under `lean` a borderline box passes and you stay here,
+under `careful` it fails and you resize up, and under `balanced` a genuine toss-up resizes up.
+It never rescues a box that is plainly false — a clear-cut failure resizes at every setting.
+
 ## Steps
 
 1. Map first. Dispatch one `scout` for the map — where the change goes, with `file:line` refs —

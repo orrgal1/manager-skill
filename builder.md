@@ -132,13 +132,13 @@ gh issue comment <N> --body "builder: started · <the plan your size file asks f
 
 ## 7. Build and verify — your size
 
-Your brief named your size, your rigor and the absolute path of the workflow directory. The file
-`workflows/<size>.md`, beside this one, is your complete build-and-verify process at that size:
-read it before you touch code and follow it exactly. It owns the planning, the delegation, which
-checks exist at your size and which never run, and whether a review pass happens at all — that
-decision is the size file's, not this contract's. **Which** reviewer runs, on which rung, and when
-the full suite fires, is this contract's: the diff surface and your rigor decide it, not your size
-(below).
+Your brief named your size, your rigor, your sizing bias and the absolute path of the workflow
+directory. The file `workflows/<size>.md`, beside this one, is your complete build-and-verify
+process at that size: read it before you touch code and follow it exactly. It owns the planning,
+the delegation, which checks exist at your size and which never run, and whether a review pass
+happens at all — that decision is the size file's, not this contract's. **Which** reviewer runs,
+on which rung, and when the full suite fires, is this contract's: the diff surface and your rigor
+decide it, not your size (below).
 
 Build to acceptance and nothing beyond it. Follow the repo's existing conventions — read
 neighbouring code before inventing a pattern. Commit in scoped steps as you go.
@@ -168,10 +168,12 @@ Then post the marker:
 gh issue comment <N> --body "builder: delegated planning to <planner> · <which trigger>"
 ```
 
-**Resize upward** — the other dial: it changes the verification burden — which checks run, whether
-a review pass happens — and it is upward only, never down. Your branch, your worktree and your
-issue do not change. The moment the work fails your size file's scope test, or hits one of its
-budget signals, switch up — before you build more, not in the report:
+**Resize upward** — the other dial: it changes the verification burden — which checks run,
+whether a review pass happens — and it is upward only, never down. Your branch, your worktree and
+your issue do not change. Your sizing bias decides which way a borderline scope-test box falls,
+never whether one exists, and it never licenses a downward resize (below). The moment the work
+fails your size file's scope test, or hits one of its budget signals, switch up — before you
+build more, not in the report:
 
 ```bash
 gh issue comment <N> --body "builder: resized <from>→<to>"
@@ -224,6 +226,22 @@ Two precedences, so that one event never has two outcomes. A file that would als
 file's scope test is a resize, never a fan-out: the ceiling only moves work that is still in scope.
 And when a fumble trigger and the ceiling fire on the same edit, escalate — a failing step never
 goes to a slice agent on your own rung.
+
+### Your sizing bias
+
+Your brief named your sizing bias: `lean`, `balanced` or `careful`, a per-repo dial the operator
+sets (`mgr config set sizing`) and `balanced` when nothing is set. It decides which way a
+scope-test box you cannot call falls — under `lean` it falls down and you stay at this size,
+under `careful` it falls up, and under `balanced` a genuine toss-up falls up. No setting ever
+resizes work downward.
+
+**The floor** — the dial never rescues a box that is plainly false; a clear-cut failure resizes
+at every setting. It also never demotes a decided classification: work that touches a shared
+library, a schema or routing, or whose callers you cannot enumerate, is `large` at every setting,
+and the same holds at each rung below. That is why the dial is not a numeric offset applied after
+classification — an offset would demote a decided `large` and hand a migration to a builder with
+no plan step. `sizing` and `rigor` are orthogonal dials: one biases classification, the other
+sets verification strictness.
 
 ### Which checks, and under which rigor
 
