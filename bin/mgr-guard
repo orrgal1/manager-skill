@@ -216,15 +216,17 @@ def same_window($a; $b):
     | (($r.prev_recovers_at // null)) as $hold
     | (if $r.ok then
          {status: $fresh, reason: $fitted,
-          recovers_at: (if ($ex | length) > 0 then (($ex | first).resets_at // null) else null end)}
+          recovers_at: (if ($ex | length) > 0 then (($ex | first).resets_at // null) else null end),
+          exhausted_limit: (if ($ex | length) > 0 then ($ex | first).id else null end)}
        elif ($hold != null) and ($now < $hold) then
-         {status: "exhausted", recovers_at: $hold,
+         {status: "exhausted", recovers_at: $hold, exhausted_limit: ($r.prev_exhausted_limit // null),
           reason: ("unknown: holding last verdict (exhausted until " + iso($hold) + ")")}
-       else {status: "unknown", recovers_at: null, reason: "unknown: no reading"} end) as $v
+       else {status: "unknown", recovers_at: null, exhausted_limit: null, reason: "unknown: no reading"} end) as $v
     | {key: $r.provider,
        value: {status: $v.status, ok: ($r.ok // false), fetched_at: ($r.fetched_at // null),
                usage_fetch_failures: (if $r.ok then 0 else (($r.prev_failures // 0) + 1) end),
-               recovers_at: $v.recovers_at, reason: $v.reason, limits: $limits}}
+               recovers_at: $v.recovers_at, exhausted_limit: $v.exhausted_limit,
+               reason: $v.reason, limits: $limits}}
   ) | from_entries) as $providers
 
 # ---- the 429 ledger, upserted against the previous tick. Nothing else lands here: a builder
@@ -242,6 +244,8 @@ def same_window($a; $b):
        retry_after_ms: $s.retry_after_ms,
        recovers_at: (((($pv | if . == null then null else .recovers_at end))
                       // (if $p == null then null else ($p.recovers_at // null) end))),
+       limit: (((($pv | if . == null then null else .exhausted_limit end))
+                // (if $p == null then null else ($p.limit // null) end))),
        manager_id: ($ws2mgr[($a.workspace_id // "")] // null)}
       + (if ($p != null) and ($p.since == $s.since)
          then {attempts: ($p.attempts // 0), last_reignite_at: ($p.last_reignite_at // null),
@@ -260,9 +264,9 @@ def same_window($a; $b):
      | ((($st.recovers_at // null) != null) and ($now >= $st.recovers_at)) as $reset_passed
      | select($positive or $reset_passed)
      | (($pv | if . == null then [] else (.limits // []) end)) as $ls
-     | (if $positive then ($ls | max_by(.used))
-        else (($ls | map(select(same_window(.resets_at; ($st.recovers_at // null)))) | first)
-              // ($ls | max_by(.used))) end) as $l
+     # the prompt names the limit whose reset we were waiting for when it is known,
+     # otherwise the fullest one — the 429 came from the window closest to full
+     | ((($ls | map(select(.id == ($st.limit // ""))) | first) // ($ls | max_by(.used)))) as $l
      | (($l | if . == null then "quota" else .id end)) as $lid
      | (($st.recovers_at // ($l | if . == null then null else (.resets_at // null) end))) as $rat
      | {pane_id: $st.pane_id, provider: ($st.provider // "unknown"), limit: $lid,
@@ -420,6 +424,7 @@ fetch_provider() { # fetch_provider <provider> <prev-state> -> normalized report
        | {provider:$p, ok:true, fetched_at:(.fetchedAt // null),
           prev_failures:($pp.usage_fetch_failures // 0),
           prev_recovers_at:($pp.recovers_at // null),
+          prev_exhausted_limit:($pp.exhausted_limit // null),
           limits:[.limits[]? | {id:(.id // "unknown"), label:(.label // .id // "unknown"),
                                 status:(.status // "unknown"),
                                 used:(.amount.usedFraction // 0),
@@ -431,6 +436,7 @@ fetch_provider() { # fetch_provider <provider> <prev-state> -> normalized report
        | {provider:$p, ok:false, fetched_at:($pp.fetched_at // null),
           prev_failures:($pp.usage_fetch_failures // 0),
           prev_recovers_at:($pp.recovers_at // null),
+          prev_exhausted_limit:($pp.exhausted_limit // null),
           limits:[($pp.limits // [])[] | {id, label, status, used, resets_at}]}'
   fi
 }

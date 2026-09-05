@@ -373,7 +373,7 @@ read -r WIN_C SLOPE_C <<<"$(fit_window "$SD_C/samples.jsonl" anthropic:5h "$CUR_
 read -r COLL_C COLLSLOPE_C <<<"$(fit_window "$SD_C/samples.jsonl" anthropic:5h "$CUR_C" 0)"
 assert_jq "(c) provider row shape" "$ST_C" \
   '(.providers.anthropic | keys)
-   == ["fetched_at","limits","ok","reason","recovers_at","status","usage_fetch_failures"]'
+   == ["exhausted_limit","fetched_at","limits","ok","reason","recovers_at","status","usage_fetch_failures"]'
 assert_jq "(c) limit row shape" "$ST_C" \
   '(.providers.anthropic.limits[0] | keys)
    == ["burn_per_hour","fits","hours_to_reset","id","label","projected_at_reset","resets_at",
@@ -443,21 +443,21 @@ mk_usage "$TMP/usage-e-exhausted.json" exhausted 1 "$RECOV_E"
 export FAKE_USAGE="$TMP/usage-e-exhausted.json"
 reg "$SD_E" "$NOW_E" ws-w3 w3 w3:p1 3 1 0 0 >/dev/null
 ST_E="$(MGR_STATE_DIR="$SD_E" MGR_GUARD_NOW_MS="$NOW_E" "$GUARD" tick)"
-assert_jq "(e) status exhausted with recovers_at" "$ST_E" \
+assert_jq "(e) status exhausted with recovers_at and the limit that did it" "$ST_E" \
   '.providers.anthropic.status == "exhausted" and .providers.anthropic.ok == true
-   and .providers.anthropic.recovers_at == '"$RECOV_E"
+   and .providers.anthropic.recovers_at == '"$RECOV_E"' and .providers.anthropic.exhausted_limit == "anthropic:5h"'
 assert_jq "(e) exactly one exhausted event" "$ST_E" \
   '[.events[] | select(.kind == "exhausted")] | length == 1'
 assert_jq "(e) the exhausted event names the reset" "$ST_E" \
   '[.events[] | select(.kind == "exhausted")] | first | .detail == "anthropic: exhausted until '"$(iso_of "$RECOV_E")"'"'
 assert_jq "(e) stall entry shape" "$ST_E" \
   '(.stalled | length) == 1 and (.stalled[0] | keys)
-   == ["attempts","error","last_reignite_at","manager_id","model","name","next_reignite_at",
+   == ["attempts","error","last_reignite_at","limit","manager_id","model","name","next_reignite_at",
        "pane_id","provider","recovers_at","retry_after_ms","session","since","workspace_id"]'
 assert_jq "(e) the entry is attributed and carries recovers_at" "$ST_E" \
   '.stalled[0] | .pane_id == "w3:p9" and .name == "issue-9" and .manager_id == "ws-w3"
    and .provider == "anthropic" and .retry_after_ms == 976000 and .since == '"$T0"'
-   and .attempts == 0 and .last_reignite_at == null and .recovers_at == '"$RECOV_E"
+   and .attempts == 0 and .last_reignite_at == null and .recovers_at == '"$RECOV_E"' and .limit == "anthropic:5h"'
 assert_jq "(e) next_reignite_at is since + min(retry_after, 15m)" "$ST_E" \
   '.stalled[0].next_reignite_at == '"$(( T0 + 900000 ))"
 assert_eq "(e) no prompt while exhausted" 0 "$(lines_of "$FAKE_PROMPTS")"
