@@ -50,8 +50,9 @@ downward, and a box that is plainly true keeps you here whatever the dial says.
 8. **Fix failures.** Re-review only if the fixes touched logic outside the diff already reviewed.
 9. **Done** — review clean when a pass ran, the set green.
 
-**Escalation.** A fumble trigger (builder.md §7), or a review finding you intend to decline: hand
-that step to a fresh `crux` agent — the top rung — and never retry it at your own level. A planning
+**Escalation.** A fumble trigger (builder.md §7), or a **HIGH** review finding you intend to
+decline (a MEDIUM or LOW one you decline with a reason, builder.md §7): hand that step to a fresh
+`crux` agent — the top rung — and never retry it at your own level. A planning
 trigger mid-build (builder.md §7) sends the work back to `plan` for a revision; you stay under this
 file.
 

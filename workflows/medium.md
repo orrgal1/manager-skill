@@ -43,8 +43,9 @@ failure resizes at every setting.
    planning trigger mid-build (builder.md §7) is not a resize: stop, dispatch `sketch`, continue
    under this file.
 
-**Escalation.** A fumble trigger (builder.md §7), or a review finding you intend to decline: hand
-that step to a fresh `crux` agent — the top rung — and never retry it at your own level.
+**Escalation.** A fumble trigger (builder.md §7), or a **HIGH** review finding you intend to
+decline (a MEDIUM or LOW one you decline with a reason, builder.md §7): hand that step to a fresh
+`crux` agent — the top rung — and never retry it at your own level.
 
 ## Verification
 

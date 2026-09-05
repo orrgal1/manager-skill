@@ -198,8 +198,10 @@ escalating the default action, not an option:
 
 You count these; you do not judge them. The counts are per step, and what `crux` returns resets
 them — that is a different step. A review finding you intend to decline is a sixth cause,
-uncounted — escalate it directly and name it as such in the marker's `<which trigger>`. A resize
-does not reset the counts either. Then post the marker:
+uncounted, but only when the reviewer labelled it **HIGH** — escalate that one directly and name it
+as such in the marker's `<which trigger>`. A MEDIUM or LOW finding you decline is declined with a
+reason and recorded in the fix-round list; it does not escalate, because at that severity your own
+judgement is the cheaper answer. A resize does not reset the counts either. Then post the marker:
 
 ```bash
 gh issue comment <N> --body "builder: escalated <what> · <which trigger>"
@@ -295,8 +297,8 @@ its `sweep` pass and its fix round: the list floors at the work rung there, neve
 `sprint` there is no floor: a docs-only `large` gets no pass, like any other size.
 
 A finding is a finding whoever returned it. Fix it or decline it with a reason, re-run the same
-check set, and a decline you intend to keep is the uncounted escalation cause above: it goes to a
-fresh `crux`.
+check set, and keep the declines with the change. A decline escalates to a fresh `crux` only on the
+terms the escalation dial above sets.
 
 ## 8. Pull request
 
