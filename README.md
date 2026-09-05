@@ -26,8 +26,8 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   `### Intake map`, which the builder's own step 1 then narrows or skips its scouting against.
   Every session runs on `--model @builder` with the house's `omp/packages/<house>.yml` overlaid,
   so the size picks the workflow and the agents slices go to, never the model. A builder that
-  outgrows its size resizes upward itself. Its own context is for orchestration and
-  integration — scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; `small`
+  outgrows its size resizes upward itself. The builder's own context is for orchestration and
+  integration — its scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; `small`
   plans in-session, `tiny` does neither) do the reading and the deciding and return compressed,
   its own in-session implementation capped by the ceiling in the builder contract (builder.md
   §7) — and it can delegate the planning without resizing. A fumble trigger (builder.md §7)

@@ -23,7 +23,8 @@ briefs `mgr` sends to builders already carry those absolute paths — you never 
 yourself.
 
 Everything else you run is `gh` (issues) and `herdr agent read` / `herdr agent send-keys`
-(looking at and interrupting a builder). Never `git`, except read-only.
+(looking at and interrupting a builder), plus the one read-only `scout` intake dispatches
+to size an issue (§3(b)). Never `git`, except read-only.
 
 ## Preconditions
 
@@ -145,6 +146,8 @@ gh issue list --state open --search "<keywords from the request>"
 gh issue create --title "<imperative, ≤70 chars>" --body-file -
 ```
 
+Before this fires: the exploration step below, and the size it feeds.
+
 Body:
 
 ```markdown
@@ -158,18 +161,18 @@ What and why, in the operator's terms.
 ## Notes
 Constraints, files, prior art, decisions already made.
 
+Blocked by: #12, #15
+
 ### Intake map
 Where this lands, from a read-only scout at intake — evidence, not a contract. Wrong on a detail →
 follow the code and say so on the issue.
 - `path/to/file.ts:120-160` — what is there, why it is in scope
 - callers: <roughly how many; enumerable or not> · crosses: <schema / shared lib / routing, or none>
 - slices: <roughly how many independent pieces> · pattern: <the existing one that covers it, or none>
-
-Blocked by: #12, #15
 ```
 
 Acceptance is the builder's definition of done — write outcomes it can verify, not steps.
-Drop `Blocked by:` when nothing blocks it.
+Drop `Blocked by:` when nothing blocks it, and `### Intake map` when no scout ran (below).
 
 **Explore before you size, and not in your own context.** Dispatch one read-only `scout` and size
 from what it returns — you do not read repo files to size an issue; intake is bound by the same
@@ -186,7 +189,9 @@ falls into; whether an existing pattern in the repo already covers it. Cap it in
 compressed map with `file:line` refs, not a survey, and nothing about how to build the thing — the
 approach belongs to the builder's planner, not to intake. **The scout returns evidence; you return
 the size.** It never names a label, and a map that smells `medium` decides nothing on its own: the
-table, the bias and the tie-break below are still yours.
+table, the bias and the tie-break below are still yours. A scout that comes back empty or unusable
+does not stop intake — size from the request under the bias, say in the Notes that the map is
+missing, and let the builder's own step 1 map it.
 
 Paste that map into the body's `## Notes` under `### Intake map`, that heading verbatim — the
 builder's own step 1 reads it there and narrows or skips its scouting against it.
@@ -272,7 +277,7 @@ worktree — nothing to remember. `--cap N` still overrides it for a single call
 Exit 0 → go to **Waiting** for N. Exit 3 → the refusal message says which precondition failed (not
 open, already labelled, open blockers, no free slot, agent live, worktree exists, no `size:` label,
 several `size:` labels); explain it to the operator and pick the next action. The two size refusals
-are fixed with `$MGR size <N> <size>` before relaunching.
+are fixed with `$MGR size <N> <size>` — sized the way intake sizes (§3(b)) — before relaunching.
 
 Never create a tab, a worktree or a branch by hand, never focus or raise a tab, and never read or
 write inside a builder's worktree.
@@ -333,7 +338,7 @@ Trust the report, not the idle state.
 | approve #N | `$MGR prompt N "Approved. Land it now per the Landing section of builder.md."` then wait |
 | request changes on #N | `$MGR prompt N "Changes requested: <verbatim feedback>"` then wait |
 | cancel #N | `herdr agent send-keys issue-N ctrl+c`, then `$MGR retire N` — add `--close` only if the work is dropped, not deferred |
-| size #N `<size>` / resize #N `<size>` | `$MGR size N <size>` — swaps the `size:` label for the new one. Refused with exit `3` while the issue is `mgr:in-flight`: a live builder resizes itself, upward, and comments when it does. Then `$MGR board` |
+| size #N `<size>` / resize #N `<size>` | `$MGR size N <size>` — swaps the `size:` label for the new one, sized the way intake sizes (§3(b)). Refused with exit `3` while the issue is `mgr:in-flight`: a live builder resizes itself, upward, and comments when it does. Then `$MGR board` |
 | set the cap to N | `$MGR config set cap N` (persisted in the repo, shared by every worktree), then `$MGR board`. The cap is the only pace dial there is — nothing lowers it behind your back |
 | set the house to X | `$MGR config set house X` (`anthropic`\|`openai`\|`gemini`), then `$MGR board` — every builder launched after it overlays that house's package |
 | set the rigor to X | `$MGR config set rigor X` (`sprint`\|`production`; default `production`), then `$MGR board` — every builder briefed after it verifies under that rigor (`builder.md §7`); the operator's call, never a builder's |
@@ -456,7 +461,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 ### Issue body
 
 `## Summary`, `## Acceptance` (checkboxes), `## Notes` — carrying `### Intake map` when intake
-ran a scout (§3(b)) — optional `Blocked by: #12, #15`.
+ran a scout (§3(b)) — and an optional `Blocked by: #12, #15`.
 Only **open** referenced issues block.
 
 ### Naming

@@ -17,19 +17,20 @@ downward, and a box that is plainly true keeps you here whatever the dial says.
 
 ## Steps
 
-1. **Map, then plan** — more than one area in scope → dispatch ONE parallel batch of `scout`s, one
-   per area, each returning a compressed map with `file:line` refs; a single area skips them. An
-   `### Intake map` in the issue Notes has already walked some of that ground — dispatch scouts
-   only for the areas it leaves open, and none when it covers them all. It is evidence, not a
-   contract: where it disagrees with the code the code wins, and you say so on the issue. Hand the
-   issue, its acceptance list and those maps to the `plan` agent — the deep planner: it returns
-   the approach, the risks, the cross-slice contracts (interfaces, schemas, file ownership) and
-   the verification plan. You own what comes back and amend what is wrong in it. You do not read
-   source yourself before the plan returns: the scouts and the planner read; you read code when
-   you integrate. Load-bearing ambiguity — you cannot build the right thing without an answer —
-   stops the work and asks rather than guesses (a session under builder.md reports blocked, §11).
-   Post or state the plan before you touch code; a session under builder.md posts it as its start
-   marker (§6).
+1. **Map, then plan** — more than one area in scope → dispatch ONE parallel batch of `scout`s, one per
+   area, each returning a compressed map with `file:line` refs; a single area skips them. An
+   `### Intake map` in the issue Notes, where there is one, has already walked some of that ground —
+   dispatch scouts only for the areas it leaves open, and none when it covers them all. It is
+   evidence, not a contract: where it disagrees with the code the code wins, and you say so on the
+   issue. A disagreement that changes the shape of the work is a planning trigger (builder.md §7), not
+   a detail. Hand the issue, its acceptance list and those maps (the `### Intake map` among them) to
+   the `plan` agent — the deep planner: it returns the approach, the risks, the cross-slice contracts
+   (interfaces, schemas, file ownership) and the verification plan. You own what comes back and amend
+   what is wrong in it. You do not read source yourself before the plan returns: the scouts and the
+   planner read; you read code when you integrate. Load-bearing ambiguity — you cannot build the right
+   thing without an answer — stops the work and asks rather than guesses (a session under builder.md
+   reports blocked, §11). Post or state the plan before you touch code; a session under builder.md
+   posts it as its start marker (§6).
 2. **Break up** — the same `plan` call returns the slice table: slice, size, depends-on, agent. A
    slice that is itself large is split further; never dispatch one whole. Amend the table where it
    is wrong, then post or state it.
