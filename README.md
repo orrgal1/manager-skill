@@ -16,6 +16,12 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   (`mgr:in-flight`, `mgr:awaiting-approval`) and the per-issue policy (`mgr:manual-approve`).
 - **One builder per issue**, in a [herdr](https://herdr.dev) tab named `#N <slug>`, on branch
   `issue-N-<slug>`, in worktree `<repo>-issue-N-<slug>`. The primary checkout stays clean.
+- **Every issue is sized.** Intake puts exactly one `size:tiny` / `size:small` / `size:medium` /
+  `size:large` label on the issue (`mgr size N <size>` changes one that is not in flight), the brief
+  names the size, and `mgr launch` starts the session with `--model @<size>` and sends it to
+  `workflows/<size>.md` — the whole build-and-verify process at that size: what may be delegated,
+  which checks run and which never do. `--model @<size>` requires `tiny`, `small`, `medium` and
+  `large` in the operator's omp `modelRoles`. A builder that outgrows its size resizes upward itself.
 - **A concurrency cap** (default 3; `mgr config set cap N`, `MGR_CAP` or `--cap N`). New requests
   are slotted: launched now, queued behind the in-flight set, or blocked by `Blocked by: #a, #b`
   in the issue body.
@@ -59,14 +65,14 @@ Builders launched by `mgr launch` get the status-line extension automatically �
 `--extension <checkout>/extensions/mgr-status.ts` to omp itself — so `--omp-extension` is only
 needed for sessions `mgr` did not start: adopted tabs and the manager's own.
 
-`mgr` resolves `builder.md` and its own path from its real location (symlinks followed), so the
-briefs work from the symlink or from `node_modules`.
+`mgr` resolves `builder.md`, the `workflows/` directory and its own path from its real location
+(symlinks followed), so the briefs work from the symlink or from `node_modules`.
 
 ## As a dependency
 
 ```sh
 pnpm add github:orrgal1/manager-skill     # or: npm install github:orrgal1/manager-skill
-node_modules/.bin/mgr paths               # {"root","skill_md","builder_md","mgr"} — absolute
+node_modules/.bin/mgr paths               # {"root","skill_md","builder_md","workflows","mgr"} — absolute
 node_modules/.bin/mgr --version           # {"version":"…"}
 ```
 
@@ -118,7 +124,8 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
-| `bin/mgr` | `labels` · `board` · `overview` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
+| `workflows/<size>.md` | The four size workflows — `tiny` · `small` · `medium` · `large` — that `builder.md` hands build and verify off to |
+| `bin/mgr` | `labels` · `board` · `overview` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `size` · `guard` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
 | `bin/mgr-guard` | `start` · `stop` · `status` · `overview` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
 | `extensions/mgr-status.ts` | omp status-line indicator: rate-limited / guard stopped / project paused, optional burn item |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager`; `--omp-extension` also links the status-line extension into `~/.omp/agent/extensions/` |
