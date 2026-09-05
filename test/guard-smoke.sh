@@ -358,6 +358,51 @@ BAD_NUM="$(MGR_STATE_DIR="$SD_REG" "$GUARD" register \
   '{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1","repo":"a/b","primary":"/p","cap":"3","in_flight":0,"adopting":0,"ready":0}' 2>&1)"
 assert_eq "register non-number exit code" 2 "$?"
 assert_jq "register non-number error" "$BAD_NUM" '.error.message | test("not numbers: cap")'
+# house/provider steer the poll set and index state.providers, so a value that is *there* has
+# to be an id: a number or an array used to abort the whole projection for every manager on the
+# machine. Both keys stay optional in both directions of version skew -- an older `mgr` sends
+# neither, and the current one sends provider: null when the house cannot be resolved.
+reg_payload() { # reg_payload <manager_id> <extra-json>: a complete registration plus <extra>
+  jq -nc --arg id "$1" --argjson extra "$2" \
+    '{manager_id:$id, workspace_id:"w9", pane_id:"w9:p1", repo:"a/b", primary:"/p",
+      cap:3, in_flight:0, adopting:0, ready:0} + $extra'
+}
+reg_reject() { # reg_reject <label> <manager_id> <extra-json> <keys-named-in-the-error>
+  local out rc
+  out="$(MGR_STATE_DIR="$SD_REG" MGR_GUARD_NOW_MS="$T0" "$GUARD" register \
+    "$(reg_payload "$2" "$3")" 2>&1)"
+  rc=$?
+  assert_eq "register rejects $1: exit code" 2 "$rc"
+  assert_jq "register rejects $1: the error names $4" "$out" \
+    '.error.code == 2
+     and (.error.message | test("register: must match \\[A-Za-z0-9._:-\\]\\+ : '"$4"'$"))'
+  if [ -e "$SD_REG/managers/$2.json" ]; then
+    fail "register rejects $1: managers/$2.json was written anyway"
+  else
+    pass "register rejects $1: no registration written"
+  fi
+}
+reg_accept() { # reg_accept <label> <manager_id> <extra-json> <filter-on-the-row-on-disk>
+  local out rc
+  out="$(MGR_STATE_DIR="$SD_REG" MGR_GUARD_NOW_MS="$T0" "$GUARD" register \
+    "$(reg_payload "$2" "$3")" 2>&1)"
+  rc=$?
+  assert_eq "register accepts $1: exit code" 0 "$rc"
+  assert_jq "register accepts $1: the row it wrote" "$(cat "$SD_REG/managers/$2.json" 2>/dev/null)" "$4"
+}
+reg_reject "a numeric provider"          ws-numprov   '{"provider":123}'                provider
+reg_reject "an object house"             ws-objhouse  '{"house":{"name":"anthropic"}}'  house
+reg_reject "an array house"              ws-arrhouse  '{"house":["anthropic"]}'         house
+reg_reject "a glob character"            ws-globprov  '{"provider":"zzz-*"}'            provider
+reg_reject "a provider with a space"     ws-spaceprov '{"provider":"anthropic openai"}' provider
+reg_accept "an explicit null provider"   ws-nullprov  '{"provider":null}' \
+  '.manager_id == "ws-nullprov" and has("provider") and .provider == null'
+reg_accept "an explicit null house"      ws-nullhouse '{"house":null}' \
+  'has("house") and .house == null'
+reg_accept "the old-mgr payload, neither key" ws-nokeys '{}' \
+  '(has("provider") | not) and (has("house") | not) and .seen_at == '"$T0"
+reg_accept "a legitimate provider and house" ws-goodprov '{"provider":"openai-codex","house":"openai"}' \
+  '.provider == "openai-codex" and .house == "openai"'
 
 printf '\n== (b) managers: liveness, dead drop, last_report files ==\n'
 SD_B="$TMP/s-b"
@@ -1284,10 +1329,12 @@ assert_json "(t) overview output" "$OV_T"
 assert_jq "(t) burn.stall_window stays machine-wide, naming the stalling provider's limit" "$OV_T" \
   '.burn.stall_window
    == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
-# THE regression assertion: before the fix every row got $win uniformly, so the fitting
-# anthropic manager would have carried openai-codex's window here. Now it gets none.
+# the key has to be present *and* null: before the per-provider fix the row carried no
+# stall_window key at all, and jq reads an absent key as null too -- a bare `== null` here
+# passed against both guards
 assert_jq "(t) the fitting provider's manager carries no window (acceptance box 5)" "$OV_T" \
-  '[.backlog.managers[] | select(.manager_id == "ws-fit")] | first | .stall_window == null'
+  '[.backlog.managers[] | select(.manager_id == "ws-fit")] | first
+   | has("stall_window") and .stall_window == null'
 assert_jq "(t) the stalling provider's manager carries its own window" "$OV_T" \
   '[.backlog.managers[] | select(.manager_id == "ws-stall")] | first | .stall_window
    == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
@@ -1297,8 +1344,10 @@ assert_jq "(t) the provider-less manager keeps the machine-wide fallback window"
 # the window actually reaches the simulation, not just the row: cap 1, five 10-minute
 # items with no window drain by T0+3000000 (50m); with the 30m/2h window in effect the
 # fourth item's slot opens inside the window and gets bumped to the reset, landing the
-# queue's drain at T0+8400000 (2h20m) -- past the 2h reset, unlike the fitting manager
-assert_jq "(t) the fitting manager's queue drains well inside the window, untouched" "$OV_T" \
+# queue's drain at T0+8400000 (2h20m) -- past the 2h reset, unlike the fitting manager.
+# This is the assertion that discriminates: under the old uniform $win the fitting manager
+# carried openai-codex's window into its own simulation and drained at T0+8400000 with the rest
+assert_jq "(t) THE regression assertion: the fitting manager's queue drains well inside the window, untouched" "$OV_T" \
   '[.backlog.managers[] | select(.manager_id == "ws-fit")] | first
    | .backlog_drains_at == '"$(( T0 + 3000000 ))"' and .backlog_drains_at < '"$(( T0 + 7200000 ))"
 assert_jq "(t) the stalling manager's queue is pushed past its own reset" "$OV_T" \
@@ -1313,11 +1362,100 @@ assert_jq "(t) relationally: the stalling and fallback managers drain identicall
    and (([.backlog.managers[] | select(.manager_id == "ws-stall")] | first | .backlog_drains_at)
         > ([.backlog.managers[] | select(.manager_id == "ws-fit")] | first | .backlog_drains_at))'
 
+printf '\n== (w) a non-string provider names no provider, and never aborts the projection ==\n'
+# re-review finding on the fix round: the per-provider lookup indexed $wins with whatever the
+# registration had put in .provider, so a number or an array there aborted the whole jq program
+# -- `overview` exit 1, and `mgr board`'s overview null for every manager on the machine.
+# `register` refuses to write one now, so this ledger is hand-authored exactly like (t)'s: a
+# state file written before that validation existed still has to project. A non-string names no
+# provider in particular, so it keeps the machine-wide window, same as naming none at all.
+SD_W="$TMP/s-w"; mkdir -p "$SD_W"
+jq -n --argjson t "$T0" '
+  {version:2, tick_at:$t, interval_s:60, builder_provider:"anthropic",
+   providers:{
+     anthropic:{status:"ok", ok:true, recovers_at:null, exhausted_limit:null,
+       limits:[{id:"anthropic:5h", label:"5h", status:"ok", used:0.5,
+                resets_at:($t + 7200000), burn_per_hour:0, projected_at_reset:0.5,
+                fits:true, hours_to_reset:2, sample_count:1, samples:[]}]},
+     "openai-codex":{status:"warning", ok:true, recovers_at:null, exhausted_limit:null,
+       limits:[{id:"openai-codex:5h", label:"5h", status:"warning", used:0.8,
+                resets_at:($t + 7200000), burn_per_hour:0.4, projected_at_reset:2.2,
+                fits:false, hours_to_reset:2, sample_count:4, samples:[]}]}},
+   managers:{
+     "ws-num":{manager_id:"ws-num", repo:"acme/num", provider:123,
+               live:true, pane_alive:true, cap:1, adopting:0,
+               backlog_at:$t, backlog_error:null,
+               throughput:{n:5, median_s:600, p80_s:700, last_10_mean_s:650,
+                           estimated:false, source:"repo"},
+               backlog:{ready:[range(1;6) | {number:., title:("m" + (. | tostring)), blocked_by:[]}],
+                        blocked:[], in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+                        counts:{ready:5, blocked:0, in_flight:0, awaiting_approval:0, open:5}}},
+     "ws-arr":{manager_id:"ws-arr", repo:"acme/arr", provider:["anthropic"],
+               live:true, pane_alive:true, cap:1, adopting:0,
+               backlog_at:$t, backlog_error:null,
+               throughput:{n:5, median_s:600, p80_s:700, last_10_mean_s:650,
+                           estimated:false, source:"repo"},
+               backlog:{ready:[range(1;6) | {number:., title:("a" + (. | tostring)), blocked_by:[]}],
+                        blocked:[], in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+                        counts:{ready:5, blocked:0, in_flight:0, awaiting_approval:0, open:5}}},
+     "ws-str":{manager_id:"ws-str", repo:"acme/str", provider:"anthropic",
+               live:true, pane_alive:true, cap:1, adopting:0,
+               backlog_at:$t, backlog_error:null,
+               throughput:{n:5, median_s:600, p80_s:700, last_10_mean_s:650,
+                           estimated:false, source:"repo"},
+               backlog:{ready:[range(1;6) | {number:., title:("s" + (. | tostring)), blocked_by:[]}],
+                        blocked:[], in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+                        counts:{ready:5, blocked:0, in_flight:0, awaiting_approval:0, open:5}}}},
+   stalled:[], events:[]}' >"$SD_W/state.json"
+OV_W="$(MGR_STATE_DIR="$SD_W" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 50 2>&1)"
+assert_eq "(w) overview still exits 0 with a non-string provider in state" 0 "$?"
+assert_json "(w) overview output" "$OV_W"
+assert_jq "(w) every live manager still gets a row" "$OV_W" \
+  '[.backlog.managers[] | .manager_id] == ["ws-arr","ws-num","ws-str"]'
+# without this the scenario could pass vacuously on a guard that sanitised the key on read
+assert_jq "(w) the malformed values reached the projection verbatim" "$OV_W" \
+  '([.backlog.managers[] | select(.manager_id == "ws-num")] | first | .provider) == 123
+   and ([.backlog.managers[] | select(.manager_id == "ws-arr")] | first | .provider) == ["anthropic"]'
+assert_jq "(w) the numeric provider names none, so it keeps the machine-wide window" "$OV_W" \
+  '[.backlog.managers[] | select(.manager_id == "ws-num")] | first | .stall_window
+   == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
+assert_jq "(w) and so does the array provider" "$OV_W" \
+  '[.backlog.managers[] | select(.manager_id == "ws-arr")] | first | .stall_window
+   == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
+assert_jq "(w) the string provider beside them still resolves to its own fitting subscription" "$OV_W" \
+  '[.backlog.managers[] | select(.manager_id == "ws-str")] | first
+   | has("stall_window") and .stall_window == null'
+# and the fallback window reaches each simulation, exactly like (t)'s provider-less manager
+assert_jq "(w) both malformed rows are bent by the machine-wide window, the string row is not" "$OV_W" \
+  '([.backlog.managers[] | select(.manager_id == "ws-num")] | first | .backlog_drains_at)
+     == '"$(( T0 + 8400000 ))"'
+   and ([.backlog.managers[] | select(.manager_id == "ws-arr")] | first | .backlog_drains_at)
+     == '"$(( T0 + 8400000 ))"'
+   and ([.backlog.managers[] | select(.manager_id == "ws-str")] | first | .backlog_drains_at)
+     == '"$(( T0 + 3000000 ))"
+assert_jq "(w) burn.stall_window is still the machine-wide record" "$OV_W" \
+  '.burn.stall_window
+   == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"openai-codex:5h"}'
+assert_jq "(w) the timeline still got an eta for every queued item" "$OV_W" \
+  '(.timeline.shown | length) == 15 and ([.timeline.shown[] | select(.eta == null)] | length) == 0'
+
 printf '\n== (u) poll-loop hardening: a malformed provider string contributes nothing ==\n'
 # review finding (MEDIUM): the old `for p in $providers` over an unquoted variable both
 # word-split and glob-expanded each line. A registration carrying "zzz-*" used to make the
 # tick fetch whatever files matching that glob sat in the daemon's cwd; a registration
 # carrying a space used to split into two bogus provider fetches.
+# `register` refuses to write a malformed provider now (see the register-validation block), so
+# these two registrations are hand-authored: the tick's gate still has to hold for a file that
+# landed before that validation existed, and going through `reg` here would silently leave the
+# tick with nothing malformed to filter
+reg_hand() { # reg_hand <state-dir> <manager_id> <ws> <pane> <repo> <provider>
+  mkdir -p "$1/managers"
+  jq -nc --arg id "$2" --arg ws "$3" --arg pane "$4" --arg repo "$5" --arg prov "$6" \
+    --argjson now "$T0" \
+    '{manager_id:$id, workspace_id:$ws, pane_id:$pane, repo:$repo,
+      primary:"/Users/x/code/widgets", cap:3, paused_by_operator:false,
+      in_flight:1, adopting:0, ready:0, provider:$prov, seen_at:$now}' >"$1/managers/$2.json"
+}
 SD_U1="$TMP/s-u-glob"
 GLOBDIR="$TMP/poll-glob-cwd"; mkdir -p "$GLOBDIR"
 : >"$GLOBDIR/zzz-alpha"; : >"$GLOBDIR/zzz-beta"
@@ -1327,10 +1465,12 @@ agents_file "$TMP/agents-u1.json" \
 export FAKE_AGENTS="$TMP/agents-u1.json"
 mk_usage2 "$TMP/usage-u1.json" ok 0.10 $(( T0 + 3600000 )) ok 0.15 $(( T0 + 3600000 ))
 export FAKE_USAGE="$TMP/usage-u1.json" FAKE_FETCHES="$TMP/fetches-u1.log"; : >"$FAKE_FETCHES"
-reg "$SD_U1" "$T0" ws-u1zzz wu1 wu1:p1 3 1 0 0 acme/u1 "zzz-*" >/dev/null
+reg_hand "$SD_U1" ws-u1zzz wu1 wu1:p1 acme/u1 "zzz-*"
 reg "$SD_U1" "$T0" ws-u1ok wu2 wu2:p1 3 1 0 0 acme/u2 anthropic >/dev/null
 # the daemon's actual cwd matters only to the vulnerable old code; the fix makes it inert
 ST_U1="$(cd "$GLOBDIR" && MGR_STATE_DIR="$SD_U1" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(u) the malformed registration is live all the same, so the gate is what filtered it" "$ST_U1" \
+  '.managers["ws-u1zzz"] | .live == true and .provider == "zzz-*"'
 assert_jq "(u) the glob-shaped provider is filtered out; the legitimate one is fetched" "$ST_U1" \
   '(.providers | keys) == ["anthropic"]'
 assert_eq "(u) exactly one fetch happened" 1 "$(lines_of "$FAKE_FETCHES")"
@@ -1345,9 +1485,11 @@ agents_file "$TMP/agents-u2.json" \
   "$(mk_agent manager wu3:p1 wu3 idle '')" \
   "$(mk_agent manager wu4:p1 wu4 idle '')"
 export FAKE_AGENTS="$TMP/agents-u2.json" FAKE_FETCHES="$TMP/fetches-u2.log"; : >"$FAKE_FETCHES"
-reg "$SD_U2" "$T0" ws-u2sp wu3 wu3:p1 3 1 0 0 acme/u3 "anthropic openai-codex" >/dev/null
+reg_hand "$SD_U2" ws-u2sp wu3 wu3:p1 acme/u3 "anthropic openai-codex"
 reg "$SD_U2" "$T0" ws-u2ok wu4 wu4:p1 3 1 0 0 acme/u4 openai-codex >/dev/null
 ST_U2="$(MGR_STATE_DIR="$SD_U2" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(u) the space-separated registration is live all the same" "$ST_U2" \
+  '.managers["ws-u2sp"] | .live == true and .provider == "anthropic openai-codex"'
 assert_jq "(u) a provider with a space is filtered out; the legitimate one is fetched" "$ST_U2" \
   '(.providers | keys) == ["openai-codex"]'
 assert_eq "(u) exactly one fetch happened" 1 "$(lines_of "$FAKE_FETCHES")"
@@ -1356,6 +1498,47 @@ if grep -qx 'anthropic' "$FAKE_FETCHES"; then
   fail "(u) the space-separated provider word-split into a spurious anthropic fetch"
 else
   pass "(u) no spurious anthropic fetch from word-splitting"
+fi
+# the same gate on the other branch: a stalled pane's provider comes out of a session JSONL,
+# which no `register` validation can reach, so without a gate on that branch it goes to
+# `omp usage --provider` verbatim. The legitimate provider beside it is still fetched.
+SESS_GLOBPROV="$TMP/stall-globprov.jsonl"
+jq -nc --arg ts "$(iso_ms $T0)" '
+  {type:"message", timestamp:$ts,
+   message:{role:"assistant", provider:"zzz-*", model:"m",
+            stopReason:"error", errorStatus:429, errorMessage:"429 rate limit"}}' >"$SESS_GLOBPROV"
+SESS_SPACEPROV="$TMP/stall-spaceprov.jsonl"
+jq -nc --arg ts "$(iso_ms $T0)" '
+  {type:"message", timestamp:$ts,
+   message:{role:"assistant", provider:"anthropic openai-codex", model:"m",
+            stopReason:"error", errorStatus:429, errorMessage:"429 rate limit"}}' >"$SESS_SPACEPROV"
+SD_U3="$TMP/s-u-stalled-pane"
+agents_file "$TMP/agents-u3.json" \
+  "$(mk_agent manager wu5:p1 wu5 idle '')" \
+  "$(mk_agent issue-1 wu5:p2 wu5 blocked "$SESS_GLOBPROV")" \
+  "$(mk_agent issue-2 wu5:p3 wu5 blocked "$SESS_SPACEPROV")"
+export FAKE_AGENTS="$TMP/agents-u3.json" FAKE_FETCHES="$TMP/fetches-u3.log"; : >"$FAKE_FETCHES"
+mk_usage2 "$TMP/usage-u3.json" ok 0.10 $(( T0 + 3600000 )) ok 0.15 $(( T0 + 3600000 ))
+export FAKE_USAGE="$TMP/usage-u3.json"
+reg "$SD_U3" "$T0" ws-u3ok wu5 wu5:p1 3 1 0 0 acme/u5 openai-codex >/dev/null
+ST_U3="$(cd "$GLOBDIR" && MGR_STATE_DIR="$SD_U3" MGR_GUARD_NOW_MS=$(( T0 + 1000 )) "$GUARD" tick)"
+# both panes really were read as stalled on those providers -- otherwise the poll-set
+# assertions below would hold for a guard that never saw the panes at all
+assert_jq "(u) both malformed providers did reach the ledger from the session lines" "$ST_U3" \
+  '([.stalled[] | .provider] | sort) == ["anthropic openai-codex","zzz-*"]'
+assert_jq "(u) a stalled pane's malformed provider contributes nothing to the poll set" "$ST_U3" \
+  '(.providers | keys) == ["openai-codex"]'
+assert_eq "(u) exactly one fetch happened" 1 "$(lines_of "$FAKE_FETCHES")"
+assert_eq "(u) the fetch log names only the registered provider" "openai-codex" "$(cat "$FAKE_FETCHES")"
+if grep -q 'zzz' "$FAKE_FETCHES"; then
+  fail "(u) the stalled pane's glob-shaped provider reached omp usage: $(cat "$FAKE_FETCHES")"
+else
+  pass "(u) no zzz-anything was fetched from the stalled-pane branch"
+fi
+if grep -qx 'anthropic' "$FAKE_FETCHES"; then
+  fail "(u) the stalled pane's space-separated provider word-split into an anthropic fetch"
+else
+  pass "(u) no spurious anthropic fetch from the stalled-pane branch"
 fi
 unset FAKE_FETCHES
 
@@ -1404,6 +1587,10 @@ assert_jq "(v) the stripped hold keeps status/ok/recovers_at/exhausted_limit, em
 # snapshot right here for the bounded variant below, before tick3/tick4 move SD_V forward
 SD_V_BOUND="$TMP/s-v-bounded"
 cp -a "$SD_V" "$SD_V_BOUND"
+# and the same tick2 ledger for section (x): a held verdict with limits: [] is precisely the
+# state a synthesised stall window has to cover
+SD_X="$TMP/s-x-held"
+cp -a "$SD_V" "$SD_X"
 # tick3: wa:p1 is back, plus a builder that 429d on anthropic (issue-7, on ws-a's workspace) --
 # still no usage fixture, so the fetch this tick fails too, but the held verdict survives
 agents_file "$TMP/agents-v3.json" \
@@ -1431,6 +1618,61 @@ export FAKE_AGENTS="$TMP/agents-v2.json"
 ST_VB="$(MGR_STATE_DIR="$SD_V_BOUND" MGR_GUARD_NOW_MS=$(( T0 + 1801000 )) "$GUARD" tick)"
 assert_jq "(v) bounded: the hold drops once its reset has passed, anthropic is gone entirely" "$ST_VB" \
   '(.providers | has("anthropic") | not)'
+unset FAKE_FETCHES
+
+printf '\n== (x) a held verdict synthesises the window its own manager is stalled by ==\n'
+# re-review finding on the fix round: the hold above carries no limits on purpose, so nothing
+# in burn.limits ever exhausts and the machine had no stall window at all -- state.providers
+# said "exhausted until <reset>" while overview.burn.stall_window was null and the manager on
+# that subscription projected its whole queue straight through the stall. The window is
+# synthesised from the verdict now, and burn.limits stays empty so the board still renders
+# "no quota reading yet". SD_X is (v)'s tick2 state: anthropic held, recovers_at ahead, limits [].
+NOW_X=$(( T0 + 362000 ))   # 301s past tick2, so both managers are due a backlog refresh
+# ws-a's registration went with its pane at tick2; `mgr` re-registers on its next board run
+reg "$SD_X" "$NOW_X" ws-a wa wa:p1 1 0 0 3 acme/a anthropic >/dev/null
+agents_file "$TMP/agents-x.json" \
+  "$(mk_agent manager wa:p1 wa idle '')" \
+  "$(mk_agent manager wo:p1 wo idle '')"
+export FAKE_AGENTS="$TMP/agents-x.json" FAKE_FETCHES="$TMP/fetches-x.log"; : >"$FAKE_FETCHES"
+issues_file "$TMP/issues-x.json" \
+  "$(mk_issue 1 one "" "")" "$(mk_issue 2 two "" "")" "$(mk_issue 3 three "" "")"
+export FAKE_ISSUES="$TMP/issues-x.json"
+thru_file "$SD_X" acme/a 600 600 600 600 600
+thru_file "$SD_X" acme/o 600 600 600 600 600
+# openai-codex only: anthropic's fetch comes back empty, so its held verdict stands with
+# limits: [] while the other subscription keeps a real, fitting reading
+jq -c '.reports |= map(select(.provider == "openai-codex"))' "$TMP/usage-v.json" >"$TMP/usage-x.json"
+export FAKE_USAGE="$TMP/usage-x.json"
+ST_X="$(MGR_STATE_DIR="$SD_X" MGR_GUARD_NOW_MS="$NOW_X" "$GUARD" tick)"
+assert_jq "(x) anthropic is still held, with no numbers left to project on" "$ST_X" \
+  '.providers.anthropic
+   | .status == "exhausted" and .recovers_at == '"$RECOV_V"'
+     and .exhausted_limit == "anthropic:5h" and (.limits | length) == 0'
+assert_jq "(x) openai-codex beside it keeps a real, fitting reading" "$ST_X" \
+  '.providers["openai-codex"] | .status == "ok" and .ok == true and (.limits | length) == 1'
+OV_X="$(MGR_STATE_DIR="$SD_X" MGR_GUARD_NOW_MS="$NOW_X" "$GUARD" overview --limit 50)"
+assert_json "(x) overview output" "$OV_X"
+# the board's reading is untouched: a held verdict has no numbers, and inventing one here
+# would make `mgr board` print a burn percentage nothing measured
+assert_jq "(x) burn.limits still carries no entry for the held provider" "$OV_X" \
+  '([.burn.limits[] | select(.provider == "anthropic")] | length) == 0
+   and ([.burn.limits[].provider] | unique) == ["openai-codex"]'
+# the incoherence being removed: status "exhausted" beside stall_window null
+assert_jq "(x) the machine-wide window is synthesised from the verdict" "$OV_X" \
+  '.burn.stall_window != null
+   and .burn.stall_window == {from:'"$NOW_X"', to:'"$RECOV_V"', limit:"anthropic:5h"}'
+assert_jq "(x) the manager on the held provider carries that window as its own" "$OV_X" \
+  '[.backlog.managers[] | select(.manager_id == "ws-a")] | first | .stall_window
+   == {from:'"$NOW_X"', to:'"$RECOV_V"', limit:"anthropic:5h"}'
+# cap 1 and three 10-minute items drain 30 minutes out with no window; with the held window
+# in force the first item cannot start before the reset, so the whole queue lands behind it
+assert_jq "(x) THE regression assertion: the queue is pushed past the reset it waits on" "$OV_X" \
+  '[.backlog.managers[] | select(.manager_id == "ws-a")] | first
+   | .backlog_drains_at == '"$(( T0 + 3600000 ))"' and .backlog_drains_at > '"$RECOV_V"
+assert_jq "(x) the manager on the healthy provider is untouched" "$OV_X" \
+  '[.backlog.managers[] | select(.manager_id == "ws-o")] | first
+   | has("stall_window") and .stall_window == null
+     and .backlog_drains_at == '"$(( NOW_X + 600000 ))"' and .backlog_drains_at < '"$RECOV_V"
 unset FAKE_FETCHES
 
 printf '\n== nothing in the guard ever interrupts a builder ==\n'

@@ -238,6 +238,21 @@ jq '.managers["ws-w9"].house = "openai"
   | .managers["ws-w9"].provider = "openai-codex"' \
   "$ovforeign/state.json" >"$ovcodex/state.json"
 
+# and once more with the caller's own provider held rather than sampled: the
+# daemon could not poll anthropic this tick, so the ledger carries the
+# exhausted verdict it is holding until the reset with no fresh limits at
+# all. The rendered quota line must still read the plain no-reading
+# sentence — an empty limits list is never a stale percentage (acceptance
+# box 10; bin/mgr-guard:262-265 is what actually writes this shape).
+ovheld="$tmp/ovheld"; mkdir -p "$ovheld"
+jq '.providers.anthropic.status="exhausted" | .providers.anthropic.ok=false
+    | .providers.anthropic.recovers_at=1788530400000
+    | .providers.anthropic.exhausted_limit="anthropic:5h"
+    | .providers.anthropic.reason=
+        "unknown: not polled this tick, holding last verdict (exhausted until 2026-09-04T14:00:00Z)"
+    | .providers.anthropic.limits=[]' \
+  "$ovstate/state.json" >"$ovheld/state.json"
+
 # guard stopped: the same ledger, now stale and exhausted — the cap must not
 # move because of it. A stopped guard also carries the exit record it wrote on
 # its way out, plus the recovery time of the limit that ran out.
@@ -249,6 +264,18 @@ jq '.guard="stopped" | .pid=null
     | .last_exit_at=1788523800000
     | .last_exit_reason="idle-exit after 1800s with no live manager and nothing stalled"' \
   "$fix/guard-running.json" >"$fix/guard-stopped.json"
+
+# a live guard, still running, but this tick could not poll the caller's
+# provider at all: the daemon holds last verdict with an empty limits list,
+# the same shape bin/mgr-guard:262-265 writes, so a manager on it does not
+# misread an empty list as a fresh zero-usage reading
+jq '.providers.anthropic.status="exhausted" | .providers.anthropic.ok=false
+    | .providers.anthropic.recovers_at=1788531111000
+    | .providers.anthropic.exhausted_limit="anthropic:5h"
+    | .providers.anthropic.reason=
+        "unknown: not polled this tick, holding last verdict (exhausted until 2026-09-04T14:11:51Z)"
+    | .providers.anthropic.limits=[]' \
+  "$fix/guard-running.json" >"$fix/guard-held.json"
 
 # a guard that answers but has no reading at all: no provider, no limits
 cat >"$fix/guard-blank.json" <<'EOF'
@@ -568,6 +595,20 @@ check 'and the heartbeat still fires, with both fields null' 'null/null' \
   "$(jq -rs 'last|"\(.house)/\(.provider)"' "$MGR_TEST_REGISTER")"
 check 'and it is still a registration' 1 \
   "$(jq -s 'length' "$MGR_TEST_REGISTER")"
+
+printf '\n# 1e. a held verdict reaches the manager, with no limits to misread\n'
+# the poll set dropped this tick but the hold is still active: status,
+# exhausted_limit and the held sentence pass straight through to the
+# manager that burns it, and limits stays the empty list the daemon wrote —
+# never a stale percentage a consumer could mistake for a fresh reading
+hb=$(MGR_TEST_GUARD="$fix/guard-held.json" "$MGR" board --cap 3)
+check 'a held verdict reaches the manager: status' exhausted \
+  "$(jq -r '.quota.status' <<<"$hb")"
+check 'a held verdict reaches the manager: reason, verbatim' \
+  'unknown: not polled this tick, holding last verdict (exhausted until 2026-09-04T14:11:51Z)' \
+  "$(jq -r '.quota.reason' <<<"$hb")"
+check 'a held verdict carries no limits to misread' '[]' \
+  "$(jq -c '.quota.limits' <<<"$hb")"
 
 # ------------------------------------------- 2. the cap is the only dial there is
 
@@ -1322,9 +1363,12 @@ check 'each row gets its own provider window on the anthropic-stalling ledger' \
              | "\(.repo)=\(if .stall_window == null then "null" else .stall_window.limit end)"]
             | join(" ")' <<<"$ovj")"
 # and a machine with no stalling limit at all has no window to hand anyone
-check 'no stalling limit, no window anywhere' 'null/null null null' \
+check 'no stalling limit, no window anywhere (key present, value null)' 'true true' \
   "$(ov "$ovnostall" --json \
-     | jq -r '"\(.burn.stall_window)/\([.backlog.managers[].stall_window] | map(tostring) | join(" "))"')"
+     | jq -r '(.burn | has("stall_window") and .stall_window == null) as $b
+              | ([.backlog.managers[]
+                  | has("stall_window") and .stall_window == null] | all) as $m
+              | "\($b) \($m)"')"
 
 printf '\n# 9c. Z only when TZ is unset\n'
 blktz=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID TZ=UTC \
@@ -1418,6 +1462,17 @@ check 'no placeholder dashes anywhere' 0 \
   "$(printf '%s\n' "$blki" | grep -c '—' || true)"
 check 'the shared quota is still reported' 1 \
   "$(printf '%s\n' "$blki" | grep -c 'shared with 1 other project' || true)"
+
+printf '\n# 9k. a held verdict never renders as a stale percentage\n'
+# the daemon could not poll anthropic this tick and is holding an exhausted
+# verdict with no limits at all; the manager on it must see the plain
+# no-reading sentence, not zero usage read out of an empty list
+blkh=$(ov "$ovheld")
+check 'a held verdict renders as no quota reading, verbatim' \
+  'quota    no quota reading yet' \
+  "$(printf '%s\n' "$blkh" | sed -n '/^quota/p')"
+check 'and never a percentage of any kind' 0 \
+  "$(printf '%s\n' "$blkh" | sed -n '/^quota/p' | grep -c '% used' || true)"
 
 # ------------------------------- 10. launch stamps and throughput rows
 

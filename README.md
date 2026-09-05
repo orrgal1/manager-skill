@@ -351,7 +351,8 @@ fallback the text `quota` line already makes for an unresolvable caller. Each ma
 rides along as `overview.backlog.managers[].stall_window` (`{from,to,limit}`, `null` when nothing
 stalls it) — a provider currently held on a stripped verdict (see **Quota guard**) synthesizes one
 too, `{from: now, to: recovers_at, limit: exhausted_limit}`, `limit: null` when the held verdict
-never named one, which `next` then marks as `(after the quota reset)`; `overview.burn.stall_window`
+never named one, which `next` then marks as `(after the quota reset)` — a real sampled limit for
+that same provider always wins the tie against its own held window; `overview.burn.stall_window`
 stays the machine-wide record — unchanged in shape or meaning, folding in the same held providers,
 and still what `mgr guard status` and other tooling read — even though each manager's own ETAs no
 longer use it directly.
