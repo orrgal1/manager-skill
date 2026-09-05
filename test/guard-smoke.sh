@@ -1359,6 +1359,80 @@ else
 fi
 unset FAKE_FETCHES
 
+printf '\n== (v) issue #32 review: a provider that leaves the poll set keeps its stripped hold ==\n'
+# review finding on the fix round: the poll set now follows live panes, so one manager pane
+# blipping out of `herdr agent list` used to drop its provider from state.providers entirely,
+# and JQ_POLICY rebuilds .providers from that tick's reports alone -- so an exhausted verdict's
+# recovers_at/exhausted_limit vanished with it. A builder that then 429d on that provider during
+# a usage outage got a stall record with recovers_at: null and missed its reset reignite.
+SD_V="$TMP/s-v"
+agents_file "$TMP/agents-v1.json" \
+  "$(mk_agent manager wa:p1 wa idle '')" \
+  "$(mk_agent manager wo:p1 wo idle '')"
+export FAKE_AGENTS="$TMP/agents-v1.json"
+export FAKE_PROMPTS="$TMP/prompts-v.log" FAKE_TOASTS="$TMP/toasts-v.log" FAKE_FETCHES="$TMP/fetches-v.log"
+: >"$FAKE_PROMPTS"; : >"$FAKE_TOASTS"; : >"$FAKE_FETCHES"
+RECOV_V=$(( T0 + 1800000 ))
+mk_usage2 "$TMP/usage-v.json" exhausted 1.0 "$RECOV_V" ok 0.10 $(( T0 + 3600000 ))
+export FAKE_USAGE="$TMP/usage-v.json"
+reg "$SD_V" "$T0" ws-a wa wa:p1 3 1 0 0 acme/a anthropic >/dev/null
+reg "$SD_V" "$T0" ws-o wo wo:p1 3 1 0 0 acme/o openai-codex >/dev/null
+# tick1: both managers live, the fetch succeeds -- anthropic goes exhausted with a recovers_at
+ST_V1="$(MGR_STATE_DIR="$SD_V" MGR_GUARD_NOW_MS=$(( T0 + 1000 )) "$GUARD" tick)"
+assert_jq "(v) tick1: anthropic exhausted with a recovers_at and exhausted_limit" "$ST_V1" \
+  '.providers.anthropic.status == "exhausted" and .providers.anthropic.ok == true
+   and .providers.anthropic.recovers_at == '"$RECOV_V"' and .providers.anthropic.exhausted_limit == "anthropic:5h"'
+# tick2: the blip -- wa:p1 drops out of `herdr agent list`, and the fetch fails for whoever
+# is still polled, so nothing can refresh anthropic's verdict even if it were still polled
+unset FAKE_USAGE
+agents_file "$TMP/agents-v2.json" "$(mk_agent manager wo:p1 wo idle '')"
+export FAKE_AGENTS="$TMP/agents-v2.json"
+: >"$FAKE_FETCHES"
+ST_V2="$(MGR_STATE_DIR="$SD_V" MGR_GUARD_NOW_MS=$(( T0 + 61000 )) "$GUARD" tick)"
+if grep -q 'anthropic' "$FAKE_FETCHES"; then
+  fail "(v) anthropic was polled despite its pane leaving the live set"
+else
+  pass "(v) anthropic was not polled while its pane was missing"
+fi
+assert_eq "(v) the only provider actually fetched is openai-codex" "openai-codex" "$(sort -u "$FAKE_FETCHES")"
+assert_jq "(v) the stripped hold keeps status/ok/recovers_at/exhausted_limit, empty limits" "$ST_V2" \
+  '.providers.anthropic
+   | .status == "exhausted" and .ok == false
+     and .recovers_at == '"$RECOV_V"' and .exhausted_limit == "anthropic:5h"
+     and .usage_fetch_failures == 0 and (.limits | length) == 0
+     and (.reason | startswith("unknown: not polled this tick"))'
+# snapshot right here for the bounded variant below, before tick3/tick4 move SD_V forward
+SD_V_BOUND="$TMP/s-v-bounded"
+cp -a "$SD_V" "$SD_V_BOUND"
+# tick3: wa:p1 is back, plus a builder that 429d on anthropic (issue-7, on ws-a's workspace) --
+# still no usage fixture, so the fetch this tick fails too, but the held verdict survives
+agents_file "$TMP/agents-v3.json" \
+  "$(mk_agent manager wa:p1 wa idle '')" \
+  "$(mk_agent manager wo:p1 wo idle '')" \
+  "$(mk_agent issue-7 wb:p2 wa blocked "$SESS_ANTHROPIC")"
+export FAKE_AGENTS="$TMP/agents-v3.json"
+ST_V3="$(MGR_STATE_DIR="$SD_V" MGR_GUARD_NOW_MS=$(( T0 + 121000 )) "$GUARD" tick)"
+assert_jq "(v) the stall record carries the held recovers_at and limit" "$ST_V3" \
+  '.stalled[0].recovers_at == '"$RECOV_V"' and .stalled[0].limit == "anthropic:5h"'
+assert_jq "(v) once polled again a failing fetch just holds (not the not-polled wording)" "$ST_V3" \
+  '.providers.anthropic.reason | startswith("unknown: holding last verdict")'
+# tick4: the reset has now passed, still no usage -- the reignite must fire, and it must
+# name anthropic:5h, not the bare word "quota"
+ST_V4="$(MGR_STATE_DIR="$SD_V" MGR_GUARD_NOW_MS=$(( T0 + 1801000 )) "$GUARD" tick)"
+assert_eq "(v) exactly one reignite prompt fires at the reset" 1 "$(lines_of "$FAKE_PROMPTS")"
+EXP_V="mgr-guard: anthropic:5h reset at $(iso_of "$RECOV_V") has passed (no fresh usage reading)"
+case "$(cut -f2 <"$FAKE_PROMPTS")" in
+  "$EXP_V"*) pass "(v) THE regression assertion: the reignite names anthropic:5h at the reset" ;;
+  *) fail "(v) reignite text: $(cut -f2 <"$FAKE_PROMPTS")" ;;
+esac
+# bounded variant: from the tick2 state, once the reset has passed the hold must not become
+# a permanent stale entry -- it has to drop the moment recovers_at is behind us
+export FAKE_AGENTS="$TMP/agents-v2.json"
+ST_VB="$(MGR_STATE_DIR="$SD_V_BOUND" MGR_GUARD_NOW_MS=$(( T0 + 1801000 )) "$GUARD" tick)"
+assert_jq "(v) bounded: the hold drops once its reset has passed, anthropic is gone entirely" "$ST_VB" \
+  '(.providers | has("anthropic") | not)'
+unset FAKE_FETCHES
+
 printf '\n== nothing in the guard ever interrupts a builder ==\n'
 assert_eq "no send-keys in the whole run" 0 "$(lines_of "$FAKE_KEYS")"
 
