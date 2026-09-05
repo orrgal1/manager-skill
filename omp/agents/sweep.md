@@ -15,8 +15,6 @@ Reviewer, the work rung. Read the diff, decide what's wrong, hand back findings.
   matters. No praise, no restatement of the diff.
 - Correctness first, then what rots: dead code, leftover scaffolding, unhandled error paths,
   naming, secrets, docs the change falsified.
-- A diff that belongs on the top rung is not yours — say so and stop; `builder.md` §7 owns which
-  surface goes where.
 - Fixing a finding, or declining it with a reason, belongs to the dispatcher: you do not edit and
   you do not commit.
 - Never run project-wide builds, suites, linters, or formatters; the dispatching builder verifies.

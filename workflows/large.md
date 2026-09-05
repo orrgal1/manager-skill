@@ -32,9 +32,9 @@ Any of these true → this is your file. Do not resize down: work already sized 
    dispatch falls under the ceiling (builder.md §7).
 4. **Integrate** — typecheck everything touched; run the covering tests for every slice.
 5. **Review** — one review pass over the whole diff against acceptance, design and risk; the
-   reviewer and the rung follow the diff surface (builder.md §7) — `reviewer` with
-   `security-reviewer` on the top rung, else `sweep`. Always a pass at this size, even for a
-   docs-only diff. Summarise the findings where the work is tracked.
+   reviewer and the rung follow the diff surface (builder.md §7) — `reviewer` on the top rung, with
+   `security-reviewer` beside it for auth or permissions, else `sweep`. Always a pass at this size,
+   even for a docs-only diff. Summarise the findings where the work is tracked.
 6. **Fix round** — at least one, always. Every finding is fixed or explicitly declined with a
    reason, and the list travels with the change. Fix slices are sized and dispatched like step 3.
 7. **Full suite** — always at this size — plus the repo's live or browser walk if it has one and the

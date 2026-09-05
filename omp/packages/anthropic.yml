@@ -2,10 +2,10 @@
 # Rungs: Fable (top) > Opus (work) > Sonnet (mid) > Haiku (bottom, no Haiku 5 id
 # exists here, so the bottom rung collapses onto Sonnet at low).
 # Top rung: plan (deep, for large builders), review (the reviewer and security-reviewer
-# agents, for a diff touching auth, permissions, a data shape, a public API, a schema or
-# routing), and crux (the fumble target: a fresh executor for a step a builder has failed);
+# agents, for the surfaces builder.md §7 sends to the top rung), and crux (the fumble
+# target: a fresh executor for a step a builder has failed);
 # sketch (light, for medium builders and small planning triggers) and sweep (the reviewer
-# for every other logic or contract surface) sit with default/builder/large/medium on the
+# for everything §7 sends to the work rung) sit with default/builder/large/medium on the
 # work rung; small and smol (scouts feed the plan) the mid rung; tiny (omp's own role) and
 # commit the bottom rung at low.
 # Effort: high for everything that writes or decides code, medium for the roles

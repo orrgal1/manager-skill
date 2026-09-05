@@ -226,9 +226,11 @@ goes to a slice agent on your own rung.
 
 ### Who reviews, and on which rung
 
-Your size file owns whether a review pass happens at all. What it does not own is who does it: the
-reviewer and the rung follow **what the diff touches**, never your size label. One list, here, read
-by every size file.
+Your size file owns whether a review pass happens at all — `large` always, `tiny` never, `small`
+and `medium` when the diff has surface to review. What it does not own is who does it: the
+reviewer and the rung follow **what the diff touches**, never your size label. One list, here,
+read by every size file; where it says no pass, it is answering the conditional your size file
+left open, not overruling it.
 
 - **auth, permissions, a data shape, a public API, a schema, or routing** → `reviewer`, the top
   rung — and `security-reviewer` beside it, in the same batch, whenever auth or permissions are in
