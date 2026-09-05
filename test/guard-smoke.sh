@@ -462,6 +462,18 @@ assert_jq "(e) the entry is attributed and carries recovers_at" "$ST_E" \
    and .attempts == 0 and .last_reignite_at == null and .recovers_at == '"$RECOV_E"' and .limit == "anthropic:5h"'
 assert_jq "(e) next_reignite_at is since + min(retry_after, 15m)" "$ST_E" \
   '.stalled[0].next_reignite_at == '"$(( T0 + 900000 ))"
+# the status-line extension (extensions/mgr-status.ts) reads these by name, off
+# the same file, so a rename here has to break a test rather than a status line
+assert_jq "(e) fields extensions/mgr-status.ts reads exist" "$ST_E" \
+  'has("pid") and has("tick_at") and has("interval_s")
+   and (.stalled[0] | has("pane_id") and has("provider") and has("limit")
+        and has("recovers_at") and has("next_reignite_at") and has("manager_id"))'
+assert_jq "(e) fields extensions/mgr-status.ts reads exist: the burn item" "$ST_E" \
+  '(.providers.anthropic | has("recovers_at"))
+   and (.providers.anthropic.limits[0] | has("id") and has("used") and has("burn_per_hour")
+        and has("projected_at_reset") and has("resets_at") and has("fits"))'
+assert_jq "(e) fields extensions/mgr-status.ts reads exist: the manager row" "$ST_E" \
+  '.managers["ws-w3"] | has("workspace_id") and has("pane_id")'
 assert_eq "(e) no prompt while exhausted" 0 "$(lines_of "$FAKE_PROMPTS")"
 assert_eq "(e) and no toast for an exhausted provider" 0 "$(lines_of "$FAKE_TOASTS")"
 # past the backoff, still exhausted, reset still ahead -> still nothing

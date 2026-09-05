@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Runs every test in sequence. Each test is hermetic: it builds a temp state dir
-# and fake gh/herdr/omp on its own PATH, so no network and no live tools needed.
+# Runs every test in sequence. The shell tests are hermetic: each builds a temp
+# state dir and fake gh/herdr/omp on its own PATH, so no network and no live
+# tools needed. mgr-status-unit is a bun unit test for the status extension.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
-tests="guard-smoke mgr-quota-smoke mgr-config-smoke e2e-quota"
+tests="guard-smoke mgr-quota-smoke mgr-config-smoke e2e-quota mgr-status-unit"
 failed=0
 
 for t in $tests; do
