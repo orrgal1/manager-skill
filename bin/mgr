@@ -27,6 +27,14 @@ repo() {
   printf '%s' "$MGR_REPO_CACHE"
 }
 
+# The repo without `repo()`'s `die`: the launch/throughput bookkeeping below is
+# never worth failing a command over, and `mgr overview` is machine-wide, so it
+# answers outside a repo too.
+own_repo() {
+  [ -n "${MGR_REPO_CACHE:-}" ] && { printf '%s' "$MGR_REPO_CACHE"; return; }
+  gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true
+}
+
 # primary = the main worktree = first entry of `git worktree list --porcelain`
 primary() {
   [ -n "${MGR_PRIMARY_CACHE:-}" ] && { printf '%s' "$MGR_PRIMARY_CACHE"; return; }
@@ -309,6 +317,82 @@ atomic_write() { # atomic_write <dest>   (content on stdin)
   if cat >"$tmp"; then mv -f "$tmp" "$dest"; else rm -f "$tmp"; return 1; fi
 }
 
+# ---- launch bookkeeping
+#
+# Two small files beside the guard's ledger are the whole measurement: the
+# moment a builder took an issue (`launches/<owner>__<repo>.json`, stamped by
+# launch/adopt/bind and consumed by retire) and how long the issues that landed
+# actually took (`throughput/<owner>__<repo>.jsonl`, one row per merged issue).
+# The guard tick reads both and turns them into the medians `mgr overview`
+# projects with. None of it is worth failing a command over: every failure here
+# is a warning and the command carries on.
+
+now_ms() { # the guard pins its clock with MGR_GUARD_NOW_MS; this half honours it
+  if [ -n "${MGR_GUARD_NOW_MS:-}" ]; then printf '%s' "$MGR_GUARD_NOW_MS"; return; fi
+  printf '%s' "$(( $(date +%s) * 1000 ))"
+}
+
+repo_key() { printf '%s' "${1//\//__}"; }   # owner/repo -> owner__repo
+
+launch_file() { # launch_file <owner/repo>
+  printf '%s/launches/%s.json' "$guard_state_dir" "$(repo_key "$1")"
+}
+
+record_launch() { # record_launch <N> — stamp the moment a builder took issue N
+  local rp f cur
+  rp=$(own_repo)
+  [ -n "$rp" ] || { warn "cannot record launched_at for #$1 (no repo)"; return 0; }
+  f=$(launch_file "$rp")
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  cur=""
+  [ -f "$f" ] && cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
+  [ -n "$cur" ] || cur='{}'
+  jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" \
+    '$cur + {($n): {number: ($n | tonumber), launched_at: $at}}' \
+    | atomic_write "$f" || warn "could not record launched_at for #$1 in $f"
+}
+
+take_launch() { # take_launch <N> -> that stamp ("" when unknown); drops the entry
+  local rp f cur at rest
+  rp=$(own_repo)
+  [ -n "$rp" ] || return 0
+  f=$(launch_file "$rp")
+  [ -f "$f" ] || return 0
+  cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || return 0
+  [ -n "$cur" ] || return 0
+  at=$(jq -r --arg n "$1" '(.[$n].launched_at // empty) | tostring' <<<"$cur")
+  rest=$(jq -c --arg n "$1" 'del(.[$n])' <<<"$cur") || rest=""
+  [ -n "$rest" ] && { printf '%s' "$rest" | atomic_write "$f" \
+    || warn "could not drop the launch stamp of #$1 from $f"; }
+  printf '%s' "$at"
+}
+
+append_throughput() { # append_throughput <N> <launched_at> <merged_at>
+  local rp f dur
+  rp=$(own_repo)
+  [ -n "$rp" ] || { warn "cannot append the throughput row for #$1 (no repo)"; return 1; }
+  f="$guard_state_dir/throughput/$(repo_key "$rp").jsonl"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  dur=$(jq -nr --argjson a "$2" --argjson b "$3" '[0, (($b - $a) / 1000 | round)] | max')
+  jq -nc --arg repo "$rp" --argjson n "$1" --argjson a "$2" --argjson b "$3" \
+    --argjson d "$dur" \
+    '{repo:$repo, number:$n, launched_at:$a, merged_at:$b, duration_s:$d}' >>"$f" \
+    || { warn "could not append the throughput row for #$1 to $f"; return 1; }
+}
+
+# `manager-report:` is the builder's last word on an issue, so the time of that
+# comment is when the work landed. A gh that cannot answer degrades to now.
+report_merged_at() { # report_merged_at <N> -> ms
+  local out at=""
+  out=$(gh issue view "$1" --json comments 2>/dev/null) || out=""
+  [ -n "$out" ] && at=$(jq -r '
+    [.comments[]? | select((.body // "") | startswith("manager-report:"))
+     | .createdAt // empty | select(. != "")] | last // empty
+    | fromdateiso8601 * 1000' <<<"$out" 2>/dev/null)
+  case "$at" in ''|*[!0-9]*) at=$(now_ms);; esac
+  printf '%s' "$at"
+}
+
 # `mgr-guard status` (state.json + {guard,pid}); a missing or failing binary is
 # indistinguishable from a stopped guard, which is a board with no reading —
 # never a smaller cap, since the cap is the operator's dial alone.
@@ -321,6 +405,18 @@ guard_state() {
   jq -e 'type == "object"' >/dev/null 2>&1 <<<"$out" || out='{"guard":"stopped"}'
   MGR_GUARD_CACHE=$(jq -c '. + {guard:(.guard // "stopped")}' <<<"$out")
   printf '%s' "$MGR_GUARD_CACHE"
+}
+
+# The guard's machine-wide picture, at the default display limit: burn, backlog
+# and the projected timeline of every live manager. A guard that cannot answer
+# is indistinguishable from a stopped one, so the caller decides what an empty
+# answer means — the board carries `null`, `mgr overview` says so and exits.
+guard_overview() { # guard_overview <limit> -> the overview JSON, or empty
+  local out=""
+  [ -x "$guard_bin" ] || return 0
+  out=$("$guard_bin" overview --limit "$1" 2>/dev/null) || return 0
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$out" || return 0
+  jq -c . <<<"$out"
 }
 
 # The operator's pause is a launch gate this CLI owns alone: it lives in the
@@ -611,7 +707,7 @@ cmd_board() {
   # primary is resolved (and cached) here for the same reason: the operator's
   # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
-  local b_manager board
+  local b_manager b_overview board
   primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
@@ -624,6 +720,11 @@ cmd_board() {
   # operator's pause has collapsed the effective one to 0
   b_config=$(config_json "$cap")
   b_manager=$(manager_json "$b_agents")
+  # the machine-wide overview travels with the board so one call serves both a
+  # manager's own state and the picture it ends its turn with; a guard that
+  # cannot answer is a null field, never a failed board
+  b_overview=$(guard_overview 10)
+  [ -n "$b_overview" ] || b_overview=null
 
   # the pause outranks --cap/MGR_CAP/config: from here on the cap *is* 0, which
   # is what the board reports and what the heartbeat registers.
@@ -635,6 +736,7 @@ cmd_board() {
     --argjson ag "$b_agents" \
     --argjson cap "$cap" \
     --argjson paused "$b_paused" \
+    --argjson overview "$b_overview" \
     --argjson guard "$b_guard" \
     --argjson config "$b_config" \
     --argjson manager "$b_manager" \
@@ -729,7 +831,9 @@ cmd_board() {
                           seen_at:(.value.seen_at // null)}]
                       | sort_by(.manager_id)),
             # filled in below, so that only a top-level `mgr board` records
-            changed:false, delta:null}}')
+            changed:false, delta:null},
+     # the machine-wide picture at the default limit, verbatim from the guard
+     overview:$overview}')
 
   local b_lims b_prov b_delta
   b_lims=$(jq -c '.quota.limits' <<<"$board")
@@ -741,6 +845,150 @@ cmd_board() {
   # the board JSON is the only thing on stdout; the heartbeat is silent
   printf '%s\n' "$board"
   guard_heartbeat "$board"
+}
+
+# ---------------------------------------------------------------- overview
+
+# The rendered block: five lines — four when nothing is hidden — each label
+# padded to 9 columns, with `next` wrapped greedily at 100 columns and never
+# more than three physical lines. Times are HH:MM in the operator's zone (UTC
+# with a `Z` when TZ is unset) and carry the weekday when they are not today's;
+# durations are rounded to 5 minutes; `~` marks every number that came from an
+# estimate rather than a measurement.
+JQ_RENDER_OVERVIEW='
+def pad9: (. + "         ") | .[0:9];
+def dec1: (. * 10 | round) as $c | "\($c / 10 | floor).\($c % 10)";
+def dec2: (. * 100 | round) as $c |
+  "\($c / 100 | floor)." + (($c % 100) | if . < 10 then "0\(.)" else "\(.)" end);
+def fmt($ms; $f):
+  ($ms / 1000 | floor) as $s
+  | if $tz_set then ($s | strflocaltime($f)) else ($s | gmtime | strftime($f)) end;
+def T($ms; $est):
+  if $ms == null then "—"
+  else (if $est then "~" else "" end)
+       + (if fmt($ms; "%Y-%m-%d") == fmt($now; "%Y-%m-%d") then ""
+          else fmt($ms; "%a") + " " end)
+       + fmt($ms; "%H:%M") + (if $tz_set then "" else "Z" end)
+  end;
+def D($ms; $est):
+  if $ms == null then "—"
+  else (if $ms < 0 then 0 else $ms end) as $m
+  | (($m / 300000 | round) * 300) as $r
+  | (if $est then "~" else "" end)
+    + (if $r >= 86400 then "\($r / 86400 | floor)d\(($r % 86400) / 3600 | floor)h"
+       elif $r >= 3600 then "\($r / 3600 | floor)h"
+            + ((($r % 3600) / 60 | floor) | if . < 10 then "0\(.)" else "\(.)" end)
+       else "\($r / 60 | floor)m" end)
+  end;
+def shortname: if . == null or . == "" then "" else (split("/") | last) end;
+def mname: if (.repo // "") == "" then (.manager_id // "?") else (.repo | shortname) end;
+def burnline:
+  ((.burn.limits // [])
+   | [ foreach .[] as $l ([]; . + [$l.provider // ""];
+       (if (.[0:(length - 1)] | index($l.provider // "")) == null then ($l.id // "")
+        else (($l.id // "") | ltrimstr(($l.provider // "") + ":")) end)
+       + " \((($l.used // 0) * 100 | round))% @\((($l.burn_per_hour // 0) | dec2))/h"
+       + " → \((($l.projected_at_reset // 0) | dec1))× by \(T($l.resets_at; false))"
+       + (if $l.exhaust_at == null then ""
+          else " (exhausts \(T($l.exhaust_at; true)), stalls "
+               + (if $l.resets_at == null then "—"
+                  else D($l.resets_at - $l.exhaust_at; false) end) + ")" end) ) ]
+   | join(" · ")) as $s
+  | if $s == "" then "no reading" else $s end;
+def backlogline:
+  .backlog.totals as $t
+  | ([.backlog.managers[] | select((.idle_slots // 0) > 0) | mname] | join(", ")) as $idle
+  | ([.backlog.managers[] | select(.starves_at != null)
+      | mname as $n
+      | if .starves_at <= $now then "\($n) starves NOW"
+        else "\($n) in \(D(.starves_at - $now; (.throughput.estimated // false)))" end]
+     | join(", ")) as $starve
+  | "open \($t.open // 0) · ready \($t.ready // 0) · blocked \($t.blocked // 0)"
+    + " · in flight \($t.in_flight // 0)/\($t.cap // 0) slots · idle \($t.idle_slots // 0)"
+    + (if $idle == "" then "" else " (\($idle))" end)
+    + (if $starve == "" then "" else " — \($starve)" end);
+def nextitems:
+  .burn.stall_window as $w
+  | (.timeline.shown // []) as $S
+  | (if $w == null then null
+     else ([range(0; $S | length) as $i
+            | select(($S[$i].eta // null) != null and $S[$i].eta >= $w.to)
+            | $i] | .[0] // null)
+     end) as $mark
+  | [ range(0; $S | length) as $i
+      | $S[$i] as $it
+      | (if ($it.repo // "") == "" or ($it.repo // "") == $repo then ""
+         else ($it.repo | shortname) end)
+        + "#\($it.number)"
+        + (if $it.state == "in_flight" then " in flight" else "" end)
+        + ([($it.blocked_by // [])[] | " ⊘#\(.)"] | join(""))
+        + " → \(T($it.eta; ($it.estimated // false)))"
+        + (if $mark != null and $i == $mark
+           then " (after \($w.limit | split(":") | last) reset)" else "" end) ];
+def beyondline:
+  .timeline.beyond as $b
+  | (.timeline.shown // []) as $S
+  | ([.backlog.managers[] | . as $m
+      | {hidden: ((($m.ready // 0) + ($m.blocked // 0))
+                  - ([$S[] | select(.manager_id == $m.manager_id and .state != "in_flight")]
+                     | length)),
+         name: mname, tp: ($m.throughput // {})}]
+     | map(select(.hidden > 0)) | sort_by([- .hidden, .name]) | .[0]) as $top
+  | ($top.tp // {}) as $tp
+  | (if $tp.estimated == null then true else $tp.estimated end) as $est
+  | "+\($b.count // 0) queued (\($b.blocked // 0) blocked), last \(T($b.last_eta; $est))"
+    + " · \(D((($tp.median_s // 0) * 1000); $est))/task (n=\($tp.n // 0))";
+def drainsline:
+  ([.backlog.managers[] | {name: mname, at: .backlog_drains_at}] | sort_by(.name)) as $ms
+  | if ($ms | length) == 0 then "no managers"
+    else [$ms[] | "\(.name) \(T(.at; false))"] | join(" · ") end;
+def wrapnext($items):
+  reduce $items[] as $it ({lines: [], cur: ("next" | pad9), n: 0, done: false};
+    if .done then .
+    else (if .n == 0 then .cur + $it else .cur + " · " + $it end) as $try
+    | if (.n == 0) or (($try | length) <= 100) then (.cur = $try | .n = (.n + 1))
+      elif (.lines | length) >= 2 then (.done = true)
+      else (.lines = (.lines + [.cur]) | .cur = ("         " + $it) | .n = 1)
+      end
+    end)
+  | (if .done then (.lines + [.cur + " · …"]) else (.lines + [.cur]) end)
+  | join("\n");
+[ ("burn" | pad9) + burnline,
+  ("backlog" | pad9) + backlogline,
+  (nextitems as $items
+   | if ($items | length) == 0 then ("next" | pad9) + "nothing queued"
+     else wrapnext($items) end),
+  (if .timeline.beyond == null then empty else ("beyond" | pad9) + beyondline end),
+  ("drains" | pad9) + drainsline ]
+| join("\n")'
+
+cmd_overview() {
+  local json=false limit=10
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=true; shift;;
+      --limit) limit="${2:-}"; shift 2;;
+      *) die 2 "usage: mgr overview [--json] [--limit N]";;
+    esac
+  done
+  case "$limit" in
+    ''|*[!0-9]*) die 2 "limit must be a non-negative integer: $limit";;
+  esac
+
+  local ov
+  ov=$(guard_overview "$limit")
+  [ -n "$ov" ] || die 1 "mgr-guard overview failed"
+  [ "$json" = true ] && { printf '%s\n' "$ov"; return; }
+
+  # the own repo is a rendering detail alone — issues of this repo print a bare
+  # `#N`, everything else is prefixed `repo#N` — so a run outside a repo still
+  # answers, and the guard's clock is the one the block is rendered against
+  local rp tz_set now
+  rp=$(own_repo)
+  if [ -n "${TZ:-}" ]; then tz_set=true; else tz_set=false; fi
+  now=$(jq -r '.at // 0' <<<"$ov")
+  jq -r --arg repo "$rp" --argjson tz_set "$tz_set" --argjson now "$now" \
+    "$JQ_RENDER_OVERVIEW" <<<"$ov"
 }
 
 # ---------------------------------------------------------------- launch
@@ -853,6 +1101,10 @@ cmd_launch() {
   gh issue comment "$n" --body "manager: launched · tab $tab_id · agent issue-$n · worktree $wt · branch $branch · policy $policy" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "gh issue comment #$n failed"; }
 
+  # the builder is live and the issue is labelled: from here on retire can
+  # measure how long it took
+  record_launch "$n"
+
   jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
     --arg agent "issue-$n" --arg tab "$tab_id" --arg pane "$pane_id" \
     --arg wt "$wt" --arg br "$branch" \
@@ -931,6 +1183,8 @@ cmd_adopt() {
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
+    record_launch "$n"
+
     jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
       --arg agent "issue-$n" --arg tab "$tab" --arg pane "$pane" \
       --arg wt "$wt" --arg br "$br" --argjson over "$over_cap" \
@@ -999,6 +1253,8 @@ cmd_bind() {
     || die 1 "gh issue edit #$n --add-label mgr:in-flight failed"
   gh issue comment "$n" --body "manager: bound · tab $tab · agent issue-$n · cwd $cwd · branch $br_cmt · policy $policy" >/dev/null \
     || warn "gh issue comment #$n failed"
+
+  record_launch "$n"
 
   jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
     --arg agent "issue-$n" --arg tab "$tab" --arg pane "$pane" \
@@ -1200,6 +1456,22 @@ cmd_retire() {
     fi
   done <<<"$wtlist"
 
+  # the builder's own last word plus the launch stamp is the only measurement
+  # of how long an issue takes in this repo, and the guard turns those rows
+  # into the medians `mgr overview` projects with. Read before the labels go,
+  # and never fatal: a retire that races a `gh` outage still drops the stamp.
+  local report launched_at merged_at tp_appended=false
+  report=$(parse_report "$n" 2>/dev/null || printf 'null')
+  launched_at=$(take_launch "$n")
+  if [ "$(jq -r '.status // ""' <<<"$report")" = merged ]; then
+    if [ -n "$launched_at" ]; then
+      merged_at=$(report_merged_at "$n")
+      append_throughput "$n" "$launched_at" "$merged_at" && tp_appended=true
+    else
+      warn "no launched_at for #$n; throughput row skipped"
+    fi
+  fi
+
   gh issue edit "$n" --remove-label 'mgr:in-flight' --remove-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
     || warn "could not remove mgr labels from #$n"
 
@@ -1216,8 +1488,9 @@ cmd_retire() {
   fi
 
   jq -nc --argjson number "$n" --argjson t "$tab_closed" --argjson w "$wt_removed" \
-    --argjson b "$br_deleted" --argjson c "$closed" \
-    '{number:$number,tab_closed:$t,worktree_removed:$w,branch_deleted:$b,closed:$c}'
+    --argjson b "$br_deleted" --argjson c "$closed" --argjson tp "$tp_appended" \
+    '{number:$number,tab_closed:$t,worktree_removed:$w,branch_deleted:$b,closed:$c,
+      throughput_appended:$tp}'
 }
 
 # ---------------------------------------------------------------- labels
@@ -1252,7 +1525,13 @@ mgr — manager CLI for herdr-hosted omp builders
 
   mgr labels                          ensure the mgr:* labels exist
   mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
-                                      blocked / orphans / adopting / unmanaged / quota
+                                      blocked / orphans / adopting / unmanaged / quota /
+                                      overview
+  mgr overview [--json] [--limit N]   the machine-wide picture every manager turn ends
+                                      with: burn, backlog and the projected timeline of
+                                      every live manager on this machine, as a text
+                                      block (--json for the data; --limit caps the
+                                      queued items shown, default 10)
   mgr launch <N> [--cap N]            worktree + tab + omp builder for issue N; the
                                       builder loads extensions/mgr-status.ts (status
                                       line: rate-limited / guard stopped / paused)
@@ -1286,6 +1565,9 @@ env: MGR_CAP        default concurrency cap
      MGR_BRIEF_EXTRA  markdown file appended to every brief (replaces mgr.brief-extra)
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
+     MGR_GUARD_BACKLOG_INTERVAL_S  how often the guard refreshes a manager's
+                         backlog for the overview, default 120s
+     MGR_DEFAULT_TASK_S  assumed task duration with nothing measured yet, default 2700
      MGR_STATUS_INTERVAL_S  status-line poll interval, default 5
      MGR_STATUS_BURN  1 shows the burn item in the status line
      HERDR_WORKSPACE_ID  target workspace (all commands; headless use sets it explicitly)
@@ -1314,6 +1596,7 @@ main() {
   case "$sub" in
     labels)        cmd_labels "$@";;
     board)         MGR_BOARD_RECORD=1; cmd_board "$@";;
+    overview)      cmd_overview "$@";;
     launch)        cmd_launch "$@";;
     adopt)         cmd_adopt "$@";;
     bind)          cmd_bind "$@";;

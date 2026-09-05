@@ -30,6 +30,15 @@ cat >"$fix/issue-49.json" <<'EOF'
 {"number":49,"title":"Do the thing","state":"OPEN","labels":[{"name":"mgr:in-flight"}],"body":""}
 EOF
 
+# issue 7's comment thread: the builder's merged report, with the createdAt the
+# throughput row measures against
+cat >"$fix/comments-7.json" <<'EOF'
+{"comments":[
+  {"body":"manager: bound · tab w9:t2 · agent issue-7","createdAt":"2026-09-04T12:00:00Z"},
+  {"body":"manager-report: status=merged sha=abc pr=https://github.com/owner/name/pull/9",
+   "createdAt":"2026-09-04T13:00:00Z"}]}
+EOF
+
 sess="$tmp/session-49.jsonl"
 : >"$sess"
 jq -n --arg cwd "$repo" --arg sess "$sess" '
@@ -68,6 +77,79 @@ cat >"$fix/guard-running.json" <<'EOF'
    "attempts":1,"last_reignite_at":null,"next_reignite_at":1788521000000}],
  "events":[]}
 EOF
+
+# ------------------------------------------------- overview fixtures (real guard)
+#
+# A hand-written ledger for `mgr-guard overview`: the clock is pinned at
+# 2026-09-04 12:00:00Z, the 5h limit exhausts 30 min later and resets at 14:00Z
+# (a 1h30 stall window every projection has to step over), and two live
+# managers share the machine — `owner/name` (this board's own repo) with a
+# measured 1h median, two slots and eleven queued issues, and `other/shape`
+# with a machine-median guess, one free slot and nothing ready, so it starves
+# now while its single blocked issue still projects.
+ovstate="$tmp/ovstate"
+mkdir -p "$ovstate"
+pin=1788523200000        # 2026-09-04T12:00:00Z
+real_guard="$here/../bin/mgr-guard"
+
+jq -n --argjson N "$pin" '
+  def issues($from; $to): [range($from; $to + 1) | {number:., title:"ready \(.)", blocked_by:[]}];
+  {version:2, tick_at:$N, interval_s:60, builder_provider:"anthropic",
+   providers:{anthropic:{status:"warning", ok:true, fetched_at:$N,
+     usage_fetch_failures:0, recovers_at:null,
+     reason:"anthropic:5h at 80% burning 0.4/h → 2.2× the window by 14:00Z",
+     limits:[{id:"anthropic:5h", label:"Claude 5 Hour", status:"warning", used:0.8,
+              resets_at:($N + 7200000), burn_per_hour:0.4, projected_at_reset:2.2,
+              fits:false, hours_to_reset:2, sample_count:3, samples:[]},
+             {id:"anthropic:week", label:"Claude Week", status:"ok", used:0.2,
+              resets_at:1788771600000, burn_per_hour:0.02, projected_at_reset:12.6,
+              fits:true, hours_to_reset:93, sample_count:3, samples:[]}]}},
+   managers:{
+     "ws-w9":{manager_id:"ws-w9", workspace_id:"w9", pane_id:"w9:p1", repo:"owner/name",
+       primary:"/tmp/repo", cap:2, in_flight:1, adopting:0, ready:10,
+       seen_at:$N, pane_alive:true, live:true,
+       backlog:{ready:issues(7; 16),
+                blocked:[{number:17, title:"needs 7", blocked_by:[7]}],
+                in_flight:[{number:49, title:"Do the thing", launched_at:($N - 2700000)}],
+                awaiting_approval:[], cap:2, slots_free:1,
+                counts:{ready:10, blocked:1, in_flight:1, awaiting_approval:0, open:12}},
+       backlog_at:$N, backlog_error:null,
+       throughput:{n:5, median_s:3600, p80_s:4200, last_10_mean_s:3700,
+                   estimated:false, source:"repo"}},
+     "ws-w8":{manager_id:"ws-w8", workspace_id:"w8", pane_id:"w8:p1", repo:"other/shape",
+       primary:"/tmp/shape", cap:1, in_flight:0, adopting:0, ready:0,
+       seen_at:$N, pane_alive:true, live:true,
+       backlog:{ready:[],
+                blocked:[{number:101, title:"waits on a foreign issue", blocked_by:[999]}],
+                in_flight:[], awaiting_approval:[], cap:1, slots_free:1,
+                counts:{ready:0, blocked:1, in_flight:0, awaiting_approval:0, open:1}},
+       backlog_at:$N, backlog_error:null,
+       throughput:{n:1, median_s:1500, p80_s:1500, last_10_mean_s:1500,
+                   estimated:true, source:"machine"}},
+     "ws-dead":{manager_id:"ws-dead", workspace_id:"w7", pane_id:"w7:p1",
+       repo:"gone/repo", primary:"/tmp/gone", cap:4, in_flight:0, adopting:0, ready:0,
+       seen_at:($N - 900000), pane_alive:false, live:false}},
+   stalled:[], events:[]}' >"$ovstate/state.json"
+
+# the same machine with a small backlog: four queued issues, so the default
+# limit of 10 hides nothing
+ovsmall="$tmp/ovsmall"; mkdir -p "$ovsmall"
+jq '.managers["ws-w9"].ready = 2
+  | .managers["ws-w9"].backlog.ready =
+      [{number:7, title:"ready 7", blocked_by:[]}, {number:8, title:"ready 8", blocked_by:[]}]
+  | .managers["ws-w9"].backlog.counts.ready = 2
+  | .managers["ws-w9"].backlog.counts.open = 4' \
+  "$ovstate/state.json" >"$ovsmall/state.json"
+
+# and with 34 ready issues, so even `--limit 30` cannot fit the list in three
+# physical lines
+ovmany="$tmp/ovmany"; mkdir -p "$ovmany"
+jq '.managers["ws-w9"].ready = 34
+  | .managers["ws-w9"].backlog.ready =
+      [range(7; 41) | {number:., title:"ready \(.)", blocked_by:[]}]
+  | .managers["ws-w9"].backlog.counts.ready = 34
+  | .managers["ws-w9"].backlog.counts.open = 36' \
+  "$ovstate/state.json" >"$ovmany/state.json"
 
 # guard stopped: the same ledger, now stale and exhausted — the cap must not
 # move because of it. A stopped guard also carries the exit record it wrote on
@@ -121,7 +203,21 @@ case "${1:-}" in
     case "${2:-}" in
       list) cat "$MGR_TEST_FIX/issues.json";;
       view)
-        case " $* " in *" comments "*) printf '\n'; exit 0;; esac
+        # `--json comments` is answered from a per-issue fixture, and `-q` is
+        # applied for real: `mgr` reads the report body through it, and the
+        # throughput row needs the raw comment JSON with its createdAt
+        case " $* " in
+          *" comments "*)
+            f="$MGR_TEST_FIX/comments-${3:-}.json"
+            [ -f "$f" ] || { printf '\n'; exit 0; }
+            q=""; prev=""
+            for a in "$@"; do
+              [ "$prev" = "-q" ] && q="$a"
+              prev="$a"
+            done
+            if [ -n "$q" ]; then jq -r "$q" "$f"; else cat "$f"; fi
+            exit 0;;
+        esac
         f="$MGR_TEST_FIX/issue-${3:-}.json"
         [ -f "$f" ] || exit 1
         cat "$f";;
@@ -155,6 +251,8 @@ case "${1:-} ${2:-}" in
         fi;;
     esac
     exit 0;;
+  "agent rename") exit 0;;
+  "tab rename") exit 0;;
   "agent prompt") exit 0;;
   *) exit 1;;
 esac
@@ -166,6 +264,11 @@ set -uo pipefail
 printf 'mgr-guard %s\n' "$*" >>"$MGR_TEST_LOG"
 case "${1:-}" in
   status) cat "$MGR_TEST_GUARD";;
+  overview)
+    # the real guard answers the overview cases; this fake only proves the
+    # board tolerates a guard that cannot (exit 2, like an old binary)
+    [ -n "${MGR_TEST_OVERVIEW:-}" ] || exit 2
+    printf '%s\n' "$MGR_TEST_OVERVIEW";;
   stall)
     # MGR_TEST_RESUMED exists -> the builder was reignited. MGR_TEST_STALL_AFTER
     # names a marker the first check creates: the 429 lands only after it.
@@ -204,6 +307,7 @@ export MGR_TEST_LOG="$tmp/calls.log"
 export MGR_TEST_REGISTER="$tmp/register.log"
 export MGR_TEST_GUARD="$fix/guard-running.json"
 export MGR_TEST_STALL="$fix/stall-49.json"
+export MGR_TEST_OVERVIEW=              # set per case; empty = the guard cannot answer
 export MGR_TEST_RESUMED="$tmp/resumed"
 export MGR_TEST_ON_RESUME=            # set per case; empty = the guard does nothing
 export MGR_TEST_STALL_AFTER=          # set per case; the 429 lands after check #1
@@ -253,6 +357,16 @@ check 'paused_by_operator'    false "$(jq -r '.paused_by_operator' <<<"$out")"
 check 'quota keys' \
   '["guard","last_exit_at","last_exit_reason","provider","status","limits","reason","stalled","managers","changed","delta"]' \
   "$(jq -c '.quota|keys_unsorted' <<<"$out")"
+# the overview sits immediately after quota, and a guard that cannot answer it
+# is a null field — never a failed board
+check 'overview follows quota' true \
+  "$(jq -r '(keys_unsorted|index("quota")) as $i
+            | keys_unsorted[$i+1] == "overview"' <<<"$out")"
+check 'overview when the guard cannot answer' null \
+  "$(jq -r '.overview' <<<"$out")"
+check 'board overview passthrough' '{"at":1,"burn":{"limits":[]}}' \
+  "$(MGR_TEST_OVERVIEW='{"at":1,"burn":{"limits":[]}}' "$MGR" board --cap 3 \
+     | jq -c '.overview')"
 check 'quota.guard'         running "$(jq -r '.quota.guard' <<<"$out")"
 check 'quota.provider'    anthropic "$(jq -r '.quota.provider' <<<"$out")"
 check 'quota.status'        warning "$(jq -r '.quota.status' <<<"$out")"
@@ -707,7 +821,8 @@ export MGR_TEST_STALL="$tmp/no-stall.json"   # absent -> nothing is stalled
 export MGR_TEST_ON_RESUME=
 : >"$MGR_TEST_LOG"
 "$MGR" board --cap 3 >/dev/null
-check 'board touches before its own guard calls' 'touch status register' \
+# the board asks the guard for the overview it embeds, after its own status read
+check 'board touches before its own guard calls' 'touch status overview register' \
   "$(guard_calls)"
 check 'touch carries the manager id and the pane' 1 \
   "$(grep -cx 'mgr-guard touch ws-w9 w9:p1' "$MGR_TEST_LOG")"
@@ -728,6 +843,215 @@ check 'no pane, no touch' 0 "$(grep -c 'mgr-guard touch' "$MGR_TEST_LOG" || true
 env -u HERDR_WORKSPACE_ID "$MGR" board --cap 3 >/dev/null
 check 'no workspace, no touch' 0 \
   "$(grep -c 'mgr-guard touch' "$MGR_TEST_LOG" || true)"
+
+# --------------------------------------- 9. the machine-wide overview
+
+# These cases run against the REAL mgr-guard: the projection is the thing under
+# test, so a fake would prove nothing. The clock is pinned and the workspace and
+# pane are unset, so `mgr` never touches or re-registers anything and the
+# hand-written ledger is read exactly as written. TZ unset is the deterministic
+# rendering (UTC with a Z suffix); the TZ case only proves the suffix rule,
+# since the local zone of the machine running the test is not ours to pick.
+[ -x "$real_guard" ] || { printf 'not executable: %s\n' "$real_guard" >&2; exit 1; }
+
+ov() { # ov <state-dir> [args...] — mgr overview on the real guard, pinned clock
+  local dir="$1"; shift
+  env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u TZ \
+    MGR_GUARD_BIN="$real_guard" MGR_STATE_DIR="$dir" MGR_GUARD_NOW_MS="$pin" \
+    "$MGR" overview "$@"
+}
+
+nextlines() { # the continuation lines of the `next` block, one per line
+  printf '%s\n' "$1" | sed -n 's/^         //p'
+}
+
+printf '\n# 9. mgr overview --json: burn, backlog and the projected timeline\n'
+ovj=$(ov "$ovstate" --json); rc=$?
+check 'overview exit'             0 "$rc"
+check 'stdout is one json doc'    1 "$(jq -s 'length' <<<"$ovj")"
+check 'overview keys' '["at","burn","backlog","timeline"]' \
+  "$(jq -c 'keys_unsorted' <<<"$ovj")"
+check 'at is the pinned clock' "$pin" "$(jq -r '.at' <<<"$ovj")"
+# the 5h limit does not fit: it runs out 30 min in and the window closes at the
+# reset — every projected minute after that has to step over it
+check 'stall_window' \
+  "{\"from\":$((pin + 1800000)),\"to\":$((pin + 7200000)),\"limit\":\"anthropic:5h\"}" \
+  "$(jq -c '.burn.stall_window' <<<"$ovj")"
+check 'exhaust_at of the limit that does not fit' $((pin + 1800000)) \
+  "$(jq -r '.burn.limits[0].exhaust_at' <<<"$ovj")"
+check 'a limit that fits never exhausts' null \
+  "$(jq -r '.burn.limits[1].exhaust_at' <<<"$ovj")"
+check 'backlog.totals' \
+  '{"ready":10,"blocked":2,"in_flight":1,"awaiting_approval":0,"cap":3,"idle_slots":1,"open":13}' \
+  "$(jq -c '.backlog.totals' <<<"$ovj")"
+# the dead manager is in the ledger and in nothing else
+check 'only live managers participate' '["other/shape","owner/name"]' \
+  "$(jq -c '[.backlog.managers[].repo]' <<<"$ovj")"
+check 'a manager with free slots and nothing ready starves now' \
+  "true/$pin" \
+  "$(jq -r '.backlog.managers[0] | "\(.starving)/\(.starves_at)"' <<<"$ovj")"
+check 'a manager with a queue starves when the queue runs out' \
+  "false/$((pin + 24300000))" \
+  "$(jq -r '.backlog.managers[1] | "\(.starving)/\(.starves_at)"' <<<"$ovj")"
+check 'per-manager drain times' "$((pin + 1500000))/$((pin + 27000000))" \
+  "$(jq -r '[.backlog.managers[].backlog_drains_at] | "\(.[0])/\(.[1])"' <<<"$ovj")"
+check 'machine-wide drains_at is the last of them' $((pin + 27000000)) \
+  "$(jq -r '.timeline.drains_at' <<<"$ovj")"
+check 'last_eta matches drains_at' true \
+  "$(jq -r '.timeline.last_eta == .timeline.drains_at' <<<"$ovj")"
+# elapsed + a quarter median beats the median itself for #49: it has been
+# running 45 min against a 1h measurement, so it lands 15 min from now
+check 'in-flight eta' "in_flight/$((pin + 900000))" \
+  "$(jq -r '.timeline.shown[0] | "\(.state)/\(.eta)"' <<<"$ovj")"
+check 'the first queued issue is the other repo' 'other/shape/101/blocked/[999]' \
+  "$(jq -r '.timeline.shown[1] | "\(.repo)/\(.number)/\(.state)/\(.blocked_by|tostring)"' <<<"$ovj")"
+# #7 starts now, but an hour of work over a window that opens in 30 min lands
+# 30 min past the reset
+check 'work time steps over the stall window' $((pin + 9000000)) \
+  "$(jq -r '[.timeline.shown[] | select(.number == 7) | .eta][0]' <<<"$ovj")"
+check 'shown is every in-flight issue plus the limit' 11 \
+  "$(jq -r '.timeline.shown | length' <<<"$ovj")"
+check 'beyond summarises the rest' \
+  "{\"count\":2,\"blocked\":1,\"last_eta\":$((pin + 27000000)),\"drains_at\":$((pin + 27000000))}" \
+  "$(jq -c '.timeline.beyond' <<<"$ovj")"
+
+printf '\n# 9b. the rendered block, byte for byte\n'
+cat >"$fix/expect-overview.txt" <<'EOF'
+burn     anthropic:5h 80% @0.40/h → 2.2× by 14:00Z (exhausts ~12:30Z, stalls 1h30) · week 20% @0.02/h → 12.6× by Mon 09:00Z
+backlog  open 13 · ready 10 · blocked 2 · in flight 1/3 slots · idle 1 (shape) — shape starves NOW, name in 6h45
+next     #49 in flight → 12:15Z · shape#101 ⊘#999 → ~12:25Z · #7 → 14:30Z (after 5h reset)
+         #8 → 14:45Z · #9 → 15:30Z · #10 → 15:45Z · #11 → 16:30Z · #12 → 16:45Z · #13 → 17:30Z
+         #14 → 17:45Z · #15 → 18:30Z
+beyond   +2 queued (1 blocked), last 19:30Z · 1h00/task (n=5)
+drains   name 19:30Z · shape 12:25Z
+EOF
+blk=$(ov "$ovstate"); rc=$?
+check 'overview exit'             0 "$rc"
+check 'the rendered block' "$(cat "$fix/expect-overview.txt")" "$blk"
+check 'seven lines, no trailing blank' 7 "$(printf '%s\n' "$blk" | wc -l | tr -d ' ')"
+check 'every line starts with its padded label' \
+  'burn     |backlog  |next     |         |         |beyond   |drains   |' \
+  "$(printf '%s\n' "$blk" | cut -c1-9 | sed 's/$/|/' | tr -d '\n')"
+check 'next wraps within three physical lines' 2 \
+  "$(nextlines "$blk" | wc -l | tr -d ' ')"
+check 'no line is wider than 100 columns' 0 \
+  "$(printf '%s\n' "$blk" | sed -n '3,5p' | jq -R 'select(length > 100)' | wc -l | tr -d ' ')"
+
+printf '\n# 9c. Z only when TZ is unset\n'
+blktz=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID TZ=UTC \
+  MGR_GUARD_BIN="$real_guard" MGR_STATE_DIR="$ovstate" MGR_GUARD_NOW_MS="$pin" \
+  "$MGR" overview)
+check 'a set TZ drops the Z suffix' 0 \
+  "$(printf '%s\n' "$blktz" | grep -c '[0-9][0-9]:[0-9][0-9]Z' || true)"
+check 'an unset TZ keeps it' 1 \
+  "$(printf '%s\n' "$blk" | grep -c 'by 14:00Z (exhausts ~12:30Z' || true)"
+# a shorter time (no Z) fits more items per line, so only the labelled lines
+# are the same in both zones
+check 'the same five labelled lines in either zone' \
+  'burn|backlog|next|beyond|drains' \
+  "$(printf '%s\n' "$blktz" | sed -n 's/^\([a-z][a-z]*\) .*/\1/p' | tr '\n' '|' \
+     | sed 's/|$//')"
+
+printf '\n# 9d. --limit 3: three queued shown, the rest summarised\n'
+ovj3=$(ov "$ovstate" --json --limit 3)
+check 'shown is the in-flight issue plus three' 4 \
+  "$(jq -r '.timeline.shown | length' <<<"$ovj3")"
+check 'beyond counts every hidden issue' 9 \
+  "$(jq -r '.timeline.beyond.count' <<<"$ovj3")"
+check 'and how many of those are blocked' 1 \
+  "$(jq -r '.timeline.beyond.blocked' <<<"$ovj3")"
+blk3=$(ov "$ovstate" --limit 3)
+check 'the beyond line' \
+  'beyond   +9 queued (1 blocked), last 19:30Z · 1h00/task (n=5)' \
+  "$(printf '%s\n' "$blk3" | sed -n '/^beyond/p')"
+
+printf '\n# 9e. nothing hidden: no beyond at all\n'
+ovjs=$(ov "$ovsmall" --json)
+check 'beyond is null' null "$(jq -r '.timeline.beyond' <<<"$ovjs")"
+check 'shown is the whole machine' 5 "$(jq -r '.timeline.shown | length' <<<"$ovjs")"
+blks=$(ov "$ovsmall")
+check 'no beyond line' 0 "$(printf '%s\n' "$blks" | grep -c '^beyond' || true)"
+check 'the block is five lines with no beyond among them' \
+  'burn     |backlog  |next     |         |drains   |' \
+  "$(printf '%s\n' "$blks" | cut -c1-9 | sed 's/$/|/' | tr -d '\n')"
+
+printf '\n# 9f. a backlog too long for three lines ends in an ellipsis\n'
+blkm=$(ov "$ovmany" --limit 30)
+check 'next still wraps to three lines' 2 \
+  "$(nextlines "$blkm" | wc -l | tr -d ' ')"
+check 'the third line says there is more' 1 \
+  "$(nextlines "$blkm" | sed -n '2p' | grep -c ' · …$' || true)"
+
+printf '\n# 9g. mgr board embeds the very same document\n'
+ovb=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u TZ \
+  MGR_GUARD_BIN="$real_guard" MGR_STATE_DIR="$ovstate" MGR_GUARD_NOW_MS="$pin" \
+  "$MGR" board --cap 3 | jq -c '.overview')
+check 'board.overview equals mgr overview --json' "$ovj" "$ovb"
+
+printf '\n# 9h. usage, validation, and a guard that cannot answer\n'
+err=$(ov "$ovstate" --limit x 2>&1 >/dev/null); rc=$?
+check 'a bad limit exits 2'       2 "$rc"
+check 'a bad limit says why' 'limit must be a non-negative integer: x' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$(ov "$ovstate" --bogus 2>&1 >/dev/null); rc=$?
+check 'an unknown flag exits 2'   2 "$rc"
+check 'overview usage message' 'usage: mgr overview [--json] [--limit N]' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" overview 2>&1 >/dev/null); rc=$?
+check 'no guard answer exits 1'   1 "$rc"
+check 'and says which call failed' 'mgr-guard overview failed' \
+  "$(jq -r '.error.message' <<<"$err")"
+check 'usage lists overview' 1 \
+  "$("$MGR" --help | grep -c 'mgr overview \[--json\] \[--limit N\]')"
+check 'usage lists MGR_GUARD_BACKLOG_INTERVAL_S' 1 \
+  "$("$MGR" --help | grep -c 'MGR_GUARD_BACKLOG_INTERVAL_S')"
+check 'usage lists MGR_DEFAULT_TASK_S' 1 \
+  "$("$MGR" --help | grep -c 'MGR_DEFAULT_TASK_S')"
+
+printf '\n# 9i. a machine with no ledger at all still answers\n'
+mkdir -p "$tmp/ovempty"
+blke=$(ov "$tmp/ovempty"); rc=$?
+check 'empty overview exit'       0 "$rc"
+check 'the empty block' \
+  'burn     no reading|backlog  open 0 · ready 0 · blocked 0 · in flight 0/0 slots · idle 0|next     nothing queued|drains   no managers' \
+  "$(printf '%s\n' "$blke" | tr '\n' '|' | sed 's/|$//')"
+
+# ------------------------------- 10. launch stamps and throughput rows
+
+printf '\n# 10. a stamp per builder, a throughput row per merged issue\n'
+launches="$tmp/state/launches/owner__name.json"
+thru="$tmp/state/throughput/owner__name.jsonl"
+out=$(HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
+  "$MGR" bind 7 2>/dev/null); rc=$?
+check 'bind exit'                 0 "$rc"
+check 'bind number'              7 "$(jq -r '.number' <<<"$out")"
+check 'the launch stamp landed' "7/$pin" \
+  "$(jq -r '."7" | "\(.number)/\(.launched_at)"' "$launches")"
+
+out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>/dev/null); rc=$?
+check 'retire exit'               0 "$rc"
+check 'retire reports the row'  true "$(jq -r '.throughput_appended' <<<"$out")"
+check 'one row, measured from the report comment' \
+  "{\"repo\":\"owner/name\",\"number\":7,\"launched_at\":$pin,\"merged_at\":$((pin + 3600000)),\"duration_s\":3600}" \
+  "$(jq -sc '.[0]' "$thru")"
+check 'exactly one row'           1 "$(jq -s 'length' "$thru")"
+check 'the stamp was consumed'   '{}' "$(jq -c '.' "$launches")"
+
+err=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>&1 >/dev/null)
+check 'a merged report with no stamp warns' 1 \
+  "$(printf '%s\n' "$err" | grep -c 'no launched_at for #7; throughput row skipped' || true)"
+out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>/dev/null)
+check 'and appends nothing'     false "$(jq -r '.throughput_appended' <<<"$out")"
+check 'still one row'             1 "$(jq -s 'length' "$thru")"
+
+# a builder that never reported merged: the stamp is dropped, no row is written
+HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
+  "$MGR" bind 49 >/dev/null 2>&1
+check 'the stamp for #49 landed' "$pin" "$(jq -r '."49".launched_at' "$launches")"
+out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 49 2>/dev/null)
+check 'no report, no row'       false "$(jq -r '.throughput_appended' <<<"$out")"
+check 'the stamp is dropped anyway' '{}' "$(jq -c '.' "$launches")"
+check 'the throughput file is untouched' 1 "$(jq -s 'length' "$thru")"
 
 printf '\n'
 if [ "$fails" -eq 0 ]; then printf 'all checks passed\n'; exit 0; fi
