@@ -33,6 +33,7 @@ LOCKDIR="$STATE_DIR/guard.lock"
 EXITFILE="$STATE_DIR/exit.json"
 LAUNCHDIR="$STATE_DIR/launches"
 THRUDIR="$STATE_DIR/throughput"
+BACKLOGDIR="$STATE_DIR/backlog"
 
 INTERVAL_S="${MGR_GUARD_INTERVAL:-60}"
 SLOPE_WINDOW_S="${MGR_GUARD_SLOPE_WINDOW_S:-1800}"
@@ -374,13 +375,16 @@ def lbl($n): (([.labels[]?.name] | index($n)) != null);
          | {number: .number, title: .title, blocked_by: .blocked_by}] | sort_by(.number)) as $ready
 | ([$I[] | select((.inflight | not) and (.awaiting | not) and ((.blocked_by | length) > 0))
          | {number: .number, title: .title, blocked_by: .blocked_by}] | sort_by(.number)) as $blocked
-| {ready: ($ready | .[0:50]), blocked: ($blocked | .[0:50]),
-   in_flight: $in_flight, awaiting_approval: $awaiting,
-   cap: $cap,
-   slots_free: ([0, ($cap - ($in_flight | length) - $adopting)] | max),
-   counts: {ready: ($ready | length), blocked: ($blocked | length),
-            in_flight: ($in_flight | length), awaiting_approval: ($awaiting | length),
-            open: ($issues | length)}}'
+# The ledger row keeps 50 entries per list; `full` is what the timeline simulates over, so a
+# repo with hundreds of queued issues still gets an ETA for every one of them.
+| {ledger: {ready: ($ready | .[0:50]), blocked: ($blocked | .[0:50]),
+            in_flight: $in_flight, awaiting_approval: $awaiting,
+            cap: $cap,
+            slots_free: ([0, ($cap - ($in_flight | length) - $adopting)] | max),
+            counts: {ready: ($ready | length), blocked: ($blocked | length),
+                     in_flight: ($in_flight | length), awaiting_approval: ($awaiting | length),
+                     open: ($issues | length)}},
+   full: {ready: $ready, blocked: $blocked}}'
 
 # every throughput ledger as {"<owner>__<repo>": [duration_s, ...]} -> the stats for one repo.
 # n is always the row count of this repo; the numbers fall back repo -> machine -> default.
@@ -465,10 +469,14 @@ def sim($m):
         | {repo: $repo, number: .number, title: (.title // ""), state: "in_flight",
            eta: finish($now; $raw - $now), estimated: ($est or ($la == null)),
            blocked_by: [], manager_id: $mid}]) as $inflight
-    | (([($b.ready // [])[] | {repo: $repo, number: .number, title: (.title // ""),
-                               state: "ready", blocked_by: (.blocked_by // []), manager_id: $mid}]
-        + [($b.blocked // [])[] | {repo: $repo, number: .number, title: (.title // ""),
-                                   state: "blocked", blocked_by: (.blocked_by // []), manager_id: $mid}])
+    # the ledger lists stop at 50; the tick also files the whole queue under backlog/, and
+    # the simulation runs on everything — only the display is capped
+    | (($full[(($repo // "") | split("/") | join("__"))] // null)) as $fq
+    | (if $fq == null then $b else $fq end) as $qsrc
+    | (([($qsrc.ready // [])[] | {repo: $repo, number: .number, title: (.title // ""),
+                                  state: "ready", blocked_by: (.blocked_by // []), manager_id: $mid}]
+        + [($qsrc.blocked // [])[] | {repo: $repo, number: .number, title: (.title // ""),
+                                      state: "blocked", blocked_by: (.blocked_by // []), manager_id: $mid}])
        | sort_by(.number)) as $queue
     | ([$inflight[] | .number]) as $infn
     | ([$queue[] | .number]) as $qn
@@ -581,8 +589,9 @@ managers_json() { # the registrations, never the board's last_report files next 
 }
 
 # ---- the collector. `mgr` writes launches/<owner>__<repo>.json and throughput/<owner>__<repo>.jsonl;
-# the guard only ever reads them, and asks gh for the board data itself so the overview stays
-# fresh machine-wide even when a manager has not run `mgr board` in a while.
+# the guard only ever reads those, asks gh for the board data itself so the overview stays
+# fresh machine-wide even when a manager has not run `mgr board` in a while, and files the
+# whole queue of each repo under backlog/<owner>__<repo>.json for the timeline to simulate on.
 
 repo_slug() { printf '%s' "${1//\//__}"; }
 
@@ -609,6 +618,22 @@ throughput_map() { # every ledger as {"<owner>__<repo>": [duration_s, ...]}, row
   printf '%s' "$map"
 }
 
+backlog_map() { # every filed queue as {"<owner>__<repo>": {at, repo, ready, blocked}}
+  local map='{}' f slug obj
+  for f in "$BACKLOGDIR"/*.json; do
+    [ -f "$f" ] || continue
+    slug=$(basename "$f" .json)
+    obj=$(jq -c 'select(type == "object")
+                 | {at: (.at // null), repo: (.repo // null),
+                    ready: (if (.ready | type) == "array" then .ready else [] end),
+                    blocked: (if (.blocked | type) == "array" then .blocked else [] end)}' \
+          "$f" 2>/dev/null) || obj=""
+    case "$obj" in ''|null) continue;; esac
+    map=$(jq -c --arg s "$slug" --argjson o "$obj" '. + {($s): $o}' <<<"$map")
+  done
+  printf '%s' "$map"
+}
+
 gh_issues() { # gh_issues <repo> <cache-dir> -> open issues JSON, non-zero when gh cannot answer
   local repo="$1" dir="$2" cache out=""
   cache="$dir/$(repo_slug "$repo")"
@@ -630,10 +655,11 @@ gh_issues() { # gh_issues <repo> <cache-dir> -> open issues JSON, non-zero when 
 #   -> {"<manager_id>": {backlog, backlog_at, backlog_error, throughput}}
 # One gh call per distinct repo per tick, and only for managers whose snapshot is older than
 # MGR_GUARD_BACKLOG_INTERVAL_S. A refresh that fails keeps the previous snapshot and says so;
-# throughput is a file read, so it is recomputed every tick.
+# throughput is a file read, so it is recomputed every tick. Every successful refresh also
+# files the uncapped queue under backlog/, which is what `overview` simulates over.
 collect_extras() {
   local managers="$1" prev="$2" now="$3"
-  local extras='{}' cache tmap m mid repo cap adopting prevrow prev_at due issues bl thr err row
+  local extras='{}' cache tmap m mid repo cap adopting prevrow prev_at due issues raw bl thr err row
   cache=$(mktemp -d "${TMPDIR:-/tmp}/mgr-guard-backlog.XXXXXX" 2>/dev/null) || cache=""
   tmap=$(throughput_map)
   while IFS= read -r m; do
@@ -654,16 +680,25 @@ collect_extras() {
     esac
     thr=$(jq -nc --argjson map "$tmap" --arg slug "$(repo_slug "$repo")" \
       --argjson default_s "$DEFAULT_TASK_S" "$JQ_THROUGHPUT")
-    bl=""; err=""
+    raw=""; bl=""; err=""
     if [ "$due" = 1 ]; then
       if [ -z "$repo" ]; then
         err="no repo on the registration"
       elif [ -z "$cache" ]; then
         err="cannot create a tick cache dir"
       elif issues=$(gh_issues "$repo" "$cache"); then
-        bl=$(jq -c --argjson launches "$(launches_json "$repo")" --argjson cap "$cap" \
-          --argjson adopting "$adopting" "$JQ_BACKLOG" <<<"$issues" 2>/dev/null) || bl=""
-        [ -n "$bl" ] || err="backlog projection failed"
+        raw=$(jq -c --argjson launches "$(launches_json "$repo")" --argjson cap "$cap" \
+          --argjson adopting "$adopting" "$JQ_BACKLOG" <<<"$issues" 2>/dev/null) || raw=""
+        if [ -n "$raw" ]; then
+          bl=$(jq -c '.ledger' <<<"$raw")
+          mkdir -p "$BACKLOGDIR" 2>/dev/null || true
+          jq -c --arg repo "$repo" --argjson at "$now" \
+            '{at: $at, repo: $repo, ready: .full.ready, blocked: .full.blocked}' <<<"$raw" \
+            | atomic_write "$BACKLOGDIR/$(repo_slug "$repo").json" \
+            || warn "cannot write $BACKLOGDIR/$(repo_slug "$repo").json"
+        else
+          err="backlog projection failed"
+        fi
       else
         err="gh issue list failed"
       fi
@@ -1071,9 +1106,9 @@ cmd_status() {
 
 # ---------------------------------------------------------------- overview
 
-# Pure projection over state.json — no daemon needed, like `status`. What the tick collected
-# (burn, backlog, throughput) becomes one machine-wide picture: what is running, what is
-# queued, when each finishes, and which manager is about to run out of work.
+# Pure projection over state.json plus the filed queues — no daemon needed, like `status`.
+# What the tick collected (burn, backlog, throughput) becomes one machine-wide picture: what
+# is running, what is queued, when each finishes, and which manager runs out of work when.
 cmd_overview() {
   local limit=10
   while [ $# -gt 0 ]; do
@@ -1084,10 +1119,12 @@ cmd_overview() {
     esac
   done
   case "$limit" in ''|*[!0-9]*) die 2 "limit must be a non-negative integer: $limit";; esac
-  local st now
+  local st now full
   st=$(read_state)
   now=$(now_ms)
+  full=$(backlog_map)
   jq -nc --argjson st "$st" --argjson now "$now" --argjson limit "$limit" \
+    --argjson full "$full" \
     --argjson default_s "$DEFAULT_TASK_S" "$JQ_OVERVIEW" || die 1 "overview projection failed"
 }
 

@@ -873,6 +873,40 @@ assert_jq "(l) the ready list is capped at 50, the count is not" "$ST_L60" \
   '.managers["ws-wL"].backlog
    | (.ready | length) == 50 and .counts.ready == 60 and .counts.open == 60
      and (.ready | first | .number) == 100 and (.ready | last | .number) == 149'
+BK_L60="$SD_L60/backlog/acme__big.json"
+if [ -f "$BK_L60" ]; then pass "(l) the whole queue is filed under backlog/"; else fail "(l) no $BK_L60"; fi
+assert_jq "(l) the filed queue is uncapped and stamped" "$(cat "$BK_L60")" \
+  '(keys) == ["at","blocked","ready","repo"] and .at == '"$T0"' and .repo == "acme/big"
+   and (.ready | length) == 60 and .blocked == []
+   and (.ready | last) == {number:159, title:"issue 159", blocked_by:[]}'
+# the display is capped, the simulation is not: all 60 get an ETA off the filed queue
+OVL="$(MGR_STATE_DIR="$SD_L60" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 10)"
+LAST_L60=$(( T0 + 15 * 2700000 ))     # cap 4, no throughput rows: 15 rounds of MGR_DEFAULT_TASK_S
+assert_jq "(l) ten shown, the other fifty summarised" "$OVL" \
+  '(.timeline.shown | length) == 10
+   and .timeline.beyond == {count:50, blocked:0, last_eta:'"$LAST_L60"',
+                            drains_at:'"$LAST_L60"'}
+   and .timeline.drains_at == '"$LAST_L60"
+assert_jq "(l) the ledger row still reports the true counts" "$OVL" \
+  '.backlog.managers[0] | .ready == 60 and .cap == 4
+   and .backlog_drains_at == '"$LAST_L60"
+OVL2="$(MGR_STATE_DIR="$SD_L60" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 100)"
+assert_jq "(l) every one of the sixty has an ETA" "$OVL2" \
+  '(.timeline.shown | length) == 60
+   and ([.timeline.shown[] | select(.eta == null)] | length) == 0
+   and ([.timeline.shown[] | .eta] | max) == '"$LAST_L60"
+# and with the file gone the projection falls back to the 50 the ledger carries
+rm -f "$BK_L60"
+OVL3="$(MGR_STATE_DIR="$SD_L60" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 10)"
+assert_jq "(l) a missing backlog file falls back to the capped ledger lists" "$OVL3" \
+  '.timeline.beyond.count == 40
+   and .timeline.drains_at == '"$(( T0 + 13 * 2700000 ))"'
+   and (.backlog.managers[0].ready == 60)'
+printf 'not json at all\n' >"$BK_L60"
+OVL4="$(MGR_STATE_DIR="$SD_L60" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit 10)"
+assert_jq "(l) a junk backlog file is ignored, not fatal" "$OVL4" \
+  '.timeline.beyond.count == 40'
+rm -f "$BK_L60"
 
 printf '\n== (m) the refresh is rate-limited, then refetches ==\n'
 export FAKE_ISSUES="$TMP/issues-l.json" FAKE_GH_LOG="$TMP/gh-m.log"; : >"$FAKE_GH_LOG"

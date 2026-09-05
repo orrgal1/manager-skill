@@ -1053,6 +1053,21 @@ check 'no report, no row'       false "$(jq -r '.throughput_appended' <<<"$out")
 check 'the stamp is dropped anyway' '{}' "$(jq -c '.' "$launches")"
 check 'the throughput file is untouched' 1 "$(jq -s 'length' "$thru")"
 
+# ---------------------------- 10b. two builders binding at the same time
+
+printf '\n# 10b. concurrent stamps: the launches file is locked, not clobbered\n'
+rm -f "$launches"
+HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
+  "$MGR" bind 7 >/dev/null 2>&1 &
+HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
+  "$MGR" bind 49 >/dev/null 2>&1 &
+wait
+check 'neither stamp was lost' '["49","7"]' "$(jq -c 'keys' "$launches")"
+check 'both carry the pinned clock' "$pin/$pin" \
+  "$(jq -r '"\(."7".launched_at)/\(."49".launched_at)"' "$launches")"
+check 'the lock is released' 0 \
+  "$([ -d "$tmp/state/launches/owner__name.lock" ] && printf 1 || printf 0)"
+
 printf '\n'
 if [ "$fails" -eq 0 ]; then printf 'all checks passed\n'; exit 0; fi
 printf '%d check(s) failed\n' "$fails"; exit 1

@@ -338,32 +338,74 @@ launch_file() { # launch_file <owner/repo>
   printf '%s/launches/%s.json' "$guard_state_dir" "$(repo_key "$1")"
 }
 
+mtime_of() { # mtime_of <path> -> epoch seconds, 0 when unknown
+  # GNU stat spells mtime -c %Y; BSD/macOS stat spells it -f %m
+  if stat --version >/dev/null 2>&1; then
+    stat -c %Y "$1" 2>/dev/null || printf '0'
+  else
+    stat -f %m "$1" 2>/dev/null || printf '0'
+  fi
+}
+
+# The launches file is read, edited and written back, so two commands working
+# on the same repo — a second manager launching, or a retire racing a launch —
+# would drop one of the two stamps. `mkdir` is the atomic primitive every
+# filesystem agrees on: whoever creates the directory owns the file until it is
+# removed. A lock left behind by a killed command is stale after 10 s and ours
+# to clear, and a lock that cannot be taken at all is still not worth failing a
+# launch over: the caller says so and proceeds unlocked.
+launch_lock() { # launch_lock <launches-file> -> held?
+  local lock="${1%.json}.lock" age mt
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    mkdir "$lock" 2>/dev/null && return 0
+    mt=$(mtime_of "$lock")
+    age=$(( $(date +%s) - ${mt:-0} ))
+    if [ "$age" -ge 10 ]; then
+      rmdir "$lock" 2>/dev/null || true
+      mkdir "$lock" 2>/dev/null && return 0
+    fi
+    sleep 0.1
+  done
+  warn "could not lock $lock; proceeding unlocked"
+  return 1
+}
+
+launch_unlock() { # launch_unlock <launches-file>
+  rmdir "${1%.json}.lock" 2>/dev/null || true
+}
+
 record_launch() { # record_launch <N> — stamp the moment a builder took issue N
-  local rp f cur
+  local rp f cur held=false
   rp=$(own_repo)
   [ -n "$rp" ] || { warn "cannot record launched_at for #$1 (no repo)"; return 0; }
   f=$(launch_file "$rp")
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  launch_lock "$f" && held=true
   cur=""
   [ -f "$f" ] && cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
   [ -n "$cur" ] || cur='{}'
   jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" \
     '$cur + {($n): {number: ($n | tonumber), launched_at: $at}}' \
     | atomic_write "$f" || warn "could not record launched_at for #$1 in $f"
+  if $held; then launch_unlock "$f"; fi
 }
 
 take_launch() { # take_launch <N> -> that stamp ("" when unknown); drops the entry
-  local rp f cur at rest
+  local rp f cur at="" rest held=false
   rp=$(own_repo)
   [ -n "$rp" ] || return 0
   f=$(launch_file "$rp")
   [ -f "$f" ] || return 0
-  cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || return 0
-  [ -n "$cur" ] || return 0
-  at=$(jq -r --arg n "$1" '(.[$n].launched_at // empty) | tostring' <<<"$cur")
-  rest=$(jq -c --arg n "$1" 'del(.[$n])' <<<"$cur") || rest=""
-  [ -n "$rest" ] && { printf '%s' "$rest" | atomic_write "$f" \
-    || warn "could not drop the launch stamp of #$1 from $f"; }
+  launch_lock "$f" && held=true
+  cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || cur=""
+  if [ -n "$cur" ]; then
+    at=$(jq -r --arg n "$1" '(.[$n].launched_at // empty) | tostring' <<<"$cur")
+    rest=$(jq -c --arg n "$1" 'del(.[$n])' <<<"$cur") || rest=""
+    [ -n "$rest" ] && { printf '%s' "$rest" | atomic_write "$f" \
+      || warn "could not drop the launch stamp of #$1 from $f"; }
+  fi
+  if $held; then launch_unlock "$f"; fi
   printf '%s' "$at"
 }
 
