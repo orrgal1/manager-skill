@@ -1,0 +1,45 @@
+# Agent package: Google subscription. Apply with: mgr package gemini
+# Rungs: Gemini Pro (top, and the work rung — nothing sits between Pro and
+# Flash) > Gemini Flash (mid) > Gemini Flash Lite (bottom).
+# plan/review take the top rung; default/builder/large/medium the work rung;
+# small the mid rung; tiny/smol/commit the bottom rung at low.
+# Effort: high for everything that writes or decides code, medium for the roles
+# that decide nothing, low for the bottom rung. Pro exposes only low and high,
+# so high is the ceiling everywhere, never a tier above it.
+# `tiny` is also omp's own role for titles, memory and auto-thinking, so it stays
+# cheap; the tiny AGENT runs on @small (same model as small, different workflow).
+# The Gemini models this machine can authenticate are the direct Google
+# subscription served by provider `google-antigravity`, which is what
+# `omp models gemini` resolves to; a bare `gemini` provider has no auth here.
+# Ids confirmed by `omp models gemini --json` on 2026-09-05.
+modelRoles:
+  default: google-antigravity/gemini-3.1-pro:high
+  plan: google-antigravity/gemini-3.1-pro:high
+  review: google-antigravity/gemini-3.1-pro:high
+  large: google-antigravity/gemini-3.1-pro:high
+  medium: google-antigravity/gemini-3.1-pro:high
+  builder: google-antigravity/gemini-3.1-pro:high
+  small: google-antigravity/gemini-3.7-flash:high
+  tiny: google-antigravity/gemini-3.1-flash-lite:low
+  smol: google-antigravity/gemini-3.1-flash-lite:low
+  slow: "@large"
+  task: "@medium"
+  complex: "@large"
+  workhorse: "@small"
+  fast: "@small"
+  designer: google-antigravity/gemini-3.7-flash:medium
+  advisor: google-antigravity/gemini-3.7-flash:medium
+  vision: google-antigravity/gemini-3.7-flash:medium
+  commit: google-antigravity/gemini-3.1-flash-lite:low
+task:
+  agentModelOverrides:
+    reviewer: "@review"
+    security-reviewer: "@review"
+    scout: "@smol"
+    sonic: "@tiny"
+    librarian: "@small"
+    designer: "@small"
+retry:
+  fallbackChains:
+    google-antigravity/gemini-3.1-pro:
+      - google-antigravity/gemini-3.7-flash:high

@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# mgr-package — the omp side of the manager skill: install the size agent files
+# and switch the model package (house) every session on this machine runs under.
+# Deps: omp, jq.  All stdout is JSON; errors are JSON on stderr.
+#
+# A package is omp/packages/<house>.yml holding exactly three keys: modelRoles,
+# task.agentModelOverrides, retry.fallbackChains. Applying one replaces those
+# three in the omp config.yml (through `omp config set`, which validates against
+# the settings schema), writes activePackage, and leaves every other setting
+# alone. There are no env vars and no symlinks in the result: a herdr-spawned
+# builder reads the same config.yml as the manager that launched it.
+#
+# Locations, so this runs from an installed copy or from a repo checkout:
+#   MGR_ROOT          skill checkout        default the dir above this script
+#   OMP_PACKAGES_DIR  package dir           default $MGR_ROOT/omp/packages
+#   OMP_AGENTS_DIR    agent-file SOURCE dir default $MGR_ROOT/omp/agents
+#   PI_CODING_AGENT_DIR  omp agent dir      default `omp config path`
+set -euo pipefail
+
+die() { # die <exit-code> <message>
+  local code="$1"; shift
+  jq -nc --argjson c "$code" --arg m "$*" '{error:{code:$c,message:$m}}' >&2
+  exit "$code"
+}
+
+for dep in omp jq; do
+  command -v "$dep" >/dev/null 2>&1 || die 1 "missing dependency: $dep"
+done
+
+# ------------------------------------------------------------- self-location
+
+# `mgr` exports MGR_ROOT before it execs this script; run directly, the checkout
+# is the dir above bin/, with `readlink -f` following an install.sh symlink back
+# to the real checkout rather than the link's directory.
+MGR_SELF=$(readlink -f "$0" 2>/dev/null || true)
+[ -n "$MGR_SELF" ] || die 1 "cannot resolve own location: $0"
+MGR_ROOT="${MGR_ROOT:-$(dirname "$(dirname "$MGR_SELF")")}"
+MGR_BIN="$MGR_ROOT/bin/mgr"
+
+PACKAGES_DIR="${OMP_PACKAGES_DIR:-$MGR_ROOT/omp/packages}"
+AGENTS_SRC="${OMP_AGENTS_DIR:-$MGR_ROOT/omp/agents}"
+
+# omp answers where it reads and writes; PI_CODING_AGENT_DIR (the name install.sh
+# uses) already redirects it, so asking omp keeps one source of truth.
+AGENT_DIR="${PI_CODING_AGENT_DIR:-$(omp config path 2>/dev/null || true)}"
+[ -n "$AGENT_DIR" ] || die 1 "omp config path failed"
+AGENTS_DEST="$AGENT_DIR/agents"
+CONFIG="$AGENT_DIR/config.yml"
+[ -f "$AGENT_DIR/config.yaml" ] && CONFIG="$AGENT_DIR/config.yaml"
+
+RESTART_NOTE='a running omp session keeps its old roles; restart it to pick these up'
+
+# ------------------------------------------------------------------ packages
+
+names() { # every package this checkout ships, one per line
+  local f
+  [ -d "$PACKAGES_DIR" ] || return 0
+  for f in "$PACKAGES_DIR"/*.yml; do
+    [ -e "$f" ] || continue
+    basename "$f" .yml
+  done
+}
+
+active() { # the applied package, "" when nothing claims it
+  [ -f "$CONFIG" ] || return 0
+  sed -n 's/^activePackage:[[:space:]]*//p' "$CONFIG" | head -1 | tr -d "\"'"
+}
+
+# YAML -> JSON: bun ships with omp, python3+PyYAML is the fallback.
+yaml_json() { # yaml_json <file>
+  if command -v bun >/dev/null 2>&1; then
+    MGR_YAML_FILE="$1" bun -e 'process.stdout.write(JSON.stringify(Bun.YAML.parse(await Bun.file(process.env.MGR_YAML_FILE).text())))'
+  elif command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
+    python3 -c 'import json,sys,yaml; json.dump(yaml.safe_load(open(sys.argv[1])),sys.stdout)' "$1"
+  else
+    die 1 "need bun or python3+PyYAML to read $1"
+  fi
+}
+
+slice() { # slice <json> <label> <jq-filter> <file>
+  local out
+  out=$(printf '%s' "$1" | jq -c "$3 // empty") || die 3 "$4: unreadable YAML"
+  printf '%s' "$out" | jq -e 'type == "object" and length > 0' >/dev/null 2>&1 \
+    || die 3 "$4: $2 is missing or not a non-empty mapping"
+  printf '%s' "$out"
+}
+
+list_json() { # {active, available, dir}
+  jq -nc --arg a "$(active)" --arg d "$PACKAGES_DIR" \
+    --argjson av "$(names | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')" \
+    '{active:(if $a == "" then null else $a end), available:$av, dir:$d}'
+}
+
+apply() { # apply <name> -> the applied-package JSON on stdout
+  local name="$1"
+  local file="$PACKAGES_DIR/$name.yml"
+  [ -f "$file" ] || die 4 "unknown package '$name'; available: $(names | paste -sd, - | sed 's/,/, /g')"
+
+  local json roles overrides chains before was backup tmp
+  was=$(active)
+  json=$(yaml_json "$file")
+  roles=$(slice "$json" modelRoles '.modelRoles' "$file")
+  overrides=$(slice "$json" task.agentModelOverrides '.task.agentModelOverrides' "$file")
+  chains=$(slice "$json" retry.fallbackChains '.retry.fallbackChains' "$file")
+
+  before=$(omp config get modelRoles --json 2>/dev/null | jq -c '.value // {}') || before='{}'
+  backup=""
+  if [ -f "$CONFIG" ]; then
+    backup="$CONFIG.bak-$(date +%s)"
+    cp "$CONFIG" "$backup"
+  fi
+
+  omp config set modelRoles "$roles" >/dev/null || die 1 "omp config set modelRoles failed"
+  omp config set task.agentModelOverrides "$overrides" >/dev/null \
+    || die 1 "omp config set task.agentModelOverrides failed"
+  omp config set retry.fallbackChains "$chains" >/dev/null \
+    || die 1 "omp config set retry.fallbackChains failed"
+
+  # `omp config set` rewrites the file without its comments and without a
+  # trailing newline, so activePackage is stamped last and by hand
+  tmp=$(mktemp)
+  sed '/^activePackage:/d' "$CONFIG" > "$tmp"
+  [ -s "$tmp" ] && [ -n "$(tail -c 1 "$tmp")" ] && printf '\n' >> "$tmp"
+  printf 'activePackage: %s\n' "$name" >> "$tmp"
+  cat "$tmp" > "$CONFIG"
+  rm -f "$tmp"
+  if ! omp config get modelRoles --json >/dev/null 2>&1; then
+    [ -n "$backup" ] && cp "$backup" "$CONFIG"
+    die 1 "config.yml stopped parsing after the merge${backup:+; restored $backup}"
+  fi
+
+  jq -nc --arg name "$name" --arg was "$was" --arg cfg "$CONFIG" --arg bk "$backup" \
+    --arg note "$RESTART_NOTE" --argjson a "$before" --argjson b "$roles" \
+    --argjson ov "$overrides" --argjson ch "$chains" \
+    '{package:$name, previous:(if $was == "" then null else $was end),
+      config:$cfg, backup:(if $bk == "" then null else $bk end),
+      changes:[([$a, $b] | map(keys) | add | unique)[] as $k
+               | select(($a[$k] // null) != ($b[$k] // null))
+               | {role:$k, from:($a[$k] // null), to:($b[$k] // null)}],
+      agent_overrides:($ov | length), fallback_chains:($ch | length), note:$note}'
+}
+
+# ------------------------------------------------------------------- verbs
+
+cmd_package() {
+  case $# in
+    0) list_json;;
+    1) apply "$1";;
+    *) die 2 "usage: mgr package [<house>]";;
+  esac
+}
+
+# The house to install for: the flag, else what this repo's mgr config says,
+# else the first-run default. `mgr config get` needs a git checkout, so a run
+# from outside one falls through instead of failing.
+setup_house() { # setup_house <explicit-or-empty>
+  local h="${1:-}" out
+  if [ -z "$h" ] && [ -x "$MGR_BIN" ]; then
+    out=$("$MGR_BIN" config get house 2>/dev/null) || out=""
+    [ -n "$out" ] && h=$(printf '%s' "$out" | jq -r '.value // ""' 2>/dev/null || printf '')
+  fi
+  printf '%s' "${h:-anthropic}"
+}
+
+cmd_setup() {
+  local force=0 house=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift;;
+      --house) house="${2:-}"; shift 2 || true
+               [ -n "$house" ] || die 2 "usage: mgr setup [--force] [--house <house>]";;
+      *) die 2 "usage: mgr setup [--force] [--house <house>]";;
+    esac
+  done
+  [ -d "$AGENTS_SRC" ] || die 4 "no agent source dir: $AGENTS_SRC"
+
+  local installed="[]" skipped="[]" found=0 src base dest
+  mkdir -p "$AGENTS_DEST" || die 1 "cannot create $AGENTS_DEST"
+  for src in "$AGENTS_SRC"/*.md; do
+    [ -e "$src" ] || continue
+    found=1
+    base=$(basename "$src")
+    dest="$AGENTS_DEST/$base"
+    if [ -e "$dest" ] && [ "$force" -eq 0 ]; then
+      skipped=$(jq -c --arg f "$base" '. + [$f]' <<<"$skipped")
+      continue
+    fi
+    cp "$src" "$dest" || die 1 "cannot write $dest"
+    installed=$(jq -c --arg f "$base" '. + [$f]' <<<"$installed")
+  done
+  [ "$found" -eq 1 ] || die 4 "no *.md in $AGENTS_SRC"
+
+  local pkg
+  pkg=$(apply "$(setup_house "$house")")
+  jq -nc --arg src "$AGENTS_SRC" --arg dest "$AGENTS_DEST" --argjson pkg "$pkg" \
+    --argjson ins "$installed" --argjson skip "$skipped" \
+    '{agents:{source:$src, dir:$dest, installed:$ins, skipped:$skip},
+      house:$pkg.package, package:$pkg}'
+}
+
+usage() {
+  cat <<'EOF'
+mgr-package — omp agent packages and the size agent files
+
+  mgr package                    {active, available, dir}: the applied package and
+                                 the ones this checkout ships
+  mgr package <house>            apply omp/packages/<house>.yml into the omp
+                                 config.yml (modelRoles, task.agentModelOverrides,
+                                 retry.fallbackChains) and stamp activePackage;
+                                 prints the role changes
+  mgr setup [--force] [--house <house>]
+                                 install omp/agents/*.md into the omp agents dir
+                                 (existing files are skipped unless --force), then
+                                 apply the package for the house: --house, else
+                                 mgr config house, else anthropic
+
+Exit codes: 0 ok · 1 unexpected · 2 usage · 3 refused / invalid state · 4 not found.
+Errors are {"error":{"code":N,"message":"…"}} on stderr.
+
+env: MGR_ROOT             skill checkout (default: the dir above this script)
+     OMP_PACKAGES_DIR     package dir (default: $MGR_ROOT/omp/packages)
+     OMP_AGENTS_DIR       agent-file source dir (default: $MGR_ROOT/omp/agents)
+     PI_CODING_AGENT_DIR  omp agent dir (default: `omp config path`)
+EOF
+}
+
+case "${1-}" in
+  package) shift; cmd_package "$@";;
+  setup)   shift; cmd_setup "$@";;
+  -h|--help|help) usage;;
+  "") die 2 "usage: mgr-package <package|setup> [args...]";;
+  *) die 2 "unknown subcommand: ${1-} (try: mgr-package -h)";;
+esac

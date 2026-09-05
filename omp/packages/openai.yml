@@ -1,0 +1,44 @@
+# Agent package: OpenAI subscription. Apply with: mgr package openai
+# Rungs: Astra (top) > Sol (work) > Terra (mid) > Luna (bottom).
+# plan/review take the top rung; default/builder/large/medium the work rung;
+# small the mid rung; tiny/smol/commit the bottom rung at low.
+# Effort: high for everything that writes or decides code, medium for the roles
+# that decide nothing, low for the bottom rung. high is the ceiling, never a tier above it.
+# `tiny` is also omp's own role for titles, memory and auto-thinking, so it stays
+# cheap; the tiny AGENT runs on @small (same model as small, different workflow).
+# openai-codex/gpt-6-astra is ahead of omp's catalog: the id is on the
+# subscription and resolves once omp's model list is updated; the fallback chain
+# carries plan and review on Sol until then.
+modelRoles:
+  default: openai-codex/gpt-5.6-sol:high
+  plan: openai-codex/gpt-6-astra:high
+  review: openai-codex/gpt-6-astra:high
+  large: openai-codex/gpt-5.6-sol:high
+  medium: openai-codex/gpt-5.6-sol:high
+  builder: openai-codex/gpt-5.6-sol:high
+  small: openai-codex/gpt-5.6-terra:high
+  tiny: openai-codex/gpt-5.6-luna:low
+  smol: openai-codex/gpt-5.6-luna:low
+  slow: "@large"
+  task: "@medium"
+  complex: "@large"
+  workhorse: "@small"
+  fast: "@small"
+  designer: openai-codex/gpt-5.6-terra:medium
+  advisor: openai-codex/gpt-5.6-terra:medium
+  vision: openai-codex/gpt-5.6-terra:medium
+  commit: openai-codex/gpt-5.6-luna:low
+task:
+  agentModelOverrides:
+    reviewer: "@review"
+    security-reviewer: "@review"
+    scout: "@smol"
+    sonic: "@tiny"
+    librarian: "@small"
+    designer: "@small"
+retry:
+  fallbackChains:
+    openai-codex/gpt-6-astra:
+      - openai-codex/gpt-5.6-sol:high
+    openai-codex/gpt-5.6-sol:
+      - openai-codex/gpt-5.6-terra:high

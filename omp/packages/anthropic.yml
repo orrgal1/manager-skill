@@ -1,0 +1,43 @@
+# Agent package: Anthropic subscription. Apply with: mgr package anthropic
+# Rungs: Fable (top) > Opus (work) > Sonnet (mid) > Haiku (bottom, no Haiku 5 id
+# exists here, so the bottom rung collapses onto Sonnet at low).
+# plan/review take the top rung; default/builder/large/medium the work rung;
+# small the mid rung; tiny/smol/commit the bottom rung at low.
+# Effort: high for everything that writes or decides code, medium for the roles
+# that decide nothing, low for the bottom rung. high is the ceiling, never a tier above it.
+# `tiny` is also omp's own role for titles, memory and auto-thinking, so it stays
+# cheap; the tiny AGENT runs on @small (same model as small, different workflow).
+# Ids confirmed by `omp models anthropic --json` on 2026-09-05.
+modelRoles:
+  default: anthropic/claude-opus-5:high
+  plan: anthropic/claude-fable-5-1:high
+  review: anthropic/claude-fable-5-1:high
+  large: anthropic/claude-opus-5:high
+  medium: anthropic/claude-opus-5:high
+  builder: anthropic/claude-opus-5:high
+  small: anthropic/claude-sonnet-5:high
+  tiny: anthropic/claude-sonnet-5:low
+  smol: anthropic/claude-sonnet-5:low
+  slow: "@large"
+  task: "@medium"
+  complex: "@large"
+  workhorse: "@small"
+  fast: "@small"
+  designer: anthropic/claude-sonnet-5:medium
+  advisor: anthropic/claude-sonnet-5:medium
+  vision: anthropic/claude-sonnet-5:medium
+  commit: anthropic/claude-sonnet-5:low
+task:
+  agentModelOverrides:
+    reviewer: "@review"
+    security-reviewer: "@review"
+    scout: "@smol"
+    sonic: "@tiny"
+    librarian: "@small"
+    designer: "@small"
+retry:
+  fallbackChains:
+    anthropic/claude-fable-5:
+      - anthropic/claude-opus-5:high
+    anthropic/claude-fable-5-1:
+      - anthropic/claude-opus-5:high
