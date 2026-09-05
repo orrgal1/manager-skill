@@ -246,7 +246,7 @@ queue, unchanged — `mgr board` embeds the same object as `overview`, and `--li
 much of this repo's own queue is listed.
 
 ```
-quota    5-hour 80% used, runs out in ~30m, resets in 2h (14:00Z) · weekly 20% used · shared with 1 other project
+quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · weekly 20% used · shared with 1 other project
 work     1 of 2 builders running, 10 ready, 1 blocked · out of work in 6h45 (18:45Z) · queue clear in 7h30 (19:30Z)
 next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30 · #10 in 3h45
          #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · #15 in 6h30 · +2 more
