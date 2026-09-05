@@ -40,7 +40,7 @@ shellcheck -S warning bin/mgr bin/mgr-guard bin/mgr-package install.sh test/*.sh
   `PATH`, no network, non-zero exit on failure.
 - Keep the scripts `bash` 3.2 compatible — no associative arrays, no `mapfile`/`readarray`, no
   `${var,,}`, no `wait -n`. Keep tool use portable across GNU and BSD (`date`, `sed`, `stat`).
-- `bin/mgr` and `bin/mgr-guard` are contracts, not just scripts: stdout stays JSON, errors stay
+- `bin/mgr`, `bin/mgr-guard` and `bin/mgr-package` are contracts, not just scripts: stdout stays JSON, errors stay
   `{"error":{"code":N,"message":"…"}}` on stderr, and the exit codes keep their meaning
   (`1` unexpected · `2` usage · `3` refused · `4` not found). Changing a board field or an exit
   code means updating `SKILL.md` in the same PR.
@@ -55,5 +55,9 @@ shellcheck -S warning bin/mgr bin/mgr-guard bin/mgr-package install.sh test/*.sh
   edit it deliberately.
 - `builder.md` is the builder's contract: worktree discipline, self-review, landing, and the
   `manager-report:` comment format the manager parses.
+- `workflows/<size>.md` is the build-and-verify process at one size, written for any session:
+  never `gh`, a PR, or the manager — `builder.md` owns that protocol.
+- `omp/packages/<house>.yml` maps every model role to one rung of a subscription's ladder, and
+  `omp/agents/*.md` are the size agents `mgr setup` installs. Both are applied by `bin/mgr-package`.
 - `README.md` is the outside view. If you change a flag, an env var or a default, it changes there
   too.
