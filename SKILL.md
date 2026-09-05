@@ -299,7 +299,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `quota.last_exit_at` `quota.last_exit_reason` | when and why the guard last exited; `guard: stopped` with a reason of `idle-exit …` means nobody is holding it up — start it again |
 | `quota.provider` `quota.status` | the builders' provider and its limit status: `ok` \| `warning` \| `exhausted` \| `unknown` |
 | `quota.limits` | the projection, one entry per provider limit: `id`, `used` (fraction), `burn_per_hour`, `projected_at_reset`, `resets_at` (ms), `fits`. Data only — nothing acts on it |
-| `quota.reason` | one sentence about the worst limit — `anthropic:5h at 20% burning 0.2/h → 2.56× the window by 17:00Z`, or `fits`, or `unknown: no reading`; `null` with no guard state |
+| `quota.reason` | one sentence about the worst limit — `anthropic:5h at 20% burning 0.2/h → 2.56× the window by 17:00Z`, `anthropic:5h exhausted, resets at 17:00Z`, or `fits`, or `unknown: no reading`; `null` with no guard state |
 | `quota.stalled` | issue numbers of this workspace's builders stalled on a rate limit; the guard is reigniting them |
 | `quota.managers` | every registered manager: `manager_id`, `repo`, `cap`, `in_flight`, `live`, `pane_alive`, `seen_at` — attribution only, nothing is computed from it |
 | `quota.changed` `quota.delta` | `changed: true` when some limit's `fits` flipped, its `projected_at_reset` moved by ≥ `0.1`, or it is new since your last `$MGR board`; `delta` says how (`anthropic:5h 1.04× → 2.56×`, `… (now over)`, `first projection`), `null` when nothing changed. This is what triggers the burn line (§7) |

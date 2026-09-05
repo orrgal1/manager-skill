@@ -215,7 +215,11 @@ def same_window($a; $b):
     # still exhausted, whatever `omp usage` can or cannot tell us this tick
     | (($r.prev_recovers_at // null)) as $hold
     | (if $r.ok then
-         {status: $fresh, reason: $fitted,
+         # a window sitting at 100% with no burn "fits" by the arithmetic; say what it is instead
+         {status: $fresh,
+          reason: (if ($ex | length) > 0
+                   then (($ex | first).id + " exhausted, resets at " + hhmm(($ex | first).resets_at // null))
+                   else $fitted end),
           recovers_at: (if ($ex | length) > 0 then (($ex | first).resets_at // null) else null end),
           exhausted_limit: (if ($ex | length) > 0 then ($ex | first).id else null end)}
        elif ($hold != null) and ($now < $hold) then

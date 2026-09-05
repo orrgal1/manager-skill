@@ -170,7 +170,8 @@ operator. Nothing acts on the projection.
   and the slope is fitted over every matched sample instead of the two that happened to collide on
   the same millisecond. A sample span shorter than `MGR_GUARD_MIN_SLOPE_SPAN_S` counts as zero burn;
   samples older than 24h are pruned. The guard also writes one sentence per provider about the worst
-  limit — `anthropic:5h at 20% burning 0.2/h → 2.56× the window by 17:00Z`, or `fits`.
+  limit — `anthropic:5h at 20% burning 0.2/h → 2.56× the window by 17:00Z`, `anthropic:5h
+  exhausted, resets at 17:00Z`, or `fits`.
 - **Surfacing it.** `mgr board` passes the projection through as `quota.limits[]` and
   `quota.reason`, and compares it with the projection it last returned for this manager
   (`MGR_STATE_DIR/managers/<manager_id>.last_report.json`). When some limit's `fits` flipped, its

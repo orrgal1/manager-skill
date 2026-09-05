@@ -446,6 +446,8 @@ ST_E="$(MGR_STATE_DIR="$SD_E" MGR_GUARD_NOW_MS="$NOW_E" "$GUARD" tick)"
 assert_jq "(e) status exhausted with recovers_at and the limit that did it" "$ST_E" \
   '.providers.anthropic.status == "exhausted" and .providers.anthropic.ok == true
    and .providers.anthropic.recovers_at == '"$RECOV_E"' and .providers.anthropic.exhausted_limit == "anthropic:5h"'
+assert_jq "(e) the reason says exhausted, not fits" "$ST_E" \
+  '.providers.anthropic.reason == "anthropic:5h exhausted, resets at " + ((('"$RECOV_E"' / 1000) | todate)[11:16]) + "Z"'
 assert_jq "(e) exactly one exhausted event" "$ST_E" \
   '[.events[] | select(.kind == "exhausted")] | length == 1'
 assert_jq "(e) the exhausted event names the reset" "$ST_E" \
