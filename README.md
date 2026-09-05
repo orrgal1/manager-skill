@@ -18,10 +18,15 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   `issue-N-<slug>`, in worktree `<repo>-issue-N-<slug>`. The primary checkout stays clean.
 - **Every issue is sized.** Intake puts exactly one `size:tiny` / `size:small` / `size:medium` /
   `size:large` label on the issue (`mgr size N <size>` changes one that is not in flight), the brief
-  names the size, and `mgr launch` starts the session with `--model @<size>` and sends it to
-  `workflows/<size>.md` — the whole build-and-verify process at that size: what may be delegated,
-  which checks run and which never do. `--model @<size>` requires `tiny`, `small`, `medium` and
-  `large` in the operator's omp `modelRoles`. A builder that outgrows its size resizes upward itself.
+  names the size, and `mgr launch` sends the session to `workflows/<size>.md` — the whole
+  build-and-verify process at that size: what may be delegated, which checks run and which never
+  do. Every session runs on `--model @builder` with the house's `omp/packages/<house>.yml` overlaid,
+  so the size picks the workflow and the agents slices go to, never the model. A builder that
+  outgrows its size resizes upward itself.
+- **One model package per subscription.** `mgr setup` installs the five size agents (`tiny`,
+  `small`, `medium`, `large`, `plan`) into the omp agent directory and applies
+  `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,
+  `gemini`) later. One YAML per house maps every role to one rung of that subscription's ladder.
 - **A concurrency cap** (default 3; `mgr config set cap N`, `MGR_CAP` or `--cap N`). New requests
   are slotted: launched now, queued behind the in-flight set, or blocked by `Blocked by: #a, #b`
   in the issue body.
@@ -59,6 +64,7 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 git clone https://github.com/orrgal1/manager-skill ~/code/manager-skill
 ~/code/manager-skill/install.sh          # symlinks ~/.claude/skills/manager -> the clone
 ~/code/manager-skill/install.sh --omp-extension   # also links extensions/mgr-status.ts into ~/.omp/agent/extensions/ (adopted and manager sessions)
+~/code/manager-skill/install.sh --omp             # also runs `bin/mgr-package setup`: the five size agents into ~/.omp/agent/agents/ and the house's model package into its config.yml
 ```
 
 Builders launched by `mgr launch` get the status-line extension automatically — `mgr` passes
@@ -72,7 +78,7 @@ needed for sessions `mgr` did not start: adopted tabs and the manager's own.
 
 ```sh
 pnpm add github:orrgal1/manager-skill     # or: npm install github:orrgal1/manager-skill
-node_modules/.bin/mgr paths               # {"root","skill_md","builder_md","workflows","mgr"} — absolute
+node_modules/.bin/mgr paths               # {"root","skill_md","builder_md","workflows","omp","mgr"} — absolute
 node_modules/.bin/mgr --version           # {"version":"…"}
 ```
 
@@ -125,10 +131,13 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
 | `workflows/<size>.md` | The four size workflows — `tiny` · `small` · `medium` · `large` — that `builder.md` hands build and verify off to |
-| `bin/mgr` | `labels` · `board` · `overview` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `size` · `guard` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
+| `bin/mgr` | `labels` · `board` · `overview` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `size` · `guard` · `pause` · `unpause` (`resume`) · `config` · `package` · `setup` · `house` · `paths` · `--version` |
 | `bin/mgr-guard` | `start` · `stop` · `status` · `overview` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
+| `bin/mgr-package` | `package` · `setup` — installs the size agents and applies a model package into the omp config; reached as `mgr package` / `mgr setup` |
+| `omp/packages/<house>.yml` | One model package per subscription — `anthropic` · `openai` · `gemini`: `modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains` |
+| `omp/agents/<size>.md` | The five agent files `mgr setup` installs: `tiny` · `small` · `medium` · `large` · `plan` |
 | `extensions/mgr-status.ts` | omp status-line indicator: rate-limited / guard stopped / project paused, optional burn item |
-| `install.sh` | Symlinks the checkout into `~/.claude/skills/manager`; `--omp-extension` also links the status-line extension into `~/.omp/agent/extensions/` |
+| `install.sh` | Symlinks the checkout into `~/.claude/skills/manager`; `--omp-extension` also links the status-line extension into `~/.omp/agent/extensions/`, `--omp` also runs `mgr-package setup` |
 | `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |
 | `test/run.sh` | The hermetic test suite |
 

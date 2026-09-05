@@ -18,7 +18,7 @@ MGR=~/.claude/skills/manager/bin/mgr   # installed via install.sh
 # or, as a dependency: MGR=node_modules/.bin/mgr
 ```
 
-`$MGR paths` prints the absolute `SKILL.md` / `builder.md` / `workflows` / `mgr` locations, and the
+`$MGR paths` prints the absolute `SKILL.md` / `builder.md` / `workflows` / `omp` / `mgr` locations, and the
 briefs `mgr` sends to builders already carry those absolute paths — you never spell them out
 yourself.
 
@@ -35,6 +35,22 @@ gh repo view                   # it must have a GitHub remote
 ```
 
 Any of these fails: say exactly what is missing and stop. Do not improvise a board out of files.
+
+## 0. Setup (once per machine)
+
+```bash
+$MGR setup
+```
+
+It installs the five size agents (`tiny`, `small`, `medium`, `large`, `plan`) into the omp agent
+directory and applies the model package for your house — `--house <anthropic|openai|gemini>`, else
+`$MGR config get house`, else `anthropic`. Agent files already there are kept unless `--force`.
+`$MGR package <house>` switches the machine default afterwards; `$MGR package` with no argument
+prints the active package and the available ones.
+
+You and every builder you launch run on `@builder`, the house's work rung. The size picks the
+workflow file and the agents a builder dispatches to, never the session model. A session that is
+already running keeps the roles it started with — restart it to pick up a new package.
 
 ## 1. First move
 
@@ -54,8 +70,12 @@ the tab rename.** `$MGR board` echoes `manager` — the manager tab it detected 
 you are the one being found.
 
 Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `blocked`,
-`orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, and `quota` — `guard`, `limits`,
+`orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, `house`, and `quota` — `guard`, `limits`,
 `reason`, `stalled`. Then close the turn with the `$MGR overview` block, as every turn ends (§7).
+
+`house` is the package every launch overlays. `null` → run `$MGR house`, which reads the house off
+your own session; still nothing → `$MGR config set house <anthropic|openai|gemini>` before any
+launch, because `$MGR launch` refuses (exit `3`) while the house is unknown.
 
 `guard start` is idempotent: one quota-guard daemon serves every manager on the machine, so you
 either start it or attach to the one another manager already started. It does three things and
@@ -142,8 +162,9 @@ Acceptance is the builder's definition of done — write outcomes it can verify,
 Drop `Blocked by:` when nothing blocks it.
 
 Then **size it**. Exactly one `size:` label, at create time — add `--label size:<size>` to the
-`gh issue create` above. The label decides which workflow file the builder builds under and which
-model it runs on, so it is not optional.
+`gh issue create` above. The label decides which workflow file the builder builds under, and the
+size of the agents it dispatches slices to, so it is not optional. Every builder runs on
+`@builder` whatever its size.
 
 | Label | Touches | Judgement | Examples |
 |---|---|---|---|
@@ -239,6 +260,8 @@ Trust the report, not the idle state.
 | cancel #N | `herdr agent send-keys issue-N ctrl+c`, then `$MGR retire N` — add `--close` only if the work is dropped, not deferred |
 | size #N `<size>` / resize #N `<size>` | `$MGR size N <size>` — swaps the `size:` label for the new one. Refused with exit `3` while the issue is `mgr:in-flight`: a live builder resizes itself, upward, and comments when it does. Then `$MGR board` |
 | set the cap to N | `$MGR config set cap N` (persisted in the repo, shared by every worktree), then `$MGR board`. The cap is the only pace dial there is — nothing lowers it behind your back |
+| set the house to X | `$MGR config set house X` (`anthropic`\|`openai`\|`gemini`), then `$MGR board` — every builder launched after it overlays that house's package |
+| switch the package | `$MGR package X` — applies `omp/packages/X.yml` to this machine's omp config, so the roles change for every session started afterwards (yours after a restart) |
 | run builders with extra omp args / env / an extra brief directive | `$MGR config add omp-arg <arg>` (repeat; order kept) / `$MGR config add env KEY=VALUE` / `$MGR config set brief-extra /abs/file.md`. `omp-arg` and `env` reach newly launched builders only; `brief-extra` also reaches adopted ones |
 | show the harness config | `$MGR config list` |
 | pause this project | `$MGR pause` — a launch gate: a persisted cap 0 for this repo, machine-wide, so it survives the session. `$MGR board` then reports `paused_by_operator: true` with `cap` and `slots_free` `0`, and `$MGR launch` refuses (exit `3`) even when `--cap N` is passed — the pause wins. Builders already running are **not** touched: they keep working to their report. Tabs, worktrees, issues and labels are untouched; this is not `cancel` |
@@ -305,7 +328,10 @@ Trust the report, not the idle state.
 | `$MGR guard status` | the guard's whole state: the provider with its limits and burn projection, the registered managers with the board data the guard collects for them (`managers[].backlog`, `backlog_at`, `backlog_error`, `throughput`), the stalled panes with their reignite attempts, and `last_exit_at`/`last_exit_reason` when the daemon is not running. A manager is live while its herdr pane exists — `managers[].pane_alive` is that pane check and is what `live` means; `managers[].seen_at` is only the last time it ran an `mgr` command |
 | `$MGR pause` | this project's launch gate: a persisted cap 0, machine-wide for this repo (`mgr.paused` in the primary checkout's `.git/config`). `board` reports `paused_by_operator`, `launch` refuses; running builders are untouched. Idempotent |
 | `$MGR unpause` (alias `$MGR resume`) | lift the gate: the cap goes back to `--cap`/`MGR_CAP`/config/`3`. Idempotent, exit `0` when the project is not paused |
-| `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`. Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
+| `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`, `house` (`anthropic`\|`openai`\|`gemini` — the package every launch overlays). Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
+| `$MGR setup [--force] [--house <house>]` | once per machine: install the five size agents into the omp agent dir (existing files kept unless `--force`) and apply the house's package — `--house`, else `$MGR config get house`, else `anthropic` |
+| `$MGR package [<house>]` | no argument: `{active, available, dir}`. With one: apply `omp/packages/<house>.yml` to this machine's omp config (`modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains`) and print the role changes. Exit `4` on an unknown house |
+| `$MGR house` | `{provider, model, house}` read off your own session — what a launch falls back to when nothing is configured |
 
 Exit codes: `0` ok · `1` unexpected · `2` usage · `3` refused / invalid state · `4` not found.
 Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
@@ -318,6 +344,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `cap` | the effective cap: `--cap` > `MGR_CAP` > `$MGR config get cap` > `3` — all of them overridden to `0` while `paused_by_operator` is true, `--cap N` included |
 | `slots_free` | `cap − (in_flight + adopting)`, never below `0` — the only thing `launch` gates on |
 | `config` | the effective harness config: `omp-arg`, `env`, `brief-extra`, `cap` |
+| `house` | the model package a launch would overlay right now: `$MGR config get house`, else this session's own house; `null` when nothing resolves and `launch` refuses |
 | `manager` | `{pane_id,tab_id,agent,cwd}` of the live agent whose tab is labelled `manager`, or `null` — the detection key external tooling uses to find the manager tab |
 | `self` | the calling pane (`HERDR_PANE_ID`), or `null` outside a herdr pane |
 | `quota.guard` | `running` \| `stale` \| `stopped` — nothing is reignited and no projection moves unless it is `running` |
@@ -345,7 +372,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `mgr:in-flight` | a builder is live on it; counts against the cap |
 | `mgr:awaiting-approval` | PR open, waiting on the operator; does not count |
 | `mgr:manual-approve` | policy: the operator lands it. Absent → auto-merge |
-| `size:tiny` `size:small` `size:medium` `size:large` | the builder's workflow file and its model; exactly one per issue |
+| `size:tiny` `size:small` `size:medium` `size:large` | the builder's workflow file, and the size of the agents it dispatches to; exactly one per issue |
 
 ### Issue body
 
