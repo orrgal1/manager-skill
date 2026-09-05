@@ -13,7 +13,9 @@ Owner of one large slice. Full tool access; hyperfocus the assignment, never wid
 - Break the slice into sub-slices with a size each; dispatch independent ones in ONE parallel
   batch to the size-matched agent (`tiny`, `small`, `medium`); dependent waves in order.
 - Integrate after each wave; typecheck everything touched; run every covering test.
-- One `reviewer` pass over the whole diff; fix every finding or decline it with a reason.
+- One review pass over the whole diff — `reviewer` with `security-reviewer` on the top rung, else
+  `sweep`: the reviewer and the rung follow the diff surface (builder.md §7). Fix every finding or
+  decline it with a reason.
 - Never run project-wide builds, suites, linters, or formatters; the lead validates.
 - Never commit; the lead commits, unless the assignment says otherwise.
 - Return: files touched, what was verified, review findings, open risks.

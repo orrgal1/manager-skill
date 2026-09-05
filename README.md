@@ -28,9 +28,11 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   its own in-session implementation capped by the ceiling in the builder contract (builder.md §7)
   — and it can delegate the planning without resizing. A fumble trigger (builder.md §7) hands one
   step to a fresh `crux` agent on the top rung instead, with the size, workflow file and checks
-  unchanged.
-- **One model package per subscription.** `mgr setup` installs the seven agents (`tiny`, `small`,
-  `medium`, `large`, `plan`, `sketch`, `crux`) into the omp agent directory and applies
+  unchanged. The review pass follows the same rule: the reviewer and the rung follow the diff
+  surface (builder.md §7) — `reviewer`, with `security-reviewer` beside it for auth or
+  permissions, on the top rung; `sweep`, the same review contract, on the work rung.
+- **One model package per subscription.** `mgr setup` installs the eight agents (`tiny`, `small`,
+  `medium`, `large`, `plan`, `sketch`, `crux`, `sweep`) into the omp agent directory and applies
   `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,
   `gemini`) later. One YAML per house maps every role to one rung of that subscription's ladder.
 - **A concurrency cap** (default 3; `mgr config set cap N`, `MGR_CAP` or `--cap N`). New requests
@@ -70,7 +72,7 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 git clone https://github.com/orrgal1/manager-skill ~/code/manager-skill
 ~/code/manager-skill/install.sh          # symlinks ~/.claude/skills/manager -> the clone
 ~/code/manager-skill/install.sh --omp-extension   # also links extensions/mgr-status.ts into ~/.omp/agent/extensions/ (adopted and manager sessions)
-~/code/manager-skill/install.sh --omp             # also runs `bin/mgr-package setup`: the seven agents (tiny, small, medium, large, plan, sketch, crux) into ~/.omp/agent/agents/ and the house's model package into its config.yml
+~/code/manager-skill/install.sh --omp             # also runs `bin/mgr-package setup`: the eight agents (tiny, small, medium, large, plan, sketch, crux, sweep) into ~/.omp/agent/agents/ and the house's model package into its config.yml
 ```
 
 Builders launched by `mgr launch` get the status-line extension automatically — `mgr` passes
@@ -141,7 +143,7 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 | `bin/mgr-guard` | `start` · `stop` · `status` · `overview` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
 | `bin/mgr-package` | `package` · `setup` — installs the size agents and applies a model package into the omp config; reached as `mgr package` / `mgr setup` |
 | `omp/packages/<house>.yml` | One model package per subscription — `anthropic` · `openai` · `gemini`: `modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains` |
-| `omp/agents/<name>.md` | The seven agent files `mgr setup` installs: `tiny` · `small` · `medium` · `large` · `plan` · `sketch` · `crux` |
+| `omp/agents/<name>.md` | The eight agent files `mgr setup` installs: `tiny` · `small` · `medium` · `large` · `plan` · `sketch` · `crux` · `sweep` |
 | `extensions/mgr-status.ts` | omp status-line indicator: rate-limited / guard stopped / project paused, optional burn item |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager`; `--omp-extension` also links the status-line extension into `~/.omp/agent/extensions/`, `--omp` also runs `mgr-package setup` |
 | `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |

@@ -49,13 +49,13 @@ claim a check passed.
 - Typecheck every package you touched; run the tests covering every slice.
 - Full suite ONLY if the diff touches a shared library, a schema, routing, or code whose callers you
   cannot enumerate.
-- One `reviewer` pass over the whole diff when it has logic or contract surface (a new code path, an
-  auth or permission boundary, a public API, a data shape). Fix every finding or decline it with a
-  reason, then re-run the same set.
+- One review pass over the whole diff; the reviewer and the rung follow the diff surface
+  (builder.md §7) — `reviewer` with `security-reviewer` on the top rung, `sweep` on the work rung,
+  or no pass at all. Fix every finding or decline it with a reason, then re-run the same set.
 - The repo has a live or browser walk → run it only if the change crosses that boundary.
 
 ## Done when
 
 - Every slice is integrated and committed.
-- Reviewer findings are fixed, or declined with a reason you can state.
+- Review findings are fixed, or declined with a reason you can state.
 - The set above is green, and you can name which checks ran and why that set covers the change.

@@ -37,8 +37,9 @@ claim a check passed.
 
 - Typecheck the packages you touched.
 - Run the test files that cover the changed code.
-- `reviewer`: only when the diff touches auth, permissions, a data shape or a public API. A copy,
-  constant, styling or doc change does not get one.
+- Review: the reviewer and the rung follow the diff surface (builder.md §7) — `reviewer` with
+  `security-reviewer` on the top rung, `sweep` on the work rung, or no pass at all. Your size does
+  not decide it: a three-file diff that touches auth gets the top rung.
 - Never at this size: the full suite.
 
 Fix everything you or the reviewer found, re-run the same set, commit.

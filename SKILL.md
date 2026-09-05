@@ -42,8 +42,8 @@ Any of these fails: say exactly what is missing and stop. Do not improvise a boa
 $MGR setup
 ```
 
-It installs the seven agents (`tiny`, `small`, `medium`, `large`, `plan`, `sketch`, `crux`) into
-the omp agent directory and applies the model package for your house —
+It installs the eight agents (`tiny`, `small`, `medium`, `large`, `plan`, `sketch`, `crux`,
+`sweep`) into the omp agent directory and applies the model package for your house —
 `--house <anthropic|openai|gemini>`, else `$MGR config get house`, else `anthropic`. Agent files
 already there are kept unless `--force`.
 `$MGR package <house>` switches the machine default afterwards; `$MGR package` with no argument
@@ -353,7 +353,7 @@ Trust the report, not the idle state.
 | `$MGR pause` | this project's launch gate: a persisted cap 0, machine-wide for this repo (`mgr.paused` in the primary checkout's `.git/config`). `board` reports `paused_by_operator`, `launch` refuses; running builders are untouched. Idempotent |
 | `$MGR unpause` (alias `$MGR resume`) | lift the gate: the cap goes back to `--cap`/`MGR_CAP`/config/`3`. Idempotent, exit `0` when the project is not paused |
 | `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`, `house` (`anthropic`\|`openai`\|`gemini` — the package every launch overlays). Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
-| `$MGR setup [--force] [--house <house>]` | once per machine: install the seven agents into the omp agent dir (existing files kept unless `--force`) and apply the house's package — `--house`, else `$MGR config get house`, else `anthropic` |
+| `$MGR setup [--force] [--house <house>]` | once per machine: install the eight agents into the omp agent dir (existing files kept unless `--force`) and apply the house's package — `--house`, else `$MGR config get house`, else `anthropic` |
 | `$MGR package [<house>]` | no argument: `{active, available, dir}`. With one: apply `omp/packages/<house>.yml` to this machine's omp config (`modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains`) and print the role changes. Exit `4` on an unknown house |
 | `$MGR house` | `{provider, model, house}` read off your own session — what a launch falls back to when nothing is configured |
 

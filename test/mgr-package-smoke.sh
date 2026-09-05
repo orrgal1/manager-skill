@@ -163,10 +163,12 @@ check 'apply says a live session needs a restart' true \
 
 check 'omp was handed review' openai-codex/gpt-6-astra:high \
   "$(jq -r '.review' <<<"$(roles_set)")"
-check 'omp was handed the whole role set' 20 "$(jq -r 'length' <<<"$(roles_set)")"
+check 'omp was handed the whole role set' 21 "$(jq -r 'length' <<<"$(roles_set)")"
 check 'config.yml modelRoles.review' openai-codex/gpt-6-astra:high "$(cfg_role review)"
 check 'config.yml modelRoles.builder' openai-codex/gpt-5.6-sol:high "$(cfg_role builder)"
 check 'config.yml modelRoles.sketch is the work rung' openai-codex/gpt-5.6-sol:high "$(cfg_role sketch)"
+check 'config.yml modelRoles.sweep is the work rung, below review' openai-codex/gpt-5.6-sol:high \
+  "$(cfg_role sweep)"
 check 'config.yml modelRoles.tiny is the bottom rung' openai-codex/gpt-5.6-luna:low \
   "$(cfg_role tiny)"
 check 'config.yml is stamped' 1 \
@@ -185,6 +187,7 @@ check 'config.yml is restamped' 1 \
   "$(grep -cx 'activePackage: anthropic' "$agent/config.yml" || true)"
 check 'plan is the top rung' anthropic/claude-fable-5-1:high "$(cfg_role plan)"
 check 'sketch is the work rung, below plan' anthropic/claude-opus-5:high "$(cfg_role sketch)"
+check 'sweep is the work rung, below review' anthropic/claude-opus-5:high "$(cfg_role sweep)"
 
 # --------------------------------------------------- 3. refusals
 
@@ -216,22 +219,25 @@ check 'unknown setup flag exit' 2 "$rc"
 printf '\n# 4. mgr-package setup: the size agents, then the house package\n'
 out=$("$PKG" setup --house gemini); rc=$?
 check 'setup exit' 0 "$rc"
-check 'setup installs the seven agents' \
-  '["crux.md","large.md","medium.md","plan.md","sketch.md","small.md","tiny.md"]' \
+check 'setup installs the eight agents' \
+  '["crux.md","large.md","medium.md","plan.md","sketch.md","small.md","sweep.md","tiny.md"]' \
   "$(jq -c '.agents.installed' <<<"$out")"
 check 'setup skipped nothing' '[]' "$(jq -c '.agents.skipped' <<<"$out")"
 check 'setup names the agents dir' "$agent/agents" "$(jq -r '.agents.dir' <<<"$out")"
 check 'setup applied the named house' gemini "$(jq -r '.house' <<<"$out")"
 check 'setup reports the package too' gemini "$(jq -r '.package.package' <<<"$out")"
 check 'gemini: sketch collapses onto Pro with plan' google-antigravity/gemini-3.1-pro:high "$(cfg_role sketch)"
+check 'gemini: sweep collapses onto Pro with review' google-antigravity/gemini-3.1-pro:high "$(cfg_role sweep)"
 check 'the tiny agent runs on the small model' 'model: "@small"' \
   "$(grep '^model:' "$agent/agents/tiny.md")"
-check 'the agents are on disk' 7 "$(ls "$agent/agents" | wc -l | tr -d ' ')"
+check 'the sweep agent runs on the sweep rung' 'model: "@sweep"' \
+  "$(grep '^model:' "$agent/agents/sweep.md")"
+check 'the agents are on disk' 8 "$(ls "$agent/agents" | wc -l | tr -d ' ')"
 
 out=$("$PKG" setup --house gemini)
 check 'a second setup installs nothing' '[]' "$(jq -c '.agents.installed' <<<"$out")"
-check 'a second setup skips all seven' \
-  '["crux.md","large.md","medium.md","plan.md","sketch.md","small.md","tiny.md"]' \
+check 'a second setup skips all eight' \
+  '["crux.md","large.md","medium.md","plan.md","sketch.md","small.md","sweep.md","tiny.md"]' \
   "$(jq -c '.agents.skipped' <<<"$out")"
 
 printf 'local edit\n' >"$agent/agents/tiny.md"
@@ -239,8 +245,8 @@ printf 'local edit\n' >"$agent/agents/tiny.md"
 check 'without --force an existing file is left alone' 'local edit' \
   "$(cat "$agent/agents/tiny.md")"
 out=$("$PKG" setup --force --house gemini)
-check '--force reinstalls all seven' \
-  '["crux.md","large.md","medium.md","plan.md","sketch.md","small.md","tiny.md"]' \
+check '--force reinstalls all eight' \
+  '["crux.md","large.md","medium.md","plan.md","sketch.md","small.md","sweep.md","tiny.md"]' \
   "$(jq -c '.agents.installed' <<<"$out")"
 check '--force overwrote the edit' 0 \
   "$(cmp -s "$root/omp/agents/tiny.md" "$agent/agents/tiny.md"; printf '%s' "$?")"
@@ -271,7 +277,7 @@ check 'mgr package resolves omp/packages from MGR_ROOT' "$root/omp/packages" \
 out=$("$MGR" setup --force --house openai); rc=$?
 check 'mgr setup exit' 0 "$rc"
 check 'mgr setup applied openai' openai "$(jq -r '.house' <<<"$out")"
-check 'mgr setup installed the agents' 7 "$(jq -r '.agents.installed | length' <<<"$out")"
+check 'mgr setup installed the agents' 8 "$(jq -r '.agents.installed | length' <<<"$out")"
 check 'config.yml followed' openai-codex/gpt-6-astra:high "$(cfg_role review)"
 
 # ------------------------------------- 5b. a mid-apply failure is not half-applied

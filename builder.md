@@ -135,8 +135,9 @@ gh issue comment <N> --body "builder: started · <the plan your size file asks f
 Your brief named your size and the absolute path of the workflow directory. The file
 `workflows/<size>.md`, beside this one, is your complete build-and-verify process at that size:
 read it before you touch code and follow it exactly. It owns the planning, the delegation, which
-checks run, which checks never run, and whether a `reviewer` pass happens at all — that decision is
-the size file's, not this contract's.
+checks run, which checks never run, and whether a review pass happens at all — that decision is
+the size file's, not this contract's. **Which** reviewer runs, and on which rung, is this
+contract's: the diff surface decides it, not your size (below).
 
 Build to acceptance and nothing beyond it. Follow the repo's existing conventions — read
 neighbouring code before inventing a pattern. Commit in scoped steps as you go.
@@ -167,7 +168,7 @@ gh issue comment <N> --body "builder: delegated planning to <planner> · <which 
 ```
 
 **Resize upward** — the other dial: it changes the verification burden — which checks run, whether
-a `reviewer` pass happens — and it is upward only, never down. Your branch, your worktree and your
+a review pass happens — and it is upward only, never down. Your branch, your worktree and your
 issue do not change. The moment the work fails your size file's scope test, or hits one of its
 budget signals, switch up — before you build more, not in the report:
 
@@ -222,6 +223,28 @@ Two precedences, so that one event never has two outcomes. A file that would als
 file's scope test is a resize, never a fan-out: the ceiling only moves work that is still in scope.
 And when a fumble trigger and the ceiling fire on the same edit, escalate — a failing step never
 goes to a slice agent on your own rung.
+
+### Who reviews, and on which rung
+
+Your size file owns whether a review pass happens at all. What it does not own is who does it: the
+reviewer and the rung follow **what the diff touches**, never your size label. One list, here, read
+by every size file.
+
+- **auth, permissions, a data shape, a public API, a schema, or routing** → `reviewer`, the top
+  rung — and `security-reviewer` beside it, in the same batch, whenever auth or permissions are in
+  the diff.
+- **Any other logic or contract surface** — a new code path, a behaviour change, a contract a
+  caller depends on → `sweep`: the same review contract on the work rung.
+- **Copy, constants, styling or docs alone** → no pass.
+
+This applies at every size above `tiny`. `tiny` never gets a review pass, whatever it touched
+(`workflows/tiny.md`). At `large` the pass is not conditional — the surface picks the reviewer, not
+whether one runs — so a `large` whose diff is only docs or copy still gets its `sweep` pass and its
+fix round: the list floors at the work rung there, never at none.
+
+A finding is a finding whoever returned it. Fix it or decline it with a reason, re-run the same
+check set, and a decline you intend to keep is the uncounted escalation cause above: it goes to a
+fresh `crux`.
 
 ## 8. Pull request
 

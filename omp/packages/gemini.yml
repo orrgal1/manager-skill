@@ -1,15 +1,17 @@
 # Agent package: Google subscription. Apply with: mgr package gemini
 # Rungs: Gemini Pro (top, and the work rung — nothing sits between Pro and
 # Flash) > Gemini Flash (mid) > Gemini Flash Lite (bottom).
-# Top rung: plan (deep, for large builders), review, and crux (the fumble
-# target: a fresh executor for a step a builder has failed) — Pro, which is
-# the work rung too, so crux is a fresh context on the same model; stated,
-# not worked around;
-# sketch (light, for medium builders and small planning triggers) sits with
-# default/builder/large/medium on the work rung — which on this ladder is Pro too, so
-# the light planner collapses onto the same model as the deep one; tolerated, not
-# worked around. small and smol (scouts feed the plan) the mid rung; tiny (omp's own
-# role) and commit the bottom rung at low.
+# Top rung: plan (deep, for large builders), review (the reviewer and security-reviewer
+# agents, for a diff touching auth, permissions, a data shape, a public API, a schema or
+# routing), and crux (the fumble target: a fresh executor for a step a builder has
+# failed) — Pro, which is the work rung too, so crux is a fresh context on the same
+# model; stated, not worked around;
+# sketch (light, for medium builders and small planning triggers) and sweep (the
+# reviewer for every other logic or contract surface) sit with default/builder/large/
+# medium on the work rung — which on this ladder is Pro too, so the light planner
+# collapses onto the same model as the deep one, and sweep collapses onto the same
+# model as review; tolerated, not worked around. small and smol (scouts feed the plan)
+# the mid rung; tiny (omp's own role) and commit the bottom rung at low.
 # Effort: high for everything that writes or decides code, medium for the roles
 # that decide nothing, low for the bottom rung. Pro exposes only low and high,
 # so high is the ceiling everywhere, never a tier above it.
@@ -28,6 +30,7 @@ modelRoles:
   medium: google-antigravity/gemini-3.1-pro:high
   builder: google-antigravity/gemini-3.1-pro:high
   sketch: google-antigravity/gemini-3.1-pro:high
+  sweep: google-antigravity/gemini-3.1-pro:high
   small: google-antigravity/gemini-3.7-flash:high
   tiny: google-antigravity/gemini-3.1-flash-lite:low
   smol: google-antigravity/gemini-3.7-flash:high

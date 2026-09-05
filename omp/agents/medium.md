@@ -3,7 +3,7 @@ name: medium
 description: Takes a medium slice - several files or packages, one feature or bug, may add a contract or test, callers enumerable.
 model: "@medium"
 thinkingLevel: high
-spawns: "scout, tiny, small, reviewer"
+spawns: "scout, tiny, small, reviewer, security-reviewer, sweep"
 ---
 
 Worker on one medium slice. Full tool access; hyperfocus the assignment, never widen it.

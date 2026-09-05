@@ -31,8 +31,10 @@ Any of these true → this is your file. Do not resize down: work already sized 
    suites. You integrate after each wave and commit; anything you would type yourself rather than
    dispatch falls under the ceiling (builder.md §7).
 4. **Integrate** — typecheck everything touched; run the covering tests for every slice.
-5. **Review** — one `reviewer` pass over the whole diff against acceptance, design and risk.
-   Summarise the findings where the work is tracked.
+5. **Review** — one review pass over the whole diff against acceptance, design and risk; the
+   reviewer and the rung follow the diff surface (builder.md §7) — `reviewer` with
+   `security-reviewer` on the top rung, else `sweep`. Always a pass at this size, even for a
+   docs-only diff. Summarise the findings where the work is tracked.
 6. **Fix round** — at least one, always. Every finding is fixed or explicitly declined with a
    reason, and the list travels with the change. Fix slices are sized and dispatched like step 3.
 7. **Full suite** — always at this size — plus the repo's live or browser walk if it has one and the
@@ -52,7 +54,8 @@ scripts, `justfile`, `Makefile` or the CI workflow. None of those exist → say 
 claim a check passed.
 
 - Always: typecheck every touched package, the covering tests, and the full suite.
-- Always: one `reviewer` pass plus one fix round.
+- Always: one review pass plus one fix round — the diff surface picks the reviewer and the rung
+  (builder.md §7), never whether the pass runs.
 - The live or browser walk when the change crosses that boundary.
 - Never a subagent running the suite; never a slice dispatched before its interface is fixed.
 
