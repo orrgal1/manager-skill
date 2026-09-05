@@ -380,7 +380,9 @@ eff_house() { # eff_house <explicit-or-empty> -> the house ("" when unknown)
 provider_of_house() { # provider_of_house <house> -> provider ("" when unknown)
   local h="${1:-}" p=""
   [ -n "$h" ] || return 0
-  p=$(sed -n '/^  default:/{s|^  default:[[:space:]]*\([^/]*\)/.*|\1|p;q;}' \
+  # anchored to the modelRoles block (top-level key to the next one) so another `default:`
+  # elsewhere in the package cannot be read as the model default
+  p=$(sed -n '/^modelRoles:/,/^[^[:space:]#]/{/^  default:/{s|^  default:[[:space:]]*\([^/]*\)/.*|\1|p;q;};}' \
     "$MGR_OMP_DIR/packages/$h.yml" 2>/dev/null) || p=""
   printf '%s' "$p"
 }
@@ -1292,7 +1294,10 @@ def nextline:
           else
             (.timeline.shown // []) as $S
             | [ $S[] | select((.repo // "") == $repo) ] as $own
-            | (.burn.stall_window) as $sw
+            # the callers own window, not .burn.stall_window: the ETAs on these items were
+            # simulated against this managers subscription, and a limit it cannot spend is
+            # neither a stall it waits out nor a reset worth naming here
+            | ($m.stall_window // null) as $sw
             | (stallmark($own; $sw)) as $markIdx
             | [ range(0; $own|length) as $i
                 | nextitemtext($own[$i]; ($markIdx != null and $i == $markIdx); $sw) ] as $texts

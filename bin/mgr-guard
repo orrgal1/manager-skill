@@ -438,19 +438,27 @@ JQ_OVERVIEW='
       then (((($now + ((1 - .used) / .burn_per_hour * 3600000)) | round) as $e
              | if .resets_at == null then $e else ([$e, .resets_at] | min) end))
       else null end)}]) as $limits
-| ([$limits[] | select((.exhaust_at != null) and (.resets_at != null) and (.resets_at > $now))]
-   | sort_by(.exhaust_at) | first) as $worst
+| ([$limits[] | select((.exhaust_at != null) and (.resets_at != null) and (.resets_at > $now))]) as $stalling
+| ($stalling | sort_by(.exhaust_at) | first) as $worst
 | (if $worst == null then null
    else {from: $worst.exhaust_at, to: $worst.resets_at, limit: $worst.id} end) as $win
+# the machine-wide window above stays the record. A manager can only ever be stalled by its
+# own subscription, so every provider also gets its own earliest-exhausting window and sim()
+# hands each manager that one: a foreign reset must not bend the ETAs a caller reads as its.
+| (($stalling | group_by(.provider)
+    | map((sort_by(.exhaust_at) | first) as $w
+          | {key: $w.provider, value: {from: $w.exhaust_at, to: $w.resets_at, limit: $w.id}})
+    | from_entries)) as $wins
 | ({n: 0, median_s: $default_s, p80_s: $default_s, last_10_mean_s: $default_s,
     estimated: true, source: "default"}) as $tdef
 
-# wall time minus the stall: work that would have run inside the window lands after it
-| def finish($start; $work):
-    (if $win == null then ($start + $work)
-     elif (($start >= $win.from) and ($start < $win.to)) then ($win.to + $work)
-     elif (($start < $win.from) and (($start + $work) > $win.from))
-     then ($win.to + ($start + $work - $win.from))
+# wall time minus the stall: work that would have run inside the window lands after it.
+# $w is the window of whoever is being simulated, never the machine-wide one
+| def finish($start; $work; $w):
+    (if $w == null then ($start + $work)
+     elif (($start >= $w.from) and ($start < $w.to)) then ($w.to + $work)
+     elif (($start < $w.from) and (($start + $work) > $w.from))
+     then ($w.to + ($start + $work - $w.from))
      else ($start + $work) end) | round;
 
 # one manager: in-flight ETAs first, then FIFO passes over ready+blocked. A pass schedules
@@ -468,12 +476,15 @@ def sim($m):
     | (if (($t.estimated) == null) then true else $t.estimated end) as $est
     | (($m.repo // null)) as $repo
     | (($m.manager_id // "")) as $mid
+    # a manager with no resolvable provider is on no subscription this guard sampled, so it
+    # gets no window at all rather than another subscription reset it cannot spend against
+    | (($wins[(($m.provider // ""))] // null)) as $mwin
     | ([($b.in_flight // [])[]
         | (.launched_at // null) as $la
         | (if $la == null then ($now + $med)
            else ($la + ([$med, (($now - $la) + (0.25 * $med))] | max)) end) as $raw
         | {repo: $repo, number: .number, title: (.title // ""), state: "in_flight",
-           eta: finish($now; $raw - $now), estimated: ($est or ($la == null)),
+           eta: finish($now; $raw - $now; $mwin), estimated: ($est or ($la == null)),
            blocked_by: [], manager_id: $mid}]) as $inflight
     # the ledger lists stop at 50; the tick also files the whole queue under backlog/, and
     # the simulation runs on everything — only the display is capped
@@ -508,7 +519,7 @@ def sim($m):
                 then ($acc | .pending += [$it])
                 else ((($acc.slots | sort)) as $ss
                       | ([$ss[0]] + [$rel[] | $acc.done[(. | tostring)]] | max) as $start
-                      | finish($start; $med) as $eta
+                      | finish($start; $med; $mwin) as $eta
                       | $acc | .slots = ([$eta] + $ss[1:])
                              | .done += {($it.number | tostring): $eta}
                              | .sched += [$it + {eta: $eta, estimated: $est}]
@@ -518,7 +529,10 @@ def sim($m):
     | (($b.counts // {ready: ($m.ready // 0), in_flight: ($m.in_flight // 0)})) as $c
     | (($c.ready // 0)) as $nready
     | (if ($snap != null) and ($nready == 0) then ($b.slots_free // 0) else 0 end) as $idle
-    | {row: {manager_id: $mid, repo: $repo, provider: ($m.provider // null), cap: $cap, ready: $nready,
+    | {row: {manager_id: $mid, repo: $repo, provider: ($m.provider // null),
+             # the window this manager can actually be stalled by, for a render that names a
+             # limit as the callers own; burn.stall_window stays the machine-wide record
+             stall_window: $mwin, cap: $cap, ready: $nready,
              blocked: ($c.blocked // 0), in_flight: ($c.in_flight // 0),
              awaiting_approval: ($c.awaiting_approval // 0),
              idle_slots: $idle, starving: ($idle > 0),
@@ -899,13 +913,16 @@ cmd_tick() {
   # never a single machine-wide default; builder_provider() only fills in when that's empty
   providers=$(jq -r --arg bp "$bp" --argjson managers "$managers" --argjson panes "$panes" \
     '([$managers[] | select((.pane_id // "") | IN($panes[])) | .provider
-         | select(type == "string" and . != "")]
+         | select(type == "string" and test("^[A-Za-z0-9._:-]+$"))]
        + [.[] | select(.stall != null) | (.stall.provider // empty)])
       | unique
       | if length == 0 then [$bp] else . end
       | .[]' <<<"$facts")
 
-  for p in $providers; do
+  # cmd_register takes the registration as filed, so the provider is whatever a manager wrote:
+  # read it a line at a time, never as an unquoted word list a glob could multiply
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
     rep=$(fetch_provider "$p" "$prev")
     reports=$(jq -c --argjson r "$rep" '. + [$r]' <<<"$reports")
     if [ "$(jq -r '.ok' <<<"$rep")" = true ]; then
@@ -916,7 +933,7 @@ cmd_tick() {
     else
       log warn "usage fetch failed for $p (degraded to unknown)"
     fi
-  done
+  done < <(printf '%s\n' "$providers")
 
   samples=$(prune_samples "$(( now - 86400000 ))")
 
