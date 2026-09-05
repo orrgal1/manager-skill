@@ -15,6 +15,13 @@ MGR="$here/../bin/mgr"
 # every launched builder loads the status-line extension from the real checkout
 # (`readlink -f` in bin/mgr resolves it even through an install.sh symlink)
 ext="$(cd "$here/.." && pwd -P)/extensions/mgr-status.ts"
+# and is briefed with the workflow file of its size, from the same checkout
+wf="$(cd "$here/.." && pwd -P)/workflows"
+# and with the model-role overlay of its house, from omp/packages/
+pkgs="$(cd "$here/.." && pwd -P)/omp/packages"
+# the paths `mgr` reports as itself and as the contract (readlink -f of $MGR)
+MGR_REAL="$(cd "$here/.." && pwd -P)/bin/mgr"
+MGR_REAL_BUILDER="$(cd "$here/.." && pwd -P)/builder.md"
 [ -x "$MGR" ] || { printf 'not executable: %s\n' "$MGR" >&2; exit 1; }
 
 # physical paths throughout: `git worktree list` reports the resolved path, and
@@ -34,14 +41,22 @@ git -C "$repo" branch -M main
 # ------------------------------------------------------------------ fixtures
 
 cat >"$fix/issues.json" <<'EOF'
-[{"number":7,"title":"Another thing","labels":[],"body":""},
- {"number":49,"title":"Do the thing","labels":[{"name":"mgr:in-flight"}],"body":""}]
+[{"number":7,"title":"Another thing","labels":[{"name":"size:small"}],"body":""},
+ {"number":49,"title":"Do the thing","labels":[{"name":"mgr:in-flight"},{"name":"size:large"}],"body":""}]
 EOF
 cat >"$fix/issue-7.json" <<'EOF'
-{"number":7,"title":"Another thing","state":"OPEN","labels":[],"body":""}
+{"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:small"}],"body":""}
 EOF
 cat >"$fix/issue-49.json" <<'EOF'
-{"number":49,"title":"Do the thing","state":"OPEN","labels":[{"name":"mgr:in-flight"}],"body":""}
+{"number":49,"title":"Do the thing","state":"OPEN","labels":[{"name":"mgr:in-flight"},{"name":"size:large"}],"body":""}
+EOF
+# the same issue 7 without a size label, and with two of them: `mgr launch`
+# refuses on both, `mgr size` fixes both
+cat >"$fix/issue-7-nosize.json" <<'EOF'
+{"number":7,"title":"Another thing","state":"OPEN","labels":[],"body":""}
+EOF
+cat >"$fix/issue-7-twosizes.json" <<'EOF'
+{"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:tiny"},{"name":"size:large"}],"body":""}
 EOF
 
 # the manager itself on w9:p1/w9:t1, one managed builder, and one unmanaged
@@ -89,7 +104,9 @@ case "${1:-}" in
       list) cat "$MGR_TEST_FIX/issues.json";;
       view)
         case " $* " in *" comments "*) printf '\n'; exit 0;; esac
-        f="$MGR_TEST_FIX/issue-${3:-}.json"
+        # MGR_TEST_ISSUE_VARIANT swaps in a variant fixture of the same issue
+        # (e.g. -nosize), so a case can change its labels without new fakes
+        f="$MGR_TEST_FIX/issue-${3:-}${MGR_TEST_ISSUE_VARIANT:-}.json"
         [ -f "$f" ] || exit 1
         cat "$f";;
       edit|comment|close) exit 0;;
@@ -147,6 +164,7 @@ export MGR_TEST_LOG="$tmp/calls.log"
 export MGR_TEST_AGENTS="$fix/agents.json"
 export MGR_TEST_TABS="$fix/tabs.json"
 export MGR_TEST_PROMPT="$tmp/prompt.txt"
+export MGR_TEST_ISSUE_VARIANT=       # set per case; empty = the labelled fixtures
 export HERDR_WORKSPACE_ID=w9
 export HERDR_PANE_ID=w9:p1
 export HERDR_TAB_ID=w9:t1
@@ -180,7 +198,8 @@ check 'primary is the throwaway repo' "$repo" "$("$MGR" board | jq -r '.primary'
 # --------------------------------------------------- 1. config CRUD
 
 printf '\n# 1. mgr config: git-config backed CRUD\n'
-check 'list on a fresh repo' '{"omp-arg":[],"env":[],"brief-extra":null,"cap":null}' \
+check 'list on a fresh repo' \
+  '{"omp-arg":[],"env":[],"brief-extra":null,"cap":null,"house":null}' \
   "$("$MGR" config list)"
 check 'get unset multi'   '{"key":"omp-arg","value":[]}'   "$("$MGR" config get omp-arg)"
 check 'get unset single'  '{"key":"cap","value":null}'      "$("$MGR" config get cap)"
@@ -194,6 +213,19 @@ check 'add env'           '{"key":"env","value":["LINK=ws://127.0.0.1:1/link"]}'
   "$("$MGR" config add env LINK=ws://127.0.0.1:1/link)"
 check 'set brief-extra'   "$(jq -nc --arg v "$fix/extra.md" '{key:"brief-extra",value:$v}')" \
   "$("$MGR" config set brief-extra "$fix/extra.md")"
+check 'set house'         '{"key":"house","value":"openai"}' \
+  "$("$MGR" config set house openai)"
+check 'get house'         '{"key":"house","value":"openai"}' \
+  "$("$MGR" config get house)"
+check 'set house again replaces it' '{"key":"house","value":"anthropic"}' \
+  "$("$MGR" config set house anthropic)"
+check 'house is stored under mgr.house' anthropic \
+  "$(git -C "$repo" config --local --get-all mgr.house)"
+err=$("$MGR" config set house bogus 2>&1 >/dev/null); rc=$?
+check 'a bogus house exit' 2 "$rc"
+check 'a bogus house message' 'house must be one of anthropic|openai|gemini: bogus' \
+  "$(jq -r '.error.message' <<<"$err")"
+check 'unset house' '{"key":"house","value":null}' "$("$MGR" config unset house)"
 
 check 'get omp-arg'  '{"key":"omp-arg","value":["--extension","/abs/ext.ts"]}' \
   "$("$MGR" config get omp-arg)"
@@ -205,7 +237,7 @@ check 'get cap is a number' '{"key":"cap","value":4}' "$("$MGR" config get cap)"
 check 'list' \
   "$(jq -nc --arg be "$fix/extra.md" \
      '{"omp-arg":["--extension","/abs/ext.ts"],env:["LINK=ws://127.0.0.1:1/link"],
-       "brief-extra":$be,cap:4}')" \
+       "brief-extra":$be,cap:4,house:null}')" \
   "$("$MGR" config list)"
 
 check 'stored in the primary .git/config' "$(printf -- '--extension\n/abs/ext.ts')" \
@@ -223,7 +255,8 @@ check 'set replaces the whole list' '{"key":"omp-arg","value":["x"]}' \
 
 err=$("$MGR" config get bogus 2>&1 >/dev/null); rc=$?
 check 'unknown key exit' 2 "$rc"
-check 'unknown key message' 'unknown config key: bogus (omp-arg|env|brief-extra|cap)' \
+check 'unknown key message' \
+  'unknown config key: bogus (omp-arg|env|brief-extra|cap|house)' \
   "$(jq -r '.error.message' <<<"$err")"
 err=$("$MGR" config add cap 3 2>&1 >/dev/null); rc=$?
 check 'add on a single-valued key exit' 2 "$rc"
@@ -258,13 +291,14 @@ check 'default cap'           3 "$("$MGR" board | jq -r '.cap')"
 
 # --------------------------------------------------- 3. launch wiring
 
-printf '\n# 3. launch: omp-arg after --, one --env per entry, brief-extra appended\n'
+printf '\n# 3. launch: --model @builder + the house overlay, then omp-arg after --, one --env per entry, brief-extra appended\n'
 "$MGR" config set cap 3 >/dev/null
 "$MGR" config add omp-arg --extension >/dev/null
 "$MGR" config add omp-arg /abs/ext.ts >/dev/null
 "$MGR" config add env LINK=ws://127.0.0.1:1/link >/dev/null
 "$MGR" config add env OTHER=x >/dev/null
 "$MGR" config set brief-extra "$fix/extra.md" >/dev/null
+"$MGR" config set house anthropic >/dev/null
 
 : >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
 out=$("$MGR" launch 7); rc=$?
@@ -274,15 +308,19 @@ check 'launch worktree'  "$wt" "$(jq -r '.worktree' <<<"$out")"
 check 'tab create argv' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env LINK=ws://127.0.0.1:1/link --env OTHER=x --no-focus" "$MGR_TEST_LOG" || true)"
 check 'agent start argv' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --extension /abs/ext.ts" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --extension /abs/ext.ts" "$MGR_TEST_LOG" || true)"
 
 prompt=$(cat "$MGR_TEST_PROMPT")
 check 'brief head' true \
   "$(starts_with 'You are the builder for issue #7 in owner/name.' "$prompt")"
 check 'brief keeps the original tail' true \
   "$(contains 'Begin with: gh issue view 7 --comments' "$prompt")"
-check 'brief points at proportionate verification before the first check' true \
-  "$(contains 'Verification is proportionate to the change: its Self-review section says which checks a change warrants, so read it before you run any check.' "$prompt")"
+check 'brief names the size' true "$(contains 'Size: small.' "$prompt")"
+check 'brief names the house' true "$(contains 'Size: small. House: anthropic. Read' "$prompt")"
+check 'brief sends the builder to its workflow file' true \
+  "$(contains "Its Build section sends you to $wf/small.md, which is how you build and verify at your size — read it before you touch code." "$prompt")"
+check 'brief drops the old proportionate-verification sentence' false \
+  "$(contains 'Verification is proportionate' "$prompt")"
 check 'brief-extra appended after a blank line' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$prompt" | tail -n 3)"
@@ -314,27 +352,109 @@ MGR_OMP_ARGS='--foo bar' MGR_ENV='A=1 B=2' MGR_BRIEF_EXTRA="$fix/other.md" \
   "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
 check 'MGR_OMP_ARGS replaces the git list' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --foo bar" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --foo bar" "$MGR_TEST_LOG" || true)"
 check 'MGR_ENV replaces the git list' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env A=1 --env B=2 --no-focus" "$MGR_TEST_LOG" || true)"
 check 'MGR_BRIEF_EXTRA replaces the git path' "$(printf '\nOverride rules')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 2)"
 drop_wt
 
-printf '\n# 3d. no config at all: no --env, only the status extension after --\n'
+printf '\n# 3d. no config at all: no --env, only the status extension and the model after --\n'
 "$MGR" config unset omp-arg >/dev/null
 "$MGR" config unset env >/dev/null
 "$MGR" config unset brief-extra >/dev/null
 : >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
 "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
-check 'agent start has only the status extension' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext" "$MGR_TEST_LOG" || true)"
+check 'agent start has only the status extension and the model' 1 \
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml" "$MGR_TEST_LOG" || true)"
 check 'tab create has no --env' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --no-focus" "$MGR_TEST_LOG" || true)"
 check 'brief has no extra' 1 \
   "$(printf '%s\n' "$(cat "$MGR_TEST_PROMPT")" | wc -l | tr -d ' ')"
 drop_wt
+
+printf '\n# 3e. the size label is a launch precondition\n'
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
+err=$(MGR_TEST_ISSUE_VARIANT=-nosize "$MGR" launch 7 2>&1 >/dev/null); rc=$?
+check 'no size label: exit' 3 "$rc"
+check 'no size label: code' 3 "$(jq -r '.error.code' <<<"$err")"
+check 'no size label: message names the fix' \
+  "issue #7 has no size: label; add exactly one with: gh issue edit 7 --add-label size:<tiny|small|medium|large> (or: $MGR_REAL size 7 <size>)" \
+  "$(jq -r '.error.message' <<<"$err")"
+check 'no size label: nothing was created' 0 \
+  "$(grep -c 'herdr tab create' "$MGR_TEST_LOG" || true)"
+check 'no size label: no worktree' false \
+  "$(if [ -d "$wt" ]; then printf true; else printf false; fi)"
+
+err=$(MGR_TEST_ISSUE_VARIANT=-twosizes "$MGR" launch 7 2>&1 >/dev/null); rc=$?
+check 'two size labels: exit' 3 "$rc"
+check 'two size labels: message names them and the fix' \
+  "issue #7 has several size: labels (large tiny); remove all but one with: gh issue edit 7 --remove-label size:<size> (or: $MGR_REAL size 7 <size>)" \
+  "$(jq -r '.error.message' <<<"$err")"
+
+printf '\n# 3f. mgr size swaps the label; a live builder resizes itself\n'
+: >"$MGR_TEST_LOG"
+check 'size 7 medium' '{"number":7,"size":"medium"}' "$("$MGR" size 7 medium)"
+check 'size 7 medium: one gh edit, add then remove' 1 \
+  "$(grep -cxF 'gh issue edit 7 --add-label size:medium --remove-label size:small' \
+     "$MGR_TEST_LOG" || true)"
+check 'size 7 medium: the size labels exist first' 1 \
+  "$(grep -cxF 'gh label create size:medium --color 5319e7 --force --description builder workflow and model: medium' \
+     "$MGR_TEST_LOG" || true)"
+check 'size on an issue that already has it drops no label' \
+  '{"number":7,"size":"small"}' "$("$MGR" size 7 small)"
+check 'size 7 small: add only' 1 \
+  "$(grep -cxF 'gh issue edit 7 --add-label size:small' "$MGR_TEST_LOG" || true)"
+err=$("$MGR" size 49 tiny 2>&1 >/dev/null); rc=$?
+check 'size on an in-flight issue: exit' 3 "$rc"
+check 'size on an in-flight issue: message' \
+  'issue #49 is in flight; its builder resizes itself (comment builder: resized <from>→<to> and swap the label)' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" size 7 huge 2>&1 >/dev/null); rc=$?
+check 'a bogus size: exit' 2 "$rc"
+check 'a bogus size: message' 'size must be one of tiny|small|medium|large: huge' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" size 7 2>&1 >/dev/null); rc=$?
+check 'size without a size word: exit' 2 "$rc"
+check 'size usage message' 'usage: mgr size <N> <tiny|small|medium|large>' \
+  "$(jq -r '.error.message' <<<"$err")"
+
+printf '\n# 3g. the house: --house > MGR_HOUSE > mgr config house > this session\n'
+: >"$MGR_TEST_LOG"
+"$MGR" launch 7 --house gemini >/dev/null
+check '--house wins over the store' 1 \
+  "$(grep -cF -- "--config $pkgs/gemini.yml" "$MGR_TEST_LOG" || true)"
+drop_wt
+: >"$MGR_TEST_LOG"
+MGR_HOUSE=openai "$MGR" launch 7 >/dev/null
+check 'MGR_HOUSE wins over the store' 1 \
+  "$(grep -cF -- "--config $pkgs/openai.yml" "$MGR_TEST_LOG" || true)"
+drop_wt
+: >"$MGR_TEST_LOG"
+MGR_HOUSE=openai "$MGR" launch 7 --house anthropic >/dev/null
+check '--house wins over MGR_HOUSE' 1 \
+  "$(grep -cF -- "--config $pkgs/anthropic.yml" "$MGR_TEST_LOG" || true)"
+drop_wt
+check 'board carries the resolved house' anthropic "$("$MGR" board | jq -r '.house')"
+
+# nothing configured and a manager session that names no provider: `mgr launch`
+# has no package to overlay and says so
+"$MGR" config unset house >/dev/null
+: >"$MGR_TEST_LOG"
+err=$("$MGR" launch 7 2>&1 >/dev/null); rc=$?
+check 'no house: exit' 3 "$rc"
+check 'no house: message names the fix' \
+  'cannot determine the model house; run: mgr config set house <anthropic|openai|gemini>' \
+  "$(jq -r '.error.message' <<<"$err")"
+check 'no house: nothing was created' 0 \
+  "$(grep -c 'herdr tab create' "$MGR_TEST_LOG" || true)"
+check 'board house is null when nothing resolves' null "$("$MGR" board | jq -r '.house')"
+err=$("$MGR" launch 7 --house bogus 2>&1 >/dev/null); rc=$?
+check 'a bogus --house exit' 2 "$rc"
+check 'a bogus --house message' 'house must be one of anthropic|openai|gemini: bogus' \
+  "$(jq -r '.error.message' <<<"$err")"
+"$MGR" config set house anthropic >/dev/null
 
 # --------------------------------------------------- 4. adopt
 
@@ -350,12 +470,38 @@ check 'adopt (bound) agent' issue-7 "$(jq -r '.agent' <<<"$out")"
 check 'adopt (bound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
-check 'adopt (bound) brief points at proportionate verification' true \
-  "$(contains 'Verification is proportionate to the change: its Self-review section' "$(cat "$MGR_TEST_PROMPT")")"
+check 'adopt (bound) brief carries the labelled size, the house and its workflow' true \
+  "$(contains "Size: small. House: anthropic. Read $MGR_REAL_BUILDER now and follow it exactly; it is your complete contract. Its Build section sends you to $wf/small.md," \
+     "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (bound) starts no agent' 0 \
   "$(grep -c 'herdr agent start' "$MGR_TEST_LOG" || true)"
 check 'adopt (bound) passes no --env' 0 \
   "$(grep -c -- '--env' "$MGR_TEST_LOG" || true)"
+
+# an adoptee is mid-work: no size label is briefed as medium, never refused
+: >"$MGR_TEST_PROMPT"
+MGR_TEST_ISSUE_VARIANT=-nosize "$MGR" adopt w9:p3 7 >/dev/null; rc=$?
+check 'adopt (bound, unlabelled) exit' 0 "$rc"
+check 'adopt (bound, unlabelled) is briefed as medium' true \
+  "$(contains "Size: medium." "$(cat "$MGR_TEST_PROMPT")")"
+check 'adopt (bound, unlabelled) points at medium.md' true \
+  "$(contains "$wf/medium.md" "$(cat "$MGR_TEST_PROMPT")")"
+: >"$MGR_TEST_PROMPT"
+MGR_TEST_ISSUE_VARIANT=-twosizes "$MGR" adopt w9:p3 7 >/dev/null; rc=$?
+check 'adopt (bound, ambiguous) exit' 0 "$rc"
+check 'adopt (bound, ambiguous) is briefed as medium' true \
+  "$(contains "Size: medium." "$(cat "$MGR_TEST_PROMPT")")"
+
+# no house resolves: the adopt brief simply leaves House out — never a refusal
+"$MGR" config unset house >/dev/null
+: >"$MGR_TEST_PROMPT"
+"$MGR" adopt w9:p3 7 >/dev/null; rc=$?
+check 'adopt (bound, no house) exit' 0 "$rc"
+check 'adopt (bound, no house) omits House' true \
+  "$(contains 'Size: small. Read ' "$(cat "$MGR_TEST_PROMPT")")"
+check 'adopt (bound, no house) says House nowhere' false \
+  "$(contains 'House: ' "$(cat "$MGR_TEST_PROMPT")")"
+"$MGR" config set house anthropic >/dev/null
 
 : >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
 out=$("$MGR" adopt w9:p3); rc=$?
@@ -364,8 +510,12 @@ check 'adopt (unbound) agent' adopt-w9-p3 "$(jq -r '.agent' <<<"$out")"
 check 'adopt (unbound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
-check 'adopt (unbound) brief points at proportionate verification' true \
-  "$(contains 'Verification is proportionate to the change: its Self-review section' "$(cat "$MGR_TEST_PROMPT")")"
+check 'adopt (unbound) is briefed as medium with the house' true \
+  "$(contains 'Policy: auto-merge. Size: medium. House: anthropic. Resume your work only after bind succeeds.' \
+     "$(cat "$MGR_TEST_PROMPT")")"
+check 'adopt (unbound) tells the session to label the issue it creates' true \
+  "$(contains 'Add exactly one size label to that issue, sized by the work you are doing: gh issue edit <new issue number> --add-label size:<tiny|small|medium|large>, then run' \
+     "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (unbound) starts no agent' 0 \
   "$(grep -c 'herdr agent start' "$MGR_TEST_LOG" || true)"
 check 'adopt (unbound) passes no --env' 0 \
@@ -390,6 +540,13 @@ check 'board .manager' "$manager" "$(jq -c '.manager' <<<"$out")"
 check 'board .self'    w9:p1     "$(jq -r '.self' <<<"$out")"
 check 'the manager tab was looked up' 1 \
   "$(grep -cx 'herdr tab list --workspace w9' "$MGR_TEST_LOG" || true)"
+# every issue row carries the size its label says, or null
+check 'board in_flight row size' large \
+  "$(jq -r '.in_flight[] | select(.number==49) | .size' <<<"$out")"
+check 'board ready row size' small \
+  "$(jq -r '.ready[] | select(.number==7) | .size' <<<"$out")"
+check 'board ready row keys' '["number","title","policy","size","blocked_by"]' \
+  "$(jq -c '.ready[0] | keys_unsorted' <<<"$out")"
 
 out=$(hl board); rc=$?
 check 'headless board exit'    0 "$rc"
@@ -405,6 +562,21 @@ check 'no manager label -> null' null \
 out=$(MGR_TEST_TABS_FAIL=1 "$MGR" board 2>/dev/null); rc=$?
 check 'tab list failure exit' 0 "$rc"
 check 'tab list failure -> null manager' null "$(jq -r '.manager' <<<"$out")"
+
+# --------------------------------------------------- 5b. paths and labels
+
+printf '\n# 5b. paths carries the workflows and omp dirs; labels covers mgr:* and size:*\n'
+out=$("$MGR" paths)
+check 'paths keys' '["root","skill_md","builder_md","workflows","omp","mgr"]' \
+  "$(jq -c 'keys_unsorted' <<<"$out")"
+check 'paths workflows' "$wf" "$(jq -r '.workflows' <<<"$out")"
+check 'paths workflows is absolute and ends in /workflows' true \
+  "$(jq -r '.workflows | startswith("/") and endswith("/workflows")' <<<"$out")"
+check 'paths omp is absolute and ends in /omp' true \
+  "$(jq -r '.omp | startswith("/") and endswith("/omp")' <<<"$out")"
+check 'labels' \
+  '{"labels":["mgr:in-flight","mgr:awaiting-approval","mgr:manual-approve","size:tiny","size:small","size:medium","size:large"]}' \
+  "$("$MGR" labels)"
 
 # --------------------------------------------------- 6. headless commands
 
