@@ -42,9 +42,10 @@ Any of these fails: say exactly what is missing and stop. Do not improvise a boa
 $MGR setup
 ```
 
-It installs the six agents (`tiny`, `small`, `medium`, `large`, `plan`, `sketch`) into the omp agent
-directory and applies the model package for your house — `--house <anthropic|openai|gemini>`, else
-`$MGR config get house`, else `anthropic`. Agent files already there are kept unless `--force`.
+It installs the seven agents (`tiny`, `small`, `medium`, `large`, `plan`, `sketch`, `crux`) into
+the omp agent directory and applies the model package for your house —
+`--house <anthropic|openai|gemini>`, else `$MGR config get house`, else `anthropic`. Agent files
+already there are kept unless `--force`.
 `$MGR package <house>` switches the machine default afterwards; `$MGR package` with no argument
 prints the active package and the available ones.
 
@@ -185,7 +186,12 @@ is the one exemption and stays in-session; `small` maps with a scout but plans i
 trigger fires. A builder that finds real meat in a correctly-sized issue has a cheaper move than
 resizing: it delegates the planning to its size's planner (`sketch` at `small` too), keeps its size,
 workflow file and checks, and comments `builder: delegated planning to <planner> · <which trigger>`.
-Neither comment needs anything from you.
+A builder that hits a fumble trigger (builder.md §7) hands that one step to a fresh `crux` agent on
+the top rung instead — its size label, workflow file and verification set do not change, and the
+marker it posts, `builder: escalated <what> · <which trigger>`, is your only visibility into it and
+needs no action. Every escalation posts one for the same reason: so the fumble rate becomes
+something you can measure, not something you have to guess at. None of the three comments needs
+anything from you.
 
 ### (c) Policy
 
@@ -259,11 +265,12 @@ the unbound case, addressed by issue:
 `herdr agent read issue-N --source recent-unwrapped --lines 60`, relay it, answer with
 `$MGR prompt N "…"`, wait again. `agent_status: blocked` gets the same treatment.
 
-Two builder comments are progress, not reports, and need nothing from you:
-`builder: resized <from>→<to>` — it outgrew its size and already moved the label — and
+Three builder comments are progress, not reports, and need nothing from you:
+`builder: resized <from>→<to>` — it outgrew its size and already moved the label;
 `builder: delegated planning to <planner> · <which trigger>` — it handed the plan to its size's
 planner (`sketch` at `small` and `medium`, `plan` at `large`) and kept its size, workflow file and
-checks.
+checks; and `builder: escalated <what> · <which trigger>` — it handed one step to a fresh `crux`
+agent on a fumble trigger (builder.md §7) and kept its size, workflow file and checks.
 
 Trust the report, not the idle state.
 
@@ -345,7 +352,7 @@ Trust the report, not the idle state.
 | `$MGR pause` | this project's launch gate: a persisted cap 0, machine-wide for this repo (`mgr.paused` in the primary checkout's `.git/config`). `board` reports `paused_by_operator`, `launch` refuses; running builders are untouched. Idempotent |
 | `$MGR unpause` (alias `$MGR resume`) | lift the gate: the cap goes back to `--cap`/`MGR_CAP`/config/`3`. Idempotent, exit `0` when the project is not paused |
 | `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`, `house` (`anthropic`\|`openai`\|`gemini` — the package every launch overlays). Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
-| `$MGR setup [--force] [--house <house>]` | once per machine: install the six agents into the omp agent dir (existing files kept unless `--force`) and apply the house's package — `--house`, else `$MGR config get house`, else `anthropic` |
+| `$MGR setup [--force] [--house <house>]` | once per machine: install the seven agents into the omp agent dir (existing files kept unless `--force`) and apply the house's package — `--house`, else `$MGR config get house`, else `anthropic` |
 | `$MGR package [<house>]` | no argument: `{active, available, dir}`. With one: apply `omp/packages/<house>.yml` to this machine's omp config (`modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains`) and print the role changes. Exit `4` on an unknown house |
 | `$MGR house` | `{provider, model, house}` read off your own session — what a launch falls back to when nothing is configured |
 
