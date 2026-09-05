@@ -24,10 +24,10 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 - **Adoption.** Opened after other tabs are already working? The manager adopts them: a tab whose
   branch names an issue is bound to it; a tab with no issue pauses, writes its own issue, binds,
   and continues under the builder contract.
-- **A quota guard.** A plain daemon — not an agent — tracks provider usage, dials concurrency down
-  to what fits before the window resets, and re-prompts sessions whose turn died on a rate limit,
-  the manager's own included. It is also what enforces the operator's pause: `mgr pause` is a
-  persisted cap 0 for the project, and the guard holds every builder it has until `mgr unpause`.
+- **A quota guard.** A plain daemon — not an agent — with two jobs: re-prompt sessions whose turn
+  died on a provider rate limit once the quota renews, the manager's own session included, and keep
+  a burn projection the manager reports to the operator. It never dials pace: the cap is the
+  operator's alone.
 - **Issue hygiene** on every request: dedupe, union overlapping asks, split multi-deliverable
   requests, wire dependencies.
 - **Harness config per repo.** `mgr config` stores extra omp CLI args, environment variables for
@@ -76,9 +76,9 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | I want to approve that one myself | adds `mgr:manual-approve` before launching |
 | what's on the board | `mgr board` as a table |
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
-| set the priority to 8 | `mgr priority 8` — outranks the others when quota is tight, and scales this project's cap ceiling toward the top project's the further behind it is |
-| pause the project | `mgr pause` — a persisted cap 0 for this repo until `mgr unpause`: nothing new launches and the guard interrupts and holds the builders it already has. Nothing is retired, no tab, worktree or issue is touched |
-| unpause / resume the project | `mgr unpause` (alias `mgr resume`) — the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the guard resumes the held builders itself |
+| pause the project | `mgr pause` — a launch gate: a persisted cap 0 for this repo until `mgr unpause`, so nothing new launches. The builders already running keep going to their report; nothing is retired, no tab, worktree or issue is touched |
+| unpause / resume the project | `mgr unpause` (alias `mgr resume`) — the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the ready issues launch |
+| quota status | `mgr board` and one burn line, e.g. `burn: anthropic:5h 20% → 2.56× by 17:00Z (was 1.04×)` |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Headless use
@@ -109,8 +109,8 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
-| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `priority` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
-| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `stall` · `priority` · `pause` · `unpause` · `paused` — the quota daemon |
+| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
+| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager` |
 | `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |
 | `test/run.sh` | The hermetic test suite |
@@ -123,7 +123,7 @@ exit `0` ok · `1` unexpected · `2` usage · `3` refused / invalid state · `4`
 ```
 operator ──▶ manager ──gh issue create──▶ GitHub issue #N
                 │
-                ├─ mgr guard start ──▶ mgr-guard daemon ──omp usage──▶ allowed_total, cap_effective
+                ├─ mgr guard start ──▶ mgr-guard daemon ──omp usage──▶ burn projection
                 │                         └──herdr agent prompt "mgr-guard: …"──▶ stalled session
                 ├─ mgr launch N ──▶ worktree + herdr tab + builder + brief
                 │                         │
@@ -138,89 +138,67 @@ operator ──▶ manager ──gh issue create──▶ GitHub issue #N
 
 Builders and the manager are all agent sessions on one provider quota. When it runs out a turn ends
 on a 429 and the pane just sits there — and the manager cannot be what notices, because it is
-stalled on the same quota. So `bin/mgr-guard` is bash, not an agent:
+stalled on the same quota. So `bin/mgr-guard` is bash, not an agent, and it has exactly two
+purposes: **reignite what the quota stopped**, and **keep a burn projection** the manager shows the
+operator. Nothing acts on the projection.
 
-- **Trajectory.** The builder provider is `omp config list --json` (`modelRoles.value.default`,
-  falling back to `anthropic`). Every tick invalidates and re-reads
-  `omp usage --json --provider <p>`, appends a sample per limit and least-squares-fits a burn rate
-  over the last `MGR_GUARD_SLOPE_WINDOW_S`: `projected_at_reset = used + burn × hours_to_reset`.
-  Samples are matched to a limit by *window*, not by the raw stamp — `omp usage` reports `resets_at`
-  with per-call millisecond jitter, so a sample belongs to the current window when its `resets_at`
-  is within 120 s of the limit's (both null matches too), and the slope is fitted over every
-  matched sample instead of the two that happened to collide on the same millisecond. A sample span
-  shorter than `MGR_GUARD_MIN_SLOPE_SPAN_S` counts as zero burn; samples older than 24h are pruned.
-  A projection over 100% must repeat for `MGR_GUARD_CONFIRM_TICKS` consecutive ticks before it
-  constrains anything (`over_ticks` and `sample_count` per limit in `mgr guard status`); increases
-  of `allowed_total` apply on the first tick.
-- **Dial-back.** A *confirmed* projection past 100% shrinks `allowed_total` (never below 1); an
-  exhausted limit sets it to 0 until the window resets. `allowed_total` is water-filled over the
-  live managers by demand into a per-manager `allotment`, and `mgr board` reports
-  `cap_effective = min(cap, allotment)`. `launch` refuses when no slot is free; `adopt` never
-  refuses — it returns `over_cap: true`, because leaving live work unmanaged is worse. Guard
-  stopped or stale → no throttle at all. Every `allowed_changed` event carries `fit` — the binding
-  limit, its fitted slope and the `{t, used}` samples behind it — so the next incident is
-  diagnosable from `mgr guard status` alone.
-- **Priorities, and the two levels of response.** Each project (repo) has a priority —
-  `mgr priority N`, default 5, higher wins, machine-wide. It does two things. First, constrained
-  or not, it derives a cap ceiling: the top-priority live project keeps its own cap, every other
-  project gets `derived_cap = max(1, floor(top_cap × priority / top_priority))`, so its effective
-  cap is `min(cap, derived_cap)`; its demand (what it actually has to run, never more than that)
-  enters the allotment, and water-filling can only lower it further, never raise it. `top_cap` is
-  the top project's `--cap` (not its momentary allotment, so the numbers are stable); ties at the
-  top all keep their own cap. Example: top project priority 10, cap 3; a project at priority 5
-  gets `floor(3 × 5/10) = 1`, so with its own cap 3 it runs at `min(3, 1) = 1`, and with its own
-  cap 1 or less its own cap wins; priority 1 still gets `max(1, floor(0.3)) = 1`. No project
-  derives below 1, so this is not how you pause one — `mgr pause` is. Second, while quota is
-  constrained the guard serves whole tiers top-down instead of sharing evenly, so a bottom tier
-  can drop to `allotment: 0`. What that does to its builders depends on *why* the quota is
-  constrained:
-  - **Level 1 — projection.** The burn trajectory says the window will not fit. `allowed_total`
-    and `cap_effective` drop, new launches are refused, and running builders are left to finish
-    their turn; each over-allotment builder is held the moment herdr reports it idle (a paused
-    entry with `esc_sent: 0`, no keys sent). Over-allotment is counted against *every* unheld
-    builder of the manager, working or not, keeping working ones first, then adoptees, then the
-    lowest issue numbers — the same count decides when there is room again, so a hold is never
-    undone by the next tick.
-  - **Level 2 — hard.** The provider itself is in trouble: status `exhausted`/`warning`, or an
-    actual 429 seen on that provider this tick (`providers.<p>.hard`). Now over-allotment builders
-    that are still *working* are interrupted with `esc` (highest issue number first, adoptees last,
-    at most three tries).
-
-  The guard resumes them itself once the share is back: the cooldown counts from the last tick the
-  manager had no room (`MGR_GUARD_RESUME_COOLDOWN_S`, 60 s by default), not from the pause, and a
-  pending `esc` re-send is cancelled as soon as the manager has room again.
-- **The operator's pause.** `mgr pause` is not a priority trick: it is a persisted cap-0 override
-  for the repo, stored in `paused.json` beside `priorities.json` in the state dir, so it survives
-  the session and every worktree. The manager's registration then carries `cap: 0` and
-  `demand: 0`, and the guard sets that manager's `demand_effective` to 0 and its allotment to 0
-  unconditionally — constrained or not, whatever its priority, whatever the provider is doing. The
-  pause is applied to the demand rather than to the ceiling precisely so the floor of 1 on
-  `derived_cap` cannot leak a builder through. Its working builders are then interrupted with
-  `esc` and its idle ones held at their next turn boundary, both with `cause: operator-paused`, and
-  `mgr guard status` reports them as `managers[].paused_by_operator` plus a top-level
-  `paused_repos`. `mgr unpause` (alias `mgr resume`) drops the entry: the cap goes back to
-  `--cap`/`MGR_CAP`/`mgr config get cap`/`3` and the guard resumes the held builders on its next
-  tick, skipping the resume cooldown because this hold was the operator's, not a quota accident.
-  `mgr priority` is untouched by any of it.
 - **Stall detection.** For every `issue-*`, `adopt-*` and `manager*` agent that is not working, the
   guard reads the tail of the omp session JSONL: a last assistant message that stopped on an error
-  with a 429 / rate-limit / quota-exhausted body is a stall.
-- **Reignition.** Once the provider is no longer exhausted it runs
-  `herdr agent prompt <pane> "mgr-guard: …"`, backing off per attempt (15 min doubling to a 2h cap).
-  Managers are reignited exactly like builders — that is what breaks the deadlock, and no agent is
-  involved.
+  with a 429 / rate-limit / quota-exhausted body is a stall. The entry keeps the pane, the
+  workspace, the provider, the error, `since`, the `recovers_at` of the limit that caused it, the
+  manager it belongs to, and the reignite attempts so far.
+- **Reignition.** A stalled pane is re-prompted only when the quota is *observably* back: this
+  tick's usage fetch succeeded and the provider reads `ok` or `warning`, or the `recovers_at` of the
+  limit that caused the 429 has passed. Never on `unknown`, and never on `exhausted` with the reset
+  still ahead. When a usage fetch fails the guard holds the last verdict — a provider known
+  exhausted until 17:00Z stays exhausted until 17:00Z instead of looking recovered because
+  `omp usage` was unreachable. Each pane backs off on its own (15 min, doubling to a 2 h cap), and
+  the prompt states the reading it acted on: `mgr-guard: anthropic:5h reset at
+  2026-09-05T17:00:00Z, now at 12%. Your previous turn stopped on a provider rate limit (429). …`,
+  or, on the `recovers_at` path with no fresh reading, that the reset time has passed and no reading
+  is available. It never claims a quota is back over a 100% reading. Managers are reignited exactly
+  like builders — that is what breaks the deadlock, and no agent is involved. A reignite is also the
+  guard's only desktop toast (`MGR_GUARD_NOTIFY`).
+- **The projection.** The builder provider comes from `omp config list --json`
+  (`modelRoles.value.default`, falling back to `anthropic`). Every tick invalidates and re-reads
+  `omp usage --json --provider <p>` and records, per limit, `used`, `resets_at`, a least-squares
+  `burn_per_hour` over the last `MGR_GUARD_SLOPE_WINDOW_S`,
+  `projected_at_reset = used + burn × hours_to_reset`, `fits` (`projected_at_reset ≤ 1`) and the
+  `{t, used}` samples the fit used. Samples are matched to a limit by *window*, not by the raw
+  stamp — `omp usage` reports `resets_at` with per-call millisecond jitter, so a sample belongs to
+  the current window when its `resets_at` is within 120 s of the limit's (both null matches too),
+  and the slope is fitted over every matched sample instead of the two that happened to collide on
+  the same millisecond. A sample span shorter than `MGR_GUARD_MIN_SLOPE_SPAN_S` counts as zero burn;
+  samples older than 24h are pruned. The guard also writes one sentence per provider about the worst
+  limit — `anthropic:5h at 20% burning 0.2/h → 2.56× the window by 17:00Z`, or `fits`.
+- **Surfacing it.** `mgr board` passes the projection through as `quota.limits[]` and
+  `quota.reason`, and compares it with the projection it last returned for this manager
+  (`MGR_STATE_DIR/managers/<manager_id>.last_report.json`). When some limit's `fits` flipped, its
+  `projected_at_reset` moved by `0.1` or more, or it is new, the board returns `quota.changed: true`
+  with `quota.delta` describing it — `anthropic:5h 1.04× → 2.56× (now over)`. The manager then ends
+  that turn with one line, `burn: anthropic:5h 20% → 2.56× by 17:00Z (was 1.04×)`, and otherwise
+  says nothing about quota.
+- **What it never does.** It computes no ceiling on how many builders may run: no `allowed_total`,
+  no priority ranking, no water-filling, no per-manager allotment, no second cap. It never pauses,
+  holds or interrupts a running builder — the only keystrokes it ever sends are a reignite prompt to
+  a pane that already stopped. `cap` is the operator's only pace dial and `mgr` enforces it alone
+  (`slots_free = cap − (in_flight + adopting)`). `mgr pause` is a launch gate owned by `mgr`, not by
+  the guard: a persisted cap 0 in the primary checkout's `.git/config` (`mgr.paused`), so `launch`
+  refuses and `board` reports `paused_by_operator` while the builders already running keep going.
+  The guard knows nothing about it.
 - **Multi-manager ledger.** `~/.local/state/mgr-guard` (`MGR_STATE_DIR`) holds `guard.pid`,
-  `guard.log`, `state.json`, `samples.jsonl`, `priorities.json`, `paused.json`, `exit.json` and one
-  `managers/<id>.json` per manager, heartbeated by every `mgr` call (`mgr board` writes the full
-  registration, every other subcommand stamps `seen_at`). One daemon serves every manager on
-  the machine.
+  `guard.log`, `state.json`, `samples.jsonl`, `exit.json`, one `managers/<id>.json` per manager —
+  heartbeated by every `mgr` call (`mgr board` writes the full registration: manager id, repo, pane,
+  cap and in-flight, for attribution only; every other subcommand stamps `seen_at`) — and the
+  `managers/<id>.last_report.json` the board writes for change detection. One daemon serves every
+  manager on the machine.
 
-`mgr guard start` is idempotent, `mgr guard status` prints the verdict (and always exits 0), and the
-daemon exits by itself only after 30 minutes with no live manager pane and no stalled or paused
-builders. A manager is live while its herdr pane exists (`herdr agent list`); heartbeat age is
-informational, so `guard status` reports both `managers[].pane_alive` and `managers[].seen_at` —
-that is what keeps a 429-stalled manager, which runs no commands at all, from being written off.
-When the daemon does exit it records why, and `mgr guard status` and `mgr board` report it as
+`mgr guard start` is idempotent, `mgr guard status` prints the whole state (and always exits 0), and
+the daemon exits by itself only after 30 minutes with no live manager pane and no stalled pane. A
+manager is live while its herdr pane exists (`herdr agent list`); heartbeat age is informational, so
+`guard status` reports both `managers[].pane_alive` and `managers[].seen_at` — that is what keeps a
+429-stalled manager, which runs no commands at all, from being written off. When the daemon does
+exit it records why, and `mgr guard status` and `mgr board` report it as
 `last_exit_at` / `last_exit_reason`.
 
 ## Configuration
@@ -242,10 +220,8 @@ error (exit `2`).
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks (`mgr-guard start --interval S` wins) |
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_MIN_SLOPE_SPAN_S` | `300` | minimum sample span before a slope is trusted; below it, burn is 0 |
-| `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager pane and no stalled or paused builders |
-| `MGR_GUARD_CONFIRM_TICKS` | `3` | consecutive ticks a limit must project past 100% before it constrains |
-| `MGR_GUARD_RESUME_COOLDOWN_S` | `60` | how long after its manager last had no room the guard may resume a paused builder |
-| `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's herdr toasts |
+| `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager pane and no stalled pane |
+| `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's herdr toasts (a reignite is the only one) |
 | `MGR_GUARD_NOW_MS` | unset | pins the guard's clock in ms since the epoch; for tests |
 
 `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID` and `HERDR_TAB_ID` are exported by herdr, not by you —
