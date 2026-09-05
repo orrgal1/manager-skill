@@ -210,7 +210,7 @@ is "quota.limits[1] fields too" "$(jq -c '.quota.limits[1] | keys_unsorted' <<<"
 is "quota.reason is the guard's reason, verbatim" "$(jq -r '.quota.reason' <<<"$bd")" \
   "$(jq -r '.providers.anthropic.reason' <<<"$st")"
 is "quota.managers[] fields" "$(jq -c '.quota.managers[0] | keys_unsorted' <<<"$bd")" \
-  '["manager_id","repo","cap","in_flight","live","pane_alive","seen_at"]'
+  '["manager_id","repo","provider","cap","in_flight","live","pane_alive","seen_at"]'
 is "quota.changed on the first projection" "$(jq -r '.quota.changed' <<<"$bd")" true
 is "quota.delta" "$(jq -r '.quota.delta' <<<"$bd")" 'first projection'
 is "last_report recorded" "$([ -f "$LR" ] && echo yes || echo no)" yes
@@ -233,7 +233,15 @@ is "registered ws-w3" "$(jq -r '.manager_id' "$MGR_STATE_DIR/managers/ws-w3.json
 is "registration cap" "$(jq -r '.cap' "$MGR_STATE_DIR/managers/ws-w3.json")" 3
 is "registration has no demand" "$(jq -r 'has("demand")' "$MGR_STATE_DIR/managers/ws-w3.json")" false
 is "registration keys" "$(jq -c 'keys_unsorted' "$MGR_STATE_DIR/managers/ws-w3.json")" \
-  '["manager_id","workspace_id","pane_id","repo","primary","cap","paused_by_operator","in_flight","adopting","ready","seen_at"]'
+  '["manager_id","workspace_id","pane_id","repo","primary","house","provider","cap","paused_by_operator","in_flight","adopting","ready","seen_at"]'
+# the whole point of #32: the guard learns which subscription to sample from the
+# manager's own registration, not from the machine's omp default
+is "registration carries the manager's house" \
+  "$(jq -r '.house' "$MGR_STATE_DIR/managers/ws-w3.json")" anthropic
+is "registration carries the provider that house burns" \
+  "$(jq -r '.provider' "$MGR_STATE_DIR/managers/ws-w3.json")" anthropic
+is "the provider polled is the registered one" \
+  "$(jq -r '.providers | keys | join(",")' <<<"$st")" anthropic
 is "the guard skips the board's report file" "$(jq -r '.managers | keys | join(",")' <<<"$st")" ws-w3,ws-w9
 
 echo "# 5. mgr launch is refused on the cap alone, and its internal board records nothing"
