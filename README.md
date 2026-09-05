@@ -28,6 +28,9 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   died on a provider rate limit once the quota renews, the manager's own session included, and keep
   a burn projection the manager reports to the operator. It never dials pace: the cap is the
   operator's alone.
+- **One overview block.** `mgr overview` is machine-wide — every manager, every builder, which is
+  the whole subscription: the burn and where it lands at reset, the backlog per repo, and an ETA per
+  issue in flight and queued. The manager ends every turn with it. Read-only: nothing paces on it.
 - **Issue hygiene** on every request: dedupe, union overlapping asks, split multi-deliverable
   requests, wire dependencies.
 - **Harness config per repo.** `mgr config` stores extra omp CLI args, environment variables for
@@ -83,7 +86,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
 | pause the project | `mgr pause` — a launch gate: a persisted cap 0 for this repo until `mgr unpause`, so nothing new launches. The builders already running keep going to their report; nothing is retired, no tab, worktree or issue is touched |
 | unpause / resume the project | `mgr unpause` (alias `mgr resume`) — the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the ready issues launch |
-| quota status | `mgr board` and one burn line, e.g. `burn: anthropic:5h 20% → 2.56× by 17:00Z (was 1.04×)` |
+| quota status / overview / what's coming | `mgr overview` — one block: burn, backlog, per-issue ETAs (see **Overview**) |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Headless use
@@ -94,6 +97,7 @@ inside the repo. Every command except `bind` works that way — `HERDR_PANE_ID` 
 
 ```sh
 HERDR_WORKSPACE_ID=<ws> mgr board
+HERDR_WORKSPACE_ID=<ws> mgr overview --json
 
 mgr config add omp-arg --extension
 mgr config add omp-arg /abs/ext.ts
@@ -114,8 +118,8 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
 | `builder.md` | The builder contract every launched or adopted session follows |
-| `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
-| `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
+| `bin/mgr` | `labels` · `board` · `overview` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
+| `bin/mgr-guard` | `start` · `stop` · `status` · `overview` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
 | `extensions/mgr-status.ts` | omp status-line indicator: rate-limited / guard stopped / project paused, optional burn item |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager`; `--omp-extension` also links the status-line extension into `~/.omp/agent/extensions/` |
 | `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |
@@ -182,9 +186,14 @@ operator. Nothing acts on the projection.
   `quota.reason`, and compares it with the projection it last returned for this manager
   (`MGR_STATE_DIR/managers/<manager_id>.last_report.json`). When some limit's `fits` flipped, its
   `projected_at_reset` moved by `0.1` or more, or it is new, the board returns `quota.changed: true`
-  with `quota.delta` describing it — `anthropic:5h 1.04× → 2.56× (now over)`. The manager then ends
-  that turn with one line, `burn: anthropic:5h 20% → 2.56× by 17:00Z (was 1.04×)`, and otherwise
-  says nothing about quota.
+  with `quota.delta` describing it — `anthropic:5h 1.04× → 2.56× (now over)`. That is change
+  detection for the operator's benefit, nothing more: what the manager actually says at the end of
+  every turn is the `mgr overview` block, which carries the same limits with their `exhaust_at`.
+- **Backlog for the overview.** Every `MGR_GUARD_BACKLOG_INTERVAL_S` (default 120 s) the guard also
+  refreshes each live manager's repo itself (`gh issue list`, the same ready/blocked/in-flight rules
+  `mgr board` uses) into `managers[].backlog` with `backlog_at`, and recomputes that repo's
+  `throughput` from `MGR_STATE_DIR/throughput/`, so the overview is fresh machine-wide even for a
+  manager that has not run a command in a while — see **Overview**.
 - **What it never does.** It computes no ceiling on how many builders may run: no `allowed_total`,
   no priority ranking, no water-filling, no per-manager allotment, no second cap. It never pauses,
   holds or interrupts a running builder — the only keystrokes it ever sends are a reignite prompt to
@@ -208,6 +217,72 @@ manager is live while its herdr pane exists (`herdr agent list`); heartbeat age 
 429-stalled manager, which runs no commands at all, from being written off. When the daemon does
 exit it records why, and `mgr guard status` and `mgr board` report it as
 `last_exit_at` / `last_exit_reason`.
+
+## Overview
+
+`mgr overview` is the one block the manager prints at the end of every turn — every turn, including
+the ones that only answered a question. It is **machine-wide** by design: every manager registered
+with the guard and every builder they have running, because the quota is one subscription and not
+one project. `--json` returns the object behind the block, `mgr board` embeds the same object as
+`overview`, and `--limit N` decides how much of the queue is listed.
+
+```
+burn     anthropic:5h 80% @0.46/h → 2.2× by 17:00 (exhausts ~15:10, stalls 1h50) · week 20% @0.02/h → 12.6× by Sat 09:00
+backlog  open 31 · ready 14 · blocked 3 · in flight 2/4 slots · idle 2 (shape) — shape starves NOW, manager-skill in ~3h10
+next     #23 in flight → 15:05 · #24 → 15:40 · #25 ⊘#23 → 16:30 · #26 → 18:20 (after 5h reset) · #27 → 19:05
+beyond   +17 queued (3 blocked), last ~Sat 09:40 · ~1h05/task (n=12)
+drains   manager-skill Sat 09:40 · shape — · livinglore 16:10
+```
+
+- **`burn`** — one entry per provider limit: how much of the window is used, the measured burn rate,
+  where that lands at reset (`2.2×` is 2.2 windows' worth) and when the window resets. A limit that
+  does not fit also says when it runs out and how long the stall to the reset is. The first limit of
+  a provider prints its full id, the rest only the window (`week`). No reading at all: `no reading`.
+- **`backlog`** — the true totals across every live manager: open issues, `ready` (launchable now),
+  `blocked`, in flight over the sum of the caps, and idle slots with the repos holding them. After
+  the dash, per manager, when it runs out of queue: `starves NOW` or `in ~3h10`.
+- **`next`** — every in-flight issue first, then the queued ones by ETA. `⊘#23` means it waits on
+  #23; an issue in another repo is prefixed with that repo (`shape#12`); `(after 5h reset)` marks
+  the first issue that only finishes after the quota window reopens. It wraps to at most three
+  lines, and a trailing `· …` means more items than fit.
+- **`beyond`** — the queue that is not listed: how many, how many of those are blocked, the ETA of
+  the last one, and the per-task median and sample count of the repo holding most of them. The line
+  is omitted when nothing is hidden.
+- **`drains`** — per manager, when its queue empties; `—` when it does not (empty queue, or nothing
+  schedulable).
+
+Times are in the local zone, with a `Z` suffix when `TZ` is unset and a weekday prefix when the day
+is not today. Durations are rounded to 5 minutes. A `~` anywhere means the number rests on an
+estimated duration.
+
+**Ten by default.** `next` lists every in-flight issue and then the next 10 queued; `--limit N`
+changes that (`--limit 50` for the whole queue, which is what the manager runs when the operator
+asks to see all of it). The simulation itself always covers every queued issue of every manager —
+only the display is capped, and `beyond` carries the size and shape of what it left out.
+
+**Where the ETAs come from.** Each repo's task duration is the median of its own history:
+`mgr launch`, `mgr adopt <pane> N` and `mgr bind N` record `launched_at` in
+`MGR_STATE_DIR/launches/<owner>__<repo>.json`, and `mgr retire N` on a *merged* report appends
+`{repo, number, launched_at, merged_at, duration_s}` to
+`MGR_STATE_DIR/throughput/<owner>__<repo>.jsonl`. Under 3 rows for a repo it falls back to the
+machine-wide median over every repo, and with no history anywhere to `MGR_DEFAULT_TASK_S` (2700 s,
+45 min). Both fallbacks are flagged `estimated` and render as `~` — durations are a heuristic, and
+the block says so instead of hiding it.
+
+From there, per manager: an in-flight issue is due at
+`launched_at + max(median, elapsed + ¼ median)`, so a builder that has already outrun the median is
+not predicted to land this second. The queue is FIFO by issue number over `cap` parallel slots; a
+queued issue starts when a slot frees and every open blocker of its own has an ETA in the past, and
+an issue nothing can schedule (a dependency cycle) gets no ETA. Projected work skips the **stall
+window** — the `[exhaust_at, resets_at]` of the earliest-exhausting limit in the burn projection —
+so a task that would straddle a dead quota resumes at the reset instead of finishing through it.
+`idle_slots` are free slots with nothing ready to fill them, and `starves_at` is when a manager's
+queue empties while it still has slots: that is the "work for the next ~3h, then it idles" reading.
+
+The data is the guard's: it refreshes every live manager's repo on its own tick (see **Quota
+guard**), so the block is machine-wide and fresh even for a manager that has been quiet, and it
+works whenever `state.json` exists — `mgr overview` reads it with `mgr-guard overview`, no daemon
+required. Nothing in the harness acts on any of it: the cap is still the operator's only pace dial.
 
 ## Status line
 
@@ -256,6 +331,8 @@ error (exit `2`).
 | `MGR_GUARD_SLOPE_WINDOW_S` | `1800` | window of usage samples the burn rate is fitted over |
 | `MGR_GUARD_MIN_SLOPE_SPAN_S` | `300` | minimum sample span before a slope is trusted; below it, burn is 0 |
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager pane and no stalled pane |
+| `MGR_GUARD_BACKLOG_INTERVAL_S` | `120` | seconds between the guard's per-repo `gh issue list` refreshes for the overview |
+| `MGR_DEFAULT_TASK_S` | `2700` | task duration assumed for the overview when there is no throughput history at all |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's herdr toasts (a reignite is the only one) |
 | `MGR_GUARD_NOW_MS` | unset | pins the guard's clock in ms since the epoch; for tests |
 | `MGR_STATUS_INTERVAL_S` | `5` | seconds between status-line polls of the guard's ledger |
@@ -278,6 +355,11 @@ needs. Each script also runs standalone (`test/guard-smoke.sh`, `test/mgr-quota-
 `test/mgr-config-smoke.sh`, `test/e2e-quota.sh`, `test/mgr-status-unit.sh`) and exits non-zero on
 failure. `test/mgr-status-unit.sh` is the one exception to the `bash`+`jq` rule: it is a `bun` unit
 test of the status-text mapping (`bun` is what omp itself runs on).
+
+The overview is covered across two of them: the projection fixtures — stall window from the burn,
+FIFO with a cap and a blocker, ETAs skipping a stall window, starvation, the throughput fallback
+chain, a 40-issue queue — in `test/guard-smoke.sh`, and `mgr overview --json`, the rendered block,
+`--limit`, `mgr retire`'s throughput row and `board.overview` in `test/mgr-quota-smoke.sh`.
 
 ## Platform
 

@@ -1,6 +1,6 @@
 ---
 name: manager
-description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs', 'quota status'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows the builder.md shipped with this skill instead, at the path given in its brief."
+description: "Act as the manager of a project — turn the operator's requests into GitHub issues and run each one as a separate builder session in its own herdr tab and git worktree. Use when the operator says 'act as the manager', 'be the manager', 'manager mode', 'you're the manager for this project', or otherwise puts you in charge of dispatching work instead of writing it. Once acting as manager it also covers everything the operator then says — any new task, feature or bug request ('add X', 'fix Y'), 'what's on the board', 'status', 'launch the next one', 'approve #N', 'request changes on #N', 'cancel #N', 'set the cap to N', 'dedupe the issues', 'adopt the other tabs', 'quota status', 'overview', 'what's coming', 'show the whole queue'. Machine-wide and project-agnostic — it works in any git repo with a GitHub remote, inside herdr. Not for builder sessions — a session the manager launched or adopted follows the builder.md shipped with this skill instead, at the path given in its brief."
 ---
 
 # Manager
@@ -54,12 +54,12 @@ you are the one being found.
 
 Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `blocked`,
 `orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, and `quota` — `guard`, `limits`,
-`reason`, `stalled`. When `quota.changed` is true, close the turn with the burn line (§7).
+`reason`, `stalled`. Then close the turn with the `$MGR overview` block, as every turn ends (§7).
 
 `guard start` is idempotent: one quota-guard daemon serves every manager on the machine, so you
 either start it or attach to the one another manager already started. It does two things and only
 two: it re-prompts sessions whose turn died on a rate limit once the quota renews, and it keeps the
-burn projection you report. It never slows anything down.
+burn projection and the per-repo backlog the overview reports. It never slows anything down.
 
 Orphans need a decision, so raise them rather than fixing them silently:
 
@@ -224,8 +224,9 @@ Trust the report, not the idle state.
 | show the harness config | `$MGR config list` |
 | pause this project | `$MGR pause` — a launch gate: a persisted cap 0 for this repo, machine-wide, so it survives the session. `$MGR board` then reports `paused_by_operator: true` with `cap` and `slots_free` `0`, and `$MGR launch` refuses (exit `3`) even when `--cap N` is passed — the pause wins. Builders already running are **not** touched: they keep working to their report. Tabs, worktrees, issues and labels are untouched; this is not `cancel` |
 | unpause / resume this project | `$MGR unpause` (alias `$MGR resume`) — lifts the gate: the cap goes back to `--cap` / `MGR_CAP` / `$MGR config get cap` / `3`. Then `$MGR board` and report the restored `cap` / `slots_free`, and launch what is `ready`. Idempotent — running it on a project that is not paused is fine |
-| status / what's on the board | `$MGR board`, reported as a short table |
-| quota status | `$MGR board`, then report the burn line (§7) from `quota.limits` / `quota.delta` and which builders are in `quota.stalled` — the guard is reigniting those, there is nothing to do about them |
+| status / what's on the board | `$MGR board`, reported as a short table — then the overview block, as always |
+| quota status | `$MGR overview` — the block *is* the answer, nothing of your own on top of it. Name the builders in `quota.stalled` if there are any: the guard is reigniting those, there is nothing to do about them |
+| show the whole queue / what's coming | `$MGR overview --limit 50` |
 | dedupe the issues | Intake (a) over the whole open list |
 | adopt the other tabs | **Adoption** |
 | launch the next one | `$MGR board`, then `$MGR launch` the lowest `ready` number |
@@ -254,12 +255,15 @@ Trust the report, not the idle state.
 - Never re-prompt a quota-stalled builder yourself. The guard reignites it, with backoff. Your own
   session runs on the same quota and can stall too; the guard reignites you as well, so a
   `mgr-guard:` prompt in your pane means resume where you stopped.
-- **Every turn ends with one burn line** — the last thing you say, from the `$MGR board` of this
-  turn, when `quota.changed` is true or the operator asked (`quota status`):
-  `burn: anthropic:5h 20% → 2.56× by 17:00Z (was 1.04×)`, built from `quota.limits[]` (`id`, `used`,
-  `projected_at_reset`, `resets_at`) and `quota.delta`. Otherwise say nothing about quota. It is
-  visibility, not an instruction: nothing acts on the projection, you least of all.
-- When you have nothing to launch and nothing to answer, say so and stop. Do not invent work.
+- **Every manager turn ends with the `$MGR overview` text block, verbatim, after everything else** —
+  unconditional: every turn, including the ones that only answered a question and the ones where
+  there was nothing to do. Run it last, after the launches and retires of this turn, so the block
+  you print is the state you are leaving the operator in. Never paraphrase it, never trim it to the
+  lines you find interesting, never fold it into a table. It is visibility, not an instruction:
+  nothing acts on it — not the burn projection, not the ETAs, not the starvation warnings, and you
+  least of all.
+- When you have nothing to launch and nothing to answer, say so, print the overview, and stop. Do
+  not invent work.
 
 ## 8. Reference
 
@@ -268,16 +272,17 @@ Trust the report, not the idle state.
 | Command | Does |
 |---|---|
 | `$MGR labels` | create/update the three `mgr:` labels; idempotent |
-| `$MGR board [--cap N]` | the whole board: issues joined to live agents |
+| `$MGR board [--cap N]` | the whole board: issues joined to live agents, with `overview` embedded at the default limit |
+| `$MGR overview [--json] [--limit N]` | machine-wide — every manager on this machine, which is the subscription's burn: the rendered text block by default, `--json` for the object. `--limit` is how many queued issues are listed after the in-flight ones (default `10`); the simulation always covers the whole queue, only the display is capped |
 | `$MGR launch <N> [--cap N]` | worktree + tab + omp builder + brief + label + comment |
 | `$MGR adopt <pane_id\|tab_id> [N]` | make a live session a builder; without N it self-registers |
 | `$MGR bind <N>` | builder-side only; you never run this |
 | `$MGR wait <N\|pane_id> [--no-quota-block]` | block until idle, return the parsed `manager-report`; a rate-limit stall is waited through — the guard reignites the pane — unless `--no-quota-block`, which returns `agent_status: quota-stalled` instead |
 | `$MGR prompt <N> <text…>` | send text to builder `issue-N` |
-| `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue |
+| `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue; on a merged report it also records the issue's duration for the overview timeline |
 | `$MGR guard start [--interval S]` | start the quota-guard daemon; idempotent, shared by all managers |
 | `$MGR guard stop` | stop it — read the Rules before you ever do |
-| `$MGR guard status` | the guard's whole state: the provider with its limits and burn projection, the registered managers, the stalled panes with their reignite attempts, and `last_exit_at`/`last_exit_reason` when the daemon is not running. A manager is live while its herdr pane exists — `managers[].pane_alive` is that pane check and is what `live` means; `managers[].seen_at` is only the last time it ran an `mgr` command |
+| `$MGR guard status` | the guard's whole state: the provider with its limits and burn projection, the registered managers with the board data the guard collects for them (`managers[].backlog`, `backlog_at`, `backlog_error`, `throughput`), the stalled panes with their reignite attempts, and `last_exit_at`/`last_exit_reason` when the daemon is not running. A manager is live while its herdr pane exists — `managers[].pane_alive` is that pane check and is what `live` means; `managers[].seen_at` is only the last time it ran an `mgr` command |
 | `$MGR pause` | this project's launch gate: a persisted cap 0, machine-wide for this repo (`mgr.paused` in the primary checkout's `.git/config`). `board` reports `paused_by_operator`, `launch` refuses; running builders are untouched. Idempotent |
 | `$MGR unpause` (alias `$MGR resume`) | lift the gate: the cap goes back to `--cap`/`MGR_CAP`/config/`3`. Idempotent, exit `0` when the project is not paused |
 | `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`. Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
@@ -302,7 +307,14 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `quota.reason` | one sentence about the worst limit — `anthropic:5h at 20% burning 0.2/h → 2.56× the window by 17:00Z`, `anthropic:5h exhausted, resets at 17:00Z`, or `fits`, or `unknown: no reading`; `null` with no guard state |
 | `quota.stalled` | issue numbers of this workspace's builders stalled on a rate limit; the guard is reigniting them |
 | `quota.managers` | every registered manager: `manager_id`, `repo`, `cap`, `in_flight`, `live`, `pane_alive`, `seen_at` — attribution only, nothing is computed from it |
-| `quota.changed` `quota.delta` | `changed: true` when some limit's `fits` flipped, its `projected_at_reset` moved by ≥ `0.1`, or it is new since your last `$MGR board`; `delta` says how (`anthropic:5h 1.04× → 2.56×`, `… (now over)`, `first projection`), `null` when nothing changed. This is what triggers the burn line (§7) |
+| `quota.changed` `quota.delta` | `changed: true` when some limit's `fits` flipped, its `projected_at_reset` moved by ≥ `0.1`, or it is new since your last `$MGR board`; `delta` says how (`anthropic:5h 1.04× → 2.56×`, `… (now over)`, `first projection`), `null` when nothing changed. Data only |
+| `overview` | the same object `$MGR overview --json` returns, at the default limit (`10`); `null` when the guard cannot answer — the board never fails on it |
+| `overview.burn.limits[]` | `quota.limits[]` plus `exhaust_at`: when this limit runs out at the current burn (`null` when it fits), bounded by `resets_at` |
+| `overview.burn.stall_window` | `{from,to,limit}` of the earliest-exhausting limit — the wall time the ETAs project through as dead time; `null` when everything fits |
+| `overview.backlog.totals` `overview.backlog.managers[]` | machine-wide sums and the per-manager rows: `ready`, `blocked`, `in_flight`, `awaiting_approval`, `cap`, `open`, `idle_slots` (free slots with nothing ready to fill them), `starving`, `starves_at` (when this manager runs out of queue and idles), `backlog_drains_at`, and `throughput` (`n`, `median_s`, `p80_s`, `last_10_mean_s`, `estimated`, `source`) |
+| `overview.timeline.shown[]` | every in-flight issue, then the next `--limit` queued ones across every repo by ETA: `repo`, `number`, `title`, `state` (`in_flight`/`ready`/`blocked`), `eta`, `estimated`, `blocked_by`, `manager_id` |
+| `overview.timeline.beyond` | the queued issues not shown: `count`, how many of those are `blocked`, `last_eta`, `drains_at`; `null` when nothing is hidden |
+| `overview.timeline.drains_at` | machine-wide: the ETA of the last queued issue of any manager (`last_eta` is the same number) |
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
 
 ### Labels
@@ -340,6 +352,8 @@ by `-`, e.g. `adopt-w26-p3`.
 | `MGR_GUARD_MIN_SLOPE_SPAN_S` | `300` | minimum sample span before a slope is trusted; below it, burn is `0` |
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager pane and no stalled builder |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's toasts (reignites only) |
+| `MGR_GUARD_BACKLOG_INTERVAL_S` | `120` | seconds between the guard's per-repo `gh issue list` refreshes for the overview |
+| `MGR_DEFAULT_TASK_S` | `2700` | task duration assumed when a repo has no throughput history and neither does the machine |
 
 Precedence for `cap`, `omp-arg`, `env` and `brief-extra`: CLI flag > `MGR_*` env > git config
 (`$MGR config`) > built-in default.
