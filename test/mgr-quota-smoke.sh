@@ -57,10 +57,11 @@ jq -n --arg cwd "$repo" --arg sess "$sess" --arg msess "$msess" '
   ]}}' >"$fix/agents.json"
 jq '{result:{agent:(.result.agents[0])}}' "$fix/agents.json" >"$fix/agent-issue-49.json"
 
-# guard running: two provider limits with a live burn projection (the 5h one
-# does not fit), one registered manager, issue-49 stalled on a 429 waiting for
-# the guard to reignite it. This is state.json v2 plus the {guard,pid} wrapper
-# `mgr-guard status` adds.
+# guard running: two subscriptions sampled in the same tick — anthropic (the
+# 5h one does not fit) and openai-codex — and two registered managers, one on
+# each, so every quota reading has a wrong provider to be confused with. Plus
+# issue-49 stalled on a 429 waiting for the guard to reignite it. This is
+# state.json v2 plus the {guard,pid} wrapper `mgr-guard status` adds.
 cat >"$fix/guard-running.json" <<'EOF'
 {"version":2,"guard":"running","pid":4242,"tick_at":1788523750609,"interval_s":60,
  "builder_provider":"anthropic",
@@ -74,9 +75,20 @@ cat >"$fix/guard-running.json" <<'EOF'
                          {"t":1788523750000,"used":0.62}]},
              {"id":"anthropic:week","label":"Claude Week","status":"ok","used":0.31,
               "resets_at":1788900000000,"burn_per_hour":0.02,"projected_at_reset":0.52,
-              "fits":true,"hours_to_reset":10.5,"sample_count":3,"samples":[]}]}},
+              "fits":true,"hours_to_reset":10.5,"sample_count":3,"samples":[]}]},
+  "openai-codex":{"status":"warning","ok":true,"fetched_at":1788523750000,
+   "usage_fetch_failures":0,"recovers_at":null,
+   "reason":"openai-codex:5h at 71% burning 0.2/h → 1.13× the window by 17:13Z",
+   "limits":[{"id":"openai-codex:5h","label":"Codex 5 Hour","status":"warning","used":0.71,
+              "resets_at":1788530000000,"burn_per_hour":0.2,"projected_at_reset":1.13,
+              "fits":false,"hours_to_reset":2.1,"sample_count":2,"samples":[]}]}},
  "managers":{"ws-w9":{"manager_id":"ws-w9","workspace_id":"w9","pane_id":"w9:p1",
-   "repo":"owner/name","primary":"/tmp/repo","cap":3,"in_flight":1,"adopting":0,"ready":1,
+   "repo":"owner/name","primary":"/tmp/repo","house":"anthropic","provider":"anthropic",
+   "cap":3,"in_flight":1,"adopting":0,"ready":1,
+   "seen_at":1788523750609,"pane_alive":true,"live":true},
+  "ws-w8":{"manager_id":"ws-w8","workspace_id":"w8","pane_id":"w8:p1",
+   "repo":"other/shape","primary":"/tmp/shape","house":"openai","provider":"openai-codex",
+   "cap":1,"in_flight":0,"adopting":0,"ready":0,
    "seen_at":1788523750609,"pane_alive":true,"live":true}},
  "stalled":[{"pane_id":"w9:p2","name":"issue-49","workspace_id":"w9","session":"/x.jsonl",
    "provider":"anthropic","model":"claude-fable-5-1","error":"429 rate_limit_error",
@@ -88,12 +100,15 @@ EOF
 # ------------------------------------------------- overview fixtures (real guard)
 #
 # A hand-written ledger for `mgr-guard overview`: the clock is pinned at
-# 2026-09-04 12:00:00Z, the 5h limit exhausts 30 min later and resets at 14:00Z
-# (a 1h30 stall window every projection has to step over), and two live
-# managers share the machine — `owner/name` (this board's own repo) with a
-# measured 1h median, two slots and eleven queued issues, and `other/shape`
-# with a machine-median guess, one free slot and nothing ready, so it starves
-# now while its single blocked issue still projects.
+# 2026-09-04 12:00:00Z, the anthropic 5h limit exhausts 30 min later and resets
+# at 14:00Z (a 1h30 stall window every projection has to step over), and three
+# live managers share the machine — `owner/name` (this board's own repo, on
+# anthropic) with a measured 1h median, two slots and eleven queued issues,
+# `other/shape` (also anthropic) with a machine-median guess, one free slot and
+# nothing ready, so it starves now while its single blocked issue still
+# projects, and `zed/paused` on openai-codex with no cap and nothing queued —
+# it is here to be *excluded* from the anthropic managers' quota line. The
+# openai-codex 5h limit fits, so it adds no stall window and no ETA of its own.
 ovstate="$tmp/ovstate"
 mkdir -p "$ovstate"
 pin=1788523200000        # 2026-09-04T12:00:00Z
@@ -110,10 +125,17 @@ jq -n --argjson N "$pin" '
               fits:false, hours_to_reset:2, sample_count:3, samples:[]},
              {id:"anthropic:week", label:"Claude Week", status:"ok", used:0.2,
               resets_at:1788771600000, burn_per_hour:0.02, projected_at_reset:12.6,
-              fits:true, hours_to_reset:93, sample_count:3, samples:[]}]}},
+              fits:true, hours_to_reset:93, sample_count:3, samples:[]}]},
+     "openai-codex":{status:"ok", ok:true, fetched_at:$N,
+       usage_fetch_failures:0, recovers_at:null,
+       reason:"openai-codex:5h at 30% burning 0.1/h → 0.5× the window by 14:00Z",
+       limits:[{id:"openai-codex:5h", label:"Codex 5 Hour", status:"ok", used:0.3,
+                resets_at:($N + 7200000), burn_per_hour:0.1, projected_at_reset:0.5,
+                fits:true, hours_to_reset:2, sample_count:3, samples:[]}]}},
    managers:{
      "ws-w9":{manager_id:"ws-w9", workspace_id:"w9", pane_id:"w9:p1", repo:"owner/name",
-       primary:"/tmp/repo", cap:2, in_flight:1, adopting:0, ready:10,
+       primary:"/tmp/repo", house:"anthropic", provider:"anthropic",
+       cap:2, in_flight:1, adopting:0, ready:10,
        seen_at:$N, pane_alive:true, live:true,
        backlog:{ready:issues(7; 16),
                 blocked:[{number:17, title:"needs 7", blocked_by:[7]}],
@@ -124,7 +146,8 @@ jq -n --argjson N "$pin" '
        throughput:{n:5, median_s:3600, p80_s:4200, last_10_mean_s:3700,
                    estimated:false, source:"repo"}},
      "ws-w8":{manager_id:"ws-w8", workspace_id:"w8", pane_id:"w8:p1", repo:"other/shape",
-       primary:"/tmp/shape", cap:1, in_flight:0, adopting:0, ready:0,
+       primary:"/tmp/shape", house:"anthropic", provider:"anthropic",
+       cap:1, in_flight:0, adopting:0, ready:0,
        seen_at:$N, pane_alive:true, live:true,
        backlog:{ready:[],
                 blocked:[{number:101, title:"waits on a foreign issue", blocked_by:[999]}],
@@ -132,6 +155,16 @@ jq -n --argjson N "$pin" '
                 counts:{ready:0, blocked:1, in_flight:0, awaiting_approval:0, open:1}},
        backlog_at:$N, backlog_error:null,
        throughput:{n:1, median_s:1500, p80_s:1500, last_10_mean_s:1500,
+                   estimated:true, source:"machine"}},
+     "ws-w6":{manager_id:"ws-w6", workspace_id:"w6", pane_id:"w6:p1", repo:"zed/paused",
+       primary:"/tmp/zed", house:"openai", provider:"openai-codex",
+       cap:0, in_flight:0, adopting:0, ready:0,
+       seen_at:$N, pane_alive:true, live:true,
+       backlog:{ready:[], blocked:[], in_flight:[], awaiting_approval:[],
+                cap:0, slots_free:0,
+                counts:{ready:0, blocked:0, in_flight:0, awaiting_approval:0, open:0}},
+       backlog_at:$N, backlog_error:null,
+       throughput:{n:0, median_s:1500, p80_s:1500, last_10_mean_s:1500,
                    estimated:true, source:"machine"}},
      "ws-dead":{manager_id:"ws-dead", workspace_id:"w7", pane_id:"w7:p1",
        repo:"gone/repo", primary:"/tmp/gone", cap:4, in_flight:0, adopting:0, ready:0,
@@ -405,8 +438,10 @@ check 'in_flight numbers'     '[49]' "$(jq -c '[.in_flight[].number]' <<<"$out")
 check 'in_flight row size'  medium "$(jq -r '.in_flight[0].size' <<<"$out")"
 check 'ready row size'       small "$(jq -r '.ready[0].size' <<<"$out")"
 check 'in_flight quota_stalled' true "$(jq -r '.in_flight[0].quota_stalled' <<<"$out")"
+# every registered manager, with the provider it burns: attribution across
+# subscriptions is what makes a mixed fleet readable
 check 'quota.managers' \
-  '[{"manager_id":"ws-w9","repo":"owner/name","cap":3,"in_flight":1,"live":true,"pane_alive":true,"seen_at":1788523750609}]' \
+  '[{"manager_id":"ws-w8","repo":"other/shape","provider":"openai-codex","cap":1,"in_flight":0,"live":true,"pane_alive":true,"seen_at":1788523750609},{"manager_id":"ws-w9","repo":"owner/name","provider":"anthropic","cap":3,"in_flight":1,"live":true,"pane_alive":true,"seen_at":1788523750609}]' \
   "$(jq -c '.quota.managers' <<<"$out")"
 # nothing exited yet: a running guard has no exit record to report
 check 'quota.last_exit_at while running' null \
@@ -433,7 +468,7 @@ check 'no priority/allotment per manager' '[]' \
 
 printf '\n# 1c. the registration heartbeat: attribution only, no demand\n'
 check 'heartbeat keys' \
-  '["manager_id","workspace_id","pane_id","repo","primary","cap","paused_by_operator","in_flight","adopting","ready"]' \
+  '["manager_id","workspace_id","pane_id","repo","primary","house","provider","cap","paused_by_operator","in_flight","adopting","ready"]' \
   "$(jq -sc 'last|keys_unsorted' "$MGR_TEST_REGISTER")"
 check 'heartbeat has no demand' false \
   "$(jq -rs 'last|has("demand")' "$MGR_TEST_REGISTER")"
@@ -444,6 +479,61 @@ check 'heartbeat paused_by_operator' false \
   "$(jq -rs 'last|.paused_by_operator' "$MGR_TEST_REGISTER")"
 check 'heartbeat pane_id'   w9:p1 "$(jq -rs 'last|.pane_id' "$MGR_TEST_REGISTER")"
 check 'heartbeat repo' owner/name "$(jq -rs 'last|.repo' "$MGR_TEST_REGISTER")"
+# the guard's poll set is built from these two: a registration that names no
+# provider is a manager the guard cannot sample for
+check 'heartbeat house and provider' 'anthropic/anthropic' \
+  "$(jq -rs 'last|"\(.house)/\(.provider)"' "$MGR_TEST_REGISTER")"
+
+printf '\n# 1d. quota.* is the caller-provider view, never the machine default\n'
+# the fixture guard sampled both subscriptions this tick, and the machine
+# default is anthropic — so an openai-codex reading reaching an anthropic
+# manager's board (or the reverse) is a scoping bug, not a fixture accident
+check 'the fixture guard holds two providers' '["anthropic","openai-codex"]' \
+  "$(jq -c '.providers|keys' "$fix/guard-running.json")"
+check "this manager's board names no other provider's limit" '[]' \
+  "$(jq -c '[.quota.limits[].id | select(startswith("anthropic:") | not)]' <<<"$out")"
+check 'quota.managers attributes each manager to its own provider' \
+  'ws-w8=openai-codex ws-w9=anthropic' \
+  "$(jq -r '[.quota.managers[] | "\(.manager_id)=\(.provider)"] | join(" ")' <<<"$out")"
+
+# MGR_HOUSE drives the real provider_of_house: the house's package file names
+# the provider a launch under it burns, and that is the subscription reported
+: >"$MGR_TEST_REGISTER"
+ob=$(MGR_HOUSE=openai "$MGR" board --cap 3)
+check 'an openai manager resolves its package provider' openai-codex \
+  "$(jq -r '.quota.provider' <<<"$ob")"
+check 'and reads that provider status' warning "$(jq -r '.quota.status' <<<"$ob")"
+check 'and only its own limits' '["openai-codex:5h"]' \
+  "$(jq -c '[.quota.limits[].id]' <<<"$ob")"
+check 'and that provider reason, verbatim' \
+  'openai-codex:5h at 71% burning 0.2/h → 1.13× the window by 17:13Z' \
+  "$(jq -r '.quota.reason' <<<"$ob")"
+check 'its heartbeat carries the same pair' 'openai/openai-codex' \
+  "$(jq -rs 'last|"\(.house)/\(.provider)"' "$MGR_TEST_REGISTER")"
+
+gb=$(MGR_HOUSE=gemini "$MGR" board --cap 3)
+check 'a gemini manager resolves its package provider' google-antigravity \
+  "$(jq -r '.quota.provider' <<<"$gb")"
+# the guard never polled it: no reading is the honest answer, not another
+# subscription's numbers
+check 'a provider the guard never sampled reads empty' 'null/[]/null' \
+  "$(jq -r '"\(.quota.status)/\(.quota.limits|tojson)/\(.quota.reason)"' <<<"$gb")"
+
+# a pane whose session has no assistant message, with nothing configured and
+# no MGR_HOUSE: nothing can name this caller's house, so it claims no
+# subscription at all rather than the machine's
+: >"$MGR_TEST_REGISTER"
+nb=$(HERDR_PANE_ID=w9:p2 "$MGR" board --cap 3)
+check 'an unresolvable caller has no house' null "$(jq -r '.house' <<<"$nb")"
+check 'and no provider' null "$(jq -r '.quota.provider' <<<"$nb")"
+check 'and no reading of anyone else' 'null/[]/null' \
+  "$(jq -r '"\(.quota.status)/\(.quota.limits|tojson)/\(.quota.reason)"' <<<"$nb")"
+check 'the guard still sees every manager' 2 \
+  "$(jq -r '.quota.managers|length' <<<"$nb")"
+check 'and the heartbeat still fires, with both fields null' 'null/null' \
+  "$(jq -rs 'last|"\(.house)/\(.provider)"' "$MGR_TEST_REGISTER")"
+check 'and it is still a registration' 1 \
+  "$(jq -s 'length' "$MGR_TEST_REGISTER")"
 
 # ------------------------------------------- 2. the cap is the only dial there is
 
@@ -463,7 +553,10 @@ check 'quota.last_exit_reason' \
 export MGR_TEST_GUARD="$fix/guard-blank.json"
 out=$("$MGR" board --cap 3)
 check 'slots_free with no reading at all' 2 "$(jq -r '.slots_free' <<<"$out")"
-check 'quota.provider'         null "$(jq -r '.quota.provider' <<<"$out")"
+# the caller's provider comes from its own house, not from the guard: a guard
+# with nothing sampled (and a null builder_provider) still gets named the
+# subscription this manager burns, with no reading attached to it
+check 'quota.provider'    anthropic "$(jq -r '.quota.provider' <<<"$out")"
 check 'quota.limits'             '[]' "$(jq -c '.quota.limits' <<<"$out")"
 check 'quota.reason'           null "$(jq -r '.quota.reason' <<<"$out")"
 check 'quota.stalled'            '[]' "$(jq -c '.quota.stalled' <<<"$out")"
@@ -945,7 +1038,8 @@ env -u HERDR_WORKSPACE_ID "$MGR" board --cap 3 >/dev/null
 check 'no workspace, no touch' 0 \
   "$(grep -c 'mgr-guard touch' "$MGR_TEST_LOG" || true)"
 
-# --------------------------------------- 9. the machine-wide overview
+# --------------------------------------- 9. the overview: machine-wide record,
+#                                            caller-scoped block
 
 # These cases run against the REAL mgr-guard: the projection is the thing under
 # test, so a fake would prove nothing. The clock is pinned and the workspace and
@@ -953,12 +1047,15 @@ check 'no workspace, no touch' 0 \
 # hand-written ledger is read exactly as written. TZ unset is the deterministic
 # rendering (UTC with a Z suffix); the TZ case only proves the suffix rule,
 # since the local zone of the machine running the test is not ours to pick.
+# OV_HOUSE is which manager is asking — anthropic unless a case says otherwise,
+# and empty for a caller whose house nothing can name.
 [ -x "$real_guard" ] || { printf 'not executable: %s\n' "$real_guard" >&2; exit 1; }
 
 ov() { # ov <state-dir> [args...] — mgr overview on the real guard, pinned clock
   local dir="$1"; shift
   env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u TZ \
     MGR_GUARD_BIN="$real_guard" MGR_STATE_DIR="$dir" MGR_GUARD_NOW_MS="$pin" \
+    MGR_HOUSE="${OV_HOUSE-anthropic}" \
     "$MGR" overview "$@"
 }
 
@@ -986,8 +1083,26 @@ check 'backlog.totals' \
   '{"ready":10,"blocked":2,"in_flight":1,"awaiting_approval":0,"cap":3,"idle_slots":1,"open":13}' \
   "$(jq -c '.backlog.totals' <<<"$ovj")"
 # the dead manager is in the ledger and in nothing else
-check 'only live managers participate' '["other/shape","owner/name"]' \
+check 'only live managers participate' \
+  '["other/shape","owner/name","zed/paused"]' \
   "$(jq -c '[.backlog.managers[].repo]' <<<"$ovj")"
+# each row names the subscription that manager burns, so a mixed fleet can be
+# attributed without guessing from the repo
+check 'every manager row carries its own provider' \
+  'other/shape=anthropic owner/name=anthropic zed/paused=openai-codex' \
+  "$(jq -r '[.backlog.managers[] | "\(.repo)=\(.provider)"] | join(" ")' <<<"$ovj")"
+# --json is the machine-wide record: nothing here is scoped to the caller, so
+# every provider the guard sampled is still in it
+check 'the record carries every sampled provider' '["anthropic","openai-codex"]' \
+  "$(jq -c '[.burn.limits[].provider] | unique' <<<"$ovj")"
+check 'and every sampled limit' \
+  '["anthropic:5h","anthropic:week","openai-codex:5h"]' \
+  "$(jq -c '[.burn.limits[].id] | sort' <<<"$ovj")"
+# ... and it is the guard's own document, not a re-rendering of it
+check 'mgr overview --json is the guard overview verbatim' \
+  "$(env MGR_STATE_DIR="$ovstate" MGR_GUARD_NOW_MS="$pin" \
+     "$real_guard" overview --limit 10 | jq -c .)" \
+  "$ovj"
 check 'a manager with free slots and nothing ready starves now' \
   "true/$pin" \
   "$(jq -r '.backlog.managers[0] | "\(.starving)/\(.starves_at)"' <<<"$ovj")"
@@ -1017,10 +1132,12 @@ check 'beyond summarises the rest' \
   "$(jq -c '.timeline.beyond' <<<"$ovj")"
 
 printf '\n# 9b. the rendered block, byte for byte\n'
-# `quota` is machine-wide — one subscription — and says so only as a count of
-# the other projects sharing it. `work` and `next` are this repo's alone:
-# `other/shape` owns issue #101 and a drain time of its own, and neither may
-# appear anywhere in the text.
+# The anthropic manager's own view. `quota` is its subscription alone — the
+# openai-codex limit the guard also sampled has no business here — and the
+# `shared with` count is the other projects on *that* subscription, so
+# `other/shape` counts and `zed/paused` (openai-codex) does not. `work` and
+# `next` are this repo's alone: `other/shape` owns issue #101 and a drain time
+# of its own, and neither may appear anywhere in the text.
 cat >"$fix/expect-overview.txt" <<'EOF'
 quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · weekly 20% used · shared with 1 other project
 work     1 of 2 builders running, 10 ready, 1 blocked · out of work in 6h45 (18:45Z) · queue clear in 7h30 (19:30Z)
@@ -1042,11 +1159,57 @@ check 'no other repo, issue or drain time in the text' 0 \
   "$(printf '%s\n' "$blk" | grep -c -e shape -e '#101' -e '#999' -e '12:25' || true)"
 check 'none of the old notation either' 0 \
   "$(printf '%s\n' "$blk" | grep -c -e '×' -e '⊘' -e '/h' -e '—' || true)"
+check 'the caller sees no other subscription in its quota line' 0 \
+  "$(printf '%s\n' "$blk" | sed -n '/^quota/p' \
+     | grep -c -e '30% used' -e codex || true)"
+
+printf '\n# 9b2. the same ledger, read by a manager on the other subscription\n'
+# same machine, same repo, different house: only the limit its own package
+# burns, and only the projects sharing that one
+blko=$(OV_HOUSE=openai ov "$ovstate")
+check 'the openai quota line is its own limit alone' \
+  'quota    5-hour 30% used, on pace until reset in 2h00 (14:00Z) · shared with 1 other project' \
+  "$(printf '%s\n' "$blko" | sed -n '/^quota/p')"
+check "and none of anthropic's numbers" 0 \
+  "$(printf '%s\n' "$blko" | sed -n '/^quota/p' \
+     | grep -c -e '80% used' -e '20% used' -e 'runs out' || true)"
+# work/next are repo-scoped, not provider-scoped: the same repo, so unchanged
+check 'work and next are untouched by the house' \
+  "$(printf '%s\n' "$blk" | sed -n '/^quota/!p')" \
+  "$(printf '%s\n' "$blko" | sed -n '/^quota/!p')"
+
+# a house the guard has not sampled: the honest answer is that there is no
+# reading for this manager, never the numbers of a subscription it cannot spend
+blkg=$(OV_HOUSE=gemini ov "$ovstate")
+check 'an unsampled provider gets the no-reading line, verbatim' \
+  'quota    no quota reading yet' \
+  "$(printf '%s\n' "$blkg" | sed -n '/^quota/p')"
+check 'and no percentage from anyone else' 0 \
+  "$(printf '%s\n' "$blkg" | sed -n '/^quota/p' | grep -c '% used' || true)"
+check 'the rest of the block still renders' \
+  "$(printf '%s\n' "$blk" | sed -n '/^quota/!p')" \
+  "$(printf '%s\n' "$blkg" | sed -n '/^quota/!p')"
+
+# and a caller whose house nothing can name — no pane, nothing configured. It
+# is not a manager on any subscription, and the readings do exist, so it keeps
+# the machine-wide line (documented fallback) rather than being told there is
+# nothing to see. Every sampled limit is on it, worst first, and at this width
+# the `shared with` tail no longer fits — the pre-existing wrapping rule, and
+# the reason two indistinguishable `5-hour` entries are a fallback and not the
+# manager's view.
+blkn=$(OV_HOUSE='' ov "$ovstate")
+check 'an unresolvable caller keeps the unfiltered line' \
+  'quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · 5-hour 30% used · weekly 20% used' \
+  "$(printf '%s\n' "$blkn" | sed -n '/^quota/p')"
+check 'which is every provider the guard sampled' 2 \
+  "$(printf '%s\n' "$blkn" | sed -n '/^quota/p' | grep -o '5-hour' | wc -l | tr -d ' ')"
+check 'and still inside 120 columns' 0 \
+  "$(printf '%s\n' "$blkn" | jq -R 'select(length > 120)' | wc -l | tr -d ' ')"
 
 printf '\n# 9c. Z only when TZ is unset\n'
 blktz=$(env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID TZ=UTC \
   MGR_GUARD_BIN="$real_guard" MGR_STATE_DIR="$ovstate" MGR_GUARD_NOW_MS="$pin" \
-  "$MGR" overview)
+  MGR_HOUSE=anthropic "$MGR" overview)
 check 'a set TZ drops the Z suffix' 0 \
   "$(printf '%s\n' "$blktz" | grep -c '[0-9][0-9]:[0-9][0-9]Z' || true)"
 check 'an unset TZ keeps it' 1 \

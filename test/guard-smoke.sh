@@ -164,6 +164,32 @@ mk_usage() { # mk_usage <file> <status> <used-fraction> <resets-at-ms>
        metadata: {}}]}' >"$1.tmp" && mv -f "$1.tmp" "$1"
 }
 
+mk_usage2() { # mk_usage2 <file> <a-status> <a-used> <a-reset> <o-status> <o-used> <o-reset>
+  # a two-subscription fixture: anthropic:5h and openai-codex:5h, individually fetchable
+  # exactly like mk_usage's single report -- the fake omp usage filters .reports by --provider
+  jq -n --arg ast "$2" --argjson auf "$3" --argjson ar "$4" \
+        --arg ost "$5" --argjson ouf "$6" --argjson or "$7" '
+    {generatedAt: 0,
+     reports: [
+       {provider: "anthropic", fetchedAt: 0,
+        limits: [{id: "anthropic:5h", label: "Claude 5 Hour",
+                  scope: {provider: "anthropic", windowId: "5h", shared: true},
+                  window: {id: "5h", label: "5 hours", durationMs: 18000000, resetsAt: $ar},
+                  amount: {used: ($auf * 100), limit: 100, remaining: ((1 - $auf) * 100),
+                           usedFraction: $auf, remainingFraction: (1 - $auf), unit: "percent"},
+                  status: $ast}],
+        metadata: {}},
+       {provider: "openai-codex", fetchedAt: 0,
+        limits: [{id: "openai-codex:5h", label: "Codex 5 Hour",
+                  scope: {provider: "openai-codex", windowId: "5h", shared: true},
+                  window: {id: "5h", label: "5 hours", durationMs: 18000000, resetsAt: $or},
+                  amount: {used: ($ouf * 100), limit: 100, remaining: ((1 - $ouf) * 100),
+                           usedFraction: $ouf, remainingFraction: (1 - $ouf), unit: "percent"},
+                  status: $ost}],
+        metadata: {}}
+     ]}' >"$1.tmp" && mv -f "$1.tmp" "$1"
+}
+
 mk_agent() { # mk_agent <name|null> <pane> <ws> <status> <session>
   jq -nc --arg n "$1" --arg p "$2" --arg w "$3" --arg s "$4" --arg f "$5" '
     {agent: "omp", name: (if $n == "null" then null else $n end),
@@ -210,14 +236,17 @@ SESS_CLEAN="$TMP/clean.jsonl"
               stopReason:"endTurn", content:"all done"}}'
 } >"$SESS_CLEAN"
 
-reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <adopting> <ready> [repo]
-  local sd="$1" now="$2" repo="${10:-acme/widgets}"
+reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <adopting> <ready> [repo] [provider] [house]
+  local sd="$1" now="$2" repo="${10:-acme/widgets}" prov="${11:-}" house="${12:-}"
   MGR_STATE_DIR="$sd" MGR_GUARD_NOW_MS="$now" "$GUARD" register "$(jq -nc \
     --arg id "$3" --arg ws "$4" --arg pane "$5" --arg repo "$repo" \
-    --argjson cap "$6" --argjson inf "$7" --argjson ad "$8" --argjson rd "$9" '
+    --argjson cap "$6" --argjson inf "$7" --argjson ad "$8" --argjson rd "$9" \
+    --arg prov "$prov" --arg house "$house" '
     {manager_id:$id, workspace_id:$ws, pane_id:$pane, repo:$repo,
      primary:"/Users/x/code/widgets", cap:$cap, paused_by_operator:false,
-     in_flight:$inf, adopting:$ad, ready:$rd}')"
+     in_flight:$inf, adopting:$ad, ready:$rd}
+    + (if $prov == "" then {} else {provider:$prov} end)
+    + (if $house == "" then {} else {house:$house} end)')"
 }
 
 mk_issue() { # mk_issue <number> <title> <labels-csv> <body>
@@ -795,8 +824,8 @@ if grep -q 'idle-exit after 2s with no live manager and no stalled builder' "$DA
 else
   fail "(k) idle-exit log line missing: $(tail -n 1 "$DAEMON_STATE/guard.log")"
 fi
-if grep -q 'tick provider=anthropic status=.* managers=.* stalled=.* reignited=.* reason=' "$DAEMON_STATE/guard.log"; then
-  pass "(k) the tick log line carries provider/status/managers/stalled/reignited/reason"
+if grep -q 'tick providers=anthropic status=anthropic:.* managers=.* stalled=.* reignited=.* reason=anthropic:' "$DAEMON_STATE/guard.log"; then
+  pass "(k) the tick log line carries providers/status/managers/stalled/reignited/reason"
 else
   fail "(k) tick log line: $(grep -m1 '^.* info tick ' "$DAEMON_STATE/guard.log")"
 fi
@@ -1020,7 +1049,8 @@ assert_jq "(p) the stall window is that limit to its reset" "$OV" \
 assert_jq "(p) manager row shape" "$OV" \
   '(.backlog.managers[0] | keys)
    == ["awaiting_approval","backlog_at","backlog_drains_at","backlog_error","blocked","cap",
-       "idle_slots","in_flight","manager_id","ready","repo","starves_at","starving","throughput"]'
+       "idle_slots","in_flight","manager_id","provider","ready","repo","starves_at","starving",
+       "throughput"]'
 assert_jq "(p) only live managers, sorted by repo" "$OV" \
   '[.backlog.managers[] | .manager_id] == ["ws-a","ws-b"]'
 assert_jq "(p) shown item shape" "$OV" \
@@ -1147,6 +1177,63 @@ assert_jq "(r) the blocker it does own is still waited on, and the queue drains"
   '.backlog.managers[0]
    | .backlog_drains_at == '"$(( T0 + 3000000 ))"' and .idle_slots == 1
      and .starving == true and .starves_at == '"$T0"
+
+printf '\n== (s) two providers ==\n'
+SD_S="$TMP/s-s"
+agents_file "$TMP/agents-s.json" \
+  "$(mk_agent manager wa:p1 wa idle '')" \
+  "$(mk_agent manager wo:p1 wo idle '')" \
+  "$(mk_agent manager wn:p1 wn idle '')"
+export FAKE_AGENTS="$TMP/agents-s.json"
+mk_usage2 "$TMP/usage-s.json" ok 0.10 $(( T0 + 3600000 )) ok 0.15 $(( T0 + 3600000 ))
+export FAKE_USAGE="$TMP/usage-s.json" FAKE_FETCHES="$TMP/fetches-s.log"; : >"$FAKE_FETCHES"
+reg "$SD_S" "$T0" ws-a wa wa:p1 3 1 0 0 acme/a anthropic anthropic >/dev/null
+reg "$SD_S" "$T0" ws-o wo wo:p1 3 1 0 0 acme/o openai-codex openai >/dev/null
+reg "$SD_S" "$T0" ws-n wn wn:p1 3 1 0 0 acme/n >/dev/null
+ST_S="$(MGR_STATE_DIR="$SD_S" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_json "(s) tick output" "$ST_S"
+assert_eq "(s) both subscriptions are sampled exactly once in one tick" 2 "$(lines_of "$FAKE_FETCHES")"
+assert_eq "(s) the sorted fetch log names both providers" "anthropic
+openai-codex" "$(sort "$FAKE_FETCHES")"
+assert_jq "(s) providers keys are both" "$ST_S" '(.providers | keys) == ["anthropic","openai-codex"]'
+assert_jq "(s) ws-a carries its own provider and house" "$ST_S" \
+  '.managers["ws-a"].provider == "anthropic" and .managers["ws-a"].house == "anthropic"'
+assert_jq "(s) ws-o carries its own provider and house" "$ST_S" \
+  '.managers["ws-o"].provider == "openai-codex" and .managers["ws-o"].house == "openai"'
+assert_jq "(s) the provider-less manager contributes no provider or house key" "$ST_S" \
+  '(.managers["ws-n"] | has("provider") | not) and (.managers["ws-n"] | has("house") | not)'
+assert_jq "(s) builder_provider is still stamped every tick" "$ST_S" '.builder_provider == "anthropic"'
+assert_jq "(s) the top-level state shape is unchanged" "$ST_S" \
+  '(keys) == ["builder_provider","events","interval_s","managers","pid","providers","stalled","tick_at","version"]'
+EXP_S_LOG="tick providers=anthropic,openai-codex status=anthropic:ok,openai-codex:ok managers=3 stalled=0 reignited=0 reason=anthropic:fits; openai-codex:fits"
+if grep -qF "$EXP_S_LOG" "$SD_S/guard.log"; then
+  pass "(s) the tick log line proves the two-provider form"
+else
+  fail "(s) tick log line: $(grep -m1 '^.* info tick ' "$SD_S/guard.log")"
+fi
+STATUS_S="$(MGR_STATE_DIR="$SD_S" "$GUARD" status)"
+assert_jq "(s) status passes both providers through unscoped" "$STATUS_S" \
+  '(.providers | keys) == ["anthropic","openai-codex"]'
+OV_S="$(MGR_STATE_DIR="$SD_S" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview)"
+assert_jq "(s) overview burn.limits carries both providers, unfiltered" "$OV_S" \
+  '([.burn.limits[].provider] | sort) == ["anthropic","openai-codex"]'
+assert_jq "(s) every backlog.managers row carries a provider key" "$OV_S" \
+  '[.backlog.managers[] | has("provider")] | all'
+assert_jq "(s) backlog.managers provider values are both providers plus the provider-less null" "$OV_S" \
+  '([.backlog.managers[].provider] | sort) == [null,"anthropic","openai-codex"]'
+# the fallback role: no live manager and no stalled pane names a provider at all ->
+# builder_provider() is the sole poll target, polled exactly once
+SD_SF="$TMP/s-s-fallback"; mkdir -p "$SD_SF"
+printf '[]\n' >"$TMP/agents-s-empty.json"
+mk_usage "$TMP/usage-s-fallback.json" ok 0.05 $(( T0 + 7200000 ))
+export FAKE_AGENTS="$TMP/agents-s-empty.json" FAKE_USAGE="$TMP/usage-s-fallback.json" \
+       FAKE_FETCHES="$TMP/fetches-s-fallback.log"
+: >"$FAKE_FETCHES"
+ST_SF="$(MGR_STATE_DIR="$SD_SF" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_eq "(s) no managers at all: exactly one fetch, the fallback target" 1 "$(lines_of "$FAKE_FETCHES")"
+assert_eq "(s) the fallback target is builder_provider()'s value" "anthropic" "$(cat "$FAKE_FETCHES")"
+assert_jq "(s) providers keys are just the fallback" "$ST_SF" '(.providers | keys) == ["anthropic"]'
+unset FAKE_FETCHES
 
 printf '\n== nothing in the guard ever interrupts a builder ==\n'
 assert_eq "no send-keys in the whole run" 0 "$(lines_of "$FAKE_KEYS")"
