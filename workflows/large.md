@@ -29,7 +29,8 @@ Any of these true → this is your file. Do not resize down: work already sized 
 3. **Execute** — independent slices in ONE parallel batch to the size-matched agent (`tiny`,
    `small`, `medium`); dependent waves in dependency order, one wave at a time. Subagents run no
    suites. You integrate after each wave and commit.
-4. **Integrate** — typecheck everything touched; run the covering tests for every slice.
+4. **Integrate** — typecheck everything touched; run the covering tests for every slice; your own
+   edits here stay within the ceiling (builder.md §7).
 5. **Review** — one `reviewer` pass over the whole diff against acceptance, design and risk.
    Summarise the findings where the work is tracked.
 6. **Fix round** — at least one, always. Every finding is fixed or explicitly declined with a
@@ -39,10 +40,10 @@ Any of these true → this is your file. Do not resize down: work already sized 
 8. **Fix failures.** Re-review only if the fixes touched logic outside the diff already reviewed.
 9. **Done** — review clean, suite green.
 
-**Escalation.** A check failing twice for a reason you cannot name, or a review finding you mean to
-decline: hand that step to a fresh `large` agent (`plan` for a plan revision), never retry it
-alone. A planning trigger mid-build (builder.md §7) sends the work back to `plan` for a revision;
-you stay under this file.
+**Escalation.** A fumble trigger (builder.md §7), or a review finding you intend to decline: hand
+that step to a fresh `crux` agent — the top rung — and never retry it at your own level. A planning
+trigger mid-build (builder.md §7) sends the work back to `plan` for a revision; you stay under this
+file.
 
 ## Verification
 

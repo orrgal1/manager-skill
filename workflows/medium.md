@@ -27,8 +27,8 @@ Any box fails → resize to `large`.
    the files, the approach, the checks you will run. Anything more goes to `sketch`.
 2. **Dispatch.** Two or more independent slices → fix the interfaces between them first, then
    dispatch them in ONE parallel batch, each to the agent matching that slice's size (tiny slice →
-   `tiny`, small slice → `small`). A single slice stays in-session. Tell every subagent to run no
-   suites and to leave validation to you.
+   `tiny`, small slice → `small`). A single slice stays in-session, within the ceiling
+   (builder.md §7). Tell every subagent to run no suites and to leave validation to you.
 3. **Integrate** the returned slices yourself, resolve the seams, and commit in scoped steps.
 4. **Self-review** the whole diff (`git diff main...HEAD`) against what was asked: dead code,
    leftover scaffolding, unhandled error paths, naming, secrets, and docs or changelog if the repo
@@ -37,9 +37,8 @@ Any box fails → resize to `large`.
    planning trigger mid-build (builder.md §7) is not a resize: stop, dispatch `sketch`, continue
    under this file.
 
-**Escalation.** The same check failing twice for a reason you cannot name, or a review finding you
-intend to decline: hand that step to a `large` agent — a `plan` agent for a plan revision — instead
-of retrying it at your own level.
+**Escalation.** A fumble trigger (builder.md §7), or a review finding you intend to decline: hand
+that step to a fresh `crux` agent — the top rung — and never retry it at your own level.
 
 ## Verification
 

@@ -17,7 +17,8 @@ Any box fails → resize to `medium`.
    and implement from it; skip it only when the issue Notes already name the exact files and
    lines. No planner by default at this size: a planning trigger (builder.md §7) is the only way
    you get one, and it is `sketch`.
-2. Implement in-session. No fan-out.
+2. Implement in-session, within the ceiling (builder.md §7) — crossing it fans the remainder out,
+   and nothing else does.
 3. Add or update the covering test only if an observable contract changed. No tests for plumbing.
 4. Self-review your own diff (`git diff main...HEAD`, or this repo's equivalent) as if someone else
    wrote it: dead code, leftover scaffolding, unhandled error paths, naming, and anything secret
@@ -25,6 +26,8 @@ Any box fails → resize to `medium`.
 5. Commit in scoped steps as you go.
 6. A fourth file, a schema, or a shared library — resize to `medium`. A planning trigger
    (builder.md §7) is not a resize: dispatch `sketch`, then continue under this file.
+   A fumble trigger (builder.md §7) is not a resize either: escalate that step to a fresh `crux`
+   agent, then continue under this file.
 
 ## Verification
 

@@ -15,12 +15,17 @@ This file is your complete contract. Follow it in order, top to bottom, until yo
 
 - **One issue.** You build issue #N and nothing else; anything outside its acceptance goes on the
   issue as a comment, not into your diff.
-- **Your context is for orchestration and integration.** Understanding the issue, reading the code
-  and deciding the approach are delegated — scouts map, your size's planner plans — and come back
-  compressed; you continue from what returns and read code when you integrate. `tiny` is the one
-  exemption from delegating at all — it reads its file and edits in-session, and stays that way. How
-  far the rest goes is your size file's call: `small` maps with a `scout` but plans in-session, and
-  reaches for a planner only on a §7 trigger; `medium` and `large` hand the plan out by default.
+- **Your context is for orchestration and integration.** What it is for: dispatching and
+  integrating, resolving conflicts, running the checks, committing, the PR, the report, and the
+  decisions this contract gives you — §5's calls and §7's three dials. Understanding the issue,
+  reading the code and deciding the approach are delegated — scouts map, your size's planner plans
+  — and come back compressed; you continue from what returns and read code when you integrate.
+  `tiny` is the one exemption from delegating at all — it reads its file and edits in-session, and
+  stays that way. How far the rest goes is your size file's call: `small` maps with a `scout` but
+  plans in-session, and reaches for a planner only on a §7 trigger; `medium` and `large` hand the
+  plan out by default. What must leave your window is countable, not a matter of taste: the map,
+  the plan, implementation past the in-session ceiling, and any step a fumble trigger has caught —
+  the numbers for all of them are in §7.
 - **Your cwd is your worktree.** Every path you read, edit or run is under it — confirm with
   `git worktree list` and `git rev-parse --show-toplevel`.
 - **The primary checkout is read-only and shared.** Prohibited there without exception: any edit or
@@ -136,9 +141,9 @@ the size file's, not this contract's.
 Build to acceptance and nothing beyond it. Follow the repo's existing conventions — read
 neighbouring code before inventing a pattern. Commit in scoped steps as you go.
 
-### Two escalations, not one
+### Three dials, not one
 
-Your size file has two dials. They are different moves; never read one as the other.
+Your size file has three dials. They are different moves; never read one as the other.
 
 **Delegate the planning** — cheap. Dispatch your size's planner — `sketch` at `small` and `medium`,
 `plan` at `large`, none at `tiny` — with the issue, its acceptance list and whatever maps you hold,
@@ -172,6 +177,47 @@ gh issue edit <N> --remove-label size:<from> --add-label size:<to>
 ```
 
 Then read `workflows/<to>.md` and continue under it. A size you have outgrown stays outgrown.
+
+**Escalate the work in hand** — the third dial: a fresh `crux` subagent, the top rung, takes over
+the step the counts below have caught. Your size label, your workflow file and your verification
+set do not change: this is not a resize, and nothing about which checks run moves. It is not a
+retry either — you do not attempt that step again yourself, and you do not hand over your
+transcript. The brief is written fresh and compressed: the goal, what was tried, the exact failure,
+and the `file:line` refs that matter. You continue from what returns. Any one of these counts makes
+escalating the default action, not an option:
+
+- 3 consecutive failed tool calls;
+- the same check or test failing twice;
+- the same file edited 3 times without its check going green;
+- any check re-run with no intervening change;
+- 3 consecutive edits that do not reduce the failure.
+
+You count these; you do not judge them. The counts are per step, and what `crux` returns resets
+them — that is a different step. Then post the marker:
+
+```bash
+gh issue comment <N> --body "builder: escalated <what> · <which trigger>"
+```
+
+Escalation is available at every size above `tiny`, `small` included. `tiny` has one trigger of its
+own and it is a resize, not an escalation (`workflows/tiny.md`).
+
+### The in-session ceiling
+
+The dials above fire on a judgement or a failure. This one fires on volume: your own
+implementation is capped at **3 files touched by your own edits and 10 of your own edit calls, per
+issue**. Cross either and the remainder goes to a size-matched slice agent with a compressed brief
+— the files, the approach, and the checks it must leave green — while you go back to integrating.
+Crossing the ceiling is neither a resize nor an escalation: same size, same workflow file, same
+checks. The count is per issue and covers only edits you make yourself; a resize does not reset it.
+
+`tiny` is exempt entirely — it edits its one file in-session and stays that way. `small` implements
+in-session by design, and the ceiling is the only thing that makes it fan out.
+
+Two precedences, so that one event never has two outcomes. A file that would also fail your size
+file's scope test is a resize, never a fan-out: the ceiling only moves work that is still in scope.
+And when a fumble trigger and the ceiling fire on the same edit, escalate — a failing step never
+goes to a slice agent on your own rung.
 
 ## 8. Pull request
 
