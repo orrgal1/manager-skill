@@ -49,7 +49,12 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 ```sh
 git clone https://github.com/orrgal1/manager-skill ~/code/manager-skill
 ~/code/manager-skill/install.sh          # symlinks ~/.claude/skills/manager -> the clone
+~/code/manager-skill/install.sh --omp-extension   # also links extensions/mgr-status.ts into ~/.omp/agent/extensions/ (adopted and manager sessions)
 ```
+
+Builders launched by `mgr launch` get the status-line extension automatically — `mgr` passes
+`--extension <checkout>/extensions/mgr-status.ts` to omp itself — so `--omp-extension` is only
+needed for sessions `mgr` did not start: adopted tabs and the manager's own.
 
 `mgr` resolves `builder.md` and its own path from its real location (symlinks followed), so the
 briefs work from the symlink or from `node_modules`.
@@ -111,7 +116,8 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 | `builder.md` | The builder contract every launched or adopted session follows |
 | `bin/mgr` | `labels` · `board` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `guard` · `pause` · `unpause` (`resume`) · `config` · `paths` · `--version` |
 | `bin/mgr-guard` | `start` · `stop` · `status` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
-| `install.sh` | Symlinks the checkout into `~/.claude/skills/manager` |
+| `extensions/mgr-status.ts` | omp status-line indicator: rate-limited / guard stopped / project paused, optional burn item |
+| `install.sh` | Symlinks the checkout into `~/.claude/skills/manager`; `--omp-extension` also links the status-line extension into `~/.omp/agent/extensions/` |
 | `package.json` | npm/pnpm manifest; `bin.mgr` → `bin/mgr` |
 | `test/run.sh` | The hermetic test suite |
 
@@ -190,7 +196,8 @@ operator. Nothing acts on the projection.
 - **Multi-manager ledger.** `~/.local/state/mgr-guard` (`MGR_STATE_DIR`) holds `guard.pid`,
   `guard.log`, `state.json`, `samples.jsonl`, `exit.json`, one `managers/<id>.json` per manager —
   heartbeated by every `mgr` call (`mgr board` writes the full registration: manager id, repo, pane,
-  cap and in-flight, for attribution only; every other subcommand stamps `seen_at`) — and the
+  cap, in-flight and `paused_by_operator`, for attribution and for the status line only — the guard
+  never reads the pause; every other subcommand stamps `seen_at`) — and the
   `managers/<id>.last_report.json` the board writes for change detection. One daemon serves every
   manager on the machine.
 
@@ -201,6 +208,33 @@ manager is live while its herdr pane exists (`herdr agent list`); heartbeat age 
 429-stalled manager, which runs no commands at all, from being written off. When the daemon does
 exit it records why, and `mgr guard status` and `mgr board` report it as
 `last_exit_at` / `last_exit_reason`.
+
+## Status line
+
+Every builder tab carries a one-line omp status indicator, so the operator can see a quota hold
+from the tab itself instead of asking the manager (which may be stalled on the same quota):
+
+- **Rate-limited.** `⏳ rate-limited on anthropic:5h, guard reignites after 17:00Z` — the limit
+  that stopped this pane and the UTC time the guard expects the quota back. With no reset time
+  known yet it reads `⏳ rate-limited on anthropic:5h, guard reignites when the quota renews`.
+- **Guard stopped.** When the ledger says the daemon is stopped or stale, the stall line gains
+  ` (guard stopped — run mgr guard start)`: nothing is going to reignite the pane until it is back.
+- **Project paused.** `⏸ project paused (mgr unpause to resume launches)` — the operator's pause,
+  from this manager's registration. A stall outranks it.
+- **Burn**, opt-in with `MGR_STATUS_BURN=1`: `🔥 anthropic:5h 20% 0.2/h → 2.56× by 17:00Z`, the
+  worst limit projected past its window.
+
+How it works: the extension polls `state.json` every `MGR_STATUS_INTERVAL_S` seconds (default 5)
+on omp's managed timer, stats the file first and re-parses only when the mtime moved, and tolerates
+a missing or half-written ledger by keeping the last good reading. It finds itself by
+`HERDR_PANE_ID` in `stalled[]` and its manager by `HERDR_WORKSPACE_ID` in `managers`. There is no
+new guard channel and no new file: it reads what the guard already writes. It is UI only — nothing
+it shows ever reaches the reignite prompt or the brief.
+
+In a headless, print or subagent session, or with no `HERDR_PANE_ID`, it is a no-op and starts no
+timer at all. Every `mgr launch` passes `--extension <checkout>/extensions/mgr-status.ts`;
+`install.sh --omp-extension` links it into `~/.omp/agent/extensions/` for adopted and manager
+sessions. A session that gets it both ways loads it twice and activates it once.
 
 ## Configuration
 
@@ -224,6 +258,8 @@ error (exit `2`).
 | `MGR_GUARD_IDLE_EXIT_S` | `1800` | the daemon exits after this long with no live manager pane and no stalled pane |
 | `MGR_GUARD_NOTIFY` | `1` | `0` silences the guard's herdr toasts (a reignite is the only one) |
 | `MGR_GUARD_NOW_MS` | unset | pins the guard's clock in ms since the epoch; for tests |
+| `MGR_STATUS_INTERVAL_S` | `5` | seconds between status-line polls of the guard's ledger |
+| `MGR_STATUS_BURN` | unset | `1` shows the burn item in the status line |
 
 `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID` and `HERDR_TAB_ID` are exported by herdr, not by you —
 except in headless use, where the caller sets `HERDR_WORKSPACE_ID` itself.
@@ -234,12 +270,14 @@ except in headless use, where the caller sets `HERDR_WORKSPACE_ID` itself.
 test/run.sh
 ```
 
-`test/run.sh` runs the three tests in sequence, prints `PASS`/`FAIL` per test with the output of
+`test/run.sh` runs the five tests in sequence, prints `PASS`/`FAIL` per test with the output of
 any failure, and exits non-zero if one fails. The suite is hermetic: every test puts the fake
 `gh`/`herdr`/`omp` it needs on its own temporary `PATH` and points `MGR_STATE_DIR` at a temporary
 directory, so it touches no network, no real repo and no real state — `bash` and `jq` are all it
 needs. Each script also runs standalone (`test/guard-smoke.sh`, `test/mgr-quota-smoke.sh`,
-`test/e2e-quota.sh`) and exits non-zero on failure.
+`test/mgr-config-smoke.sh`, `test/e2e-quota.sh`, `test/mgr-status-unit.sh`) and exits non-zero on
+failure. `test/mgr-status-unit.sh` is the one exception to the `bash`+`jq` rule: it is a `bun` unit
+test of the status-text mapping (`bun` is what omp itself runs on).
 
 ## Platform
 
