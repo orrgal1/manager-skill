@@ -294,9 +294,15 @@ ensure_labels() {
   gh label create 'mgr:awaiting-approval' --color fbca04 --force \
     --description 'manager: PR open, waiting on operator approval' >/dev/null 2>&1 \
     || die 1 "gh label create mgr:awaiting-approval failed"
+  gh label create 'mgr:awaiting-plan' --color fbca04 --force \
+    --description 'manager: plan posted, waiting on operator approval' >/dev/null 2>&1 \
+    || die 1 "gh label create mgr:awaiting-plan failed"
   gh label create 'mgr:manual-approve' --color d93f0b --force \
     --description 'manager: builder must not self-merge; operator approves' >/dev/null 2>&1 \
     || die 1 "gh label create mgr:manual-approve failed"
+  gh label create 'mgr:plan-approve' --color d93f0b --force \
+    --description 'manager: builder must not build unreviewed; operator approves the plan' >/dev/null 2>&1 \
+    || die 1 "gh label create mgr:plan-approve failed"
   local s
   for s in $MGR_SIZES; do
     gh label create "size:$s" --color "$(size_color "$s")" --force \
@@ -320,6 +326,11 @@ issue_json() { # issue_json <N> -> {number,title,state,labels,body}
 policy_of() { # policy_of <issue-json>
   jq -r 'if ([.labels[].name] | index("mgr:manual-approve")) then "manual-approve"
          else "auto-merge" end' <<<"$1"
+}
+
+plan_policy_of() { # plan_policy_of <issue-json>
+  jq -r 'if ([.labels[].name] | index("mgr:plan-approve")) then "approve"
+         else "none" end' <<<"$1"
 }
 
 # The size a builder is briefed with, read from the labels the caller already
@@ -1151,10 +1162,12 @@ cmd_board() {
     ($issues | map(. + {state:"open", policy: pol, size: sz,
                         inflight: lbl("mgr:in-flight"),
                         awaiting: lbl("mgr:awaiting-approval"),
+                        plan_awaiting: lbl("mgr:awaiting-plan"),
                         blocked_by: [blockers[] | select(. as $n | $open | index($n))]})) as $IO |
     ($extra | map(. + {state:((.state // "CLOSED")|ascii_downcase), policy: pol, size: sz,
                        awaiting: lbl("mgr:awaiting-approval"),
-                       inflight: (lbl("mgr:in-flight") or (lbl("mgr:awaiting-approval")|not)),
+                       plan_awaiting: lbl("mgr:awaiting-plan"),
+                       inflight: (lbl("mgr:in-flight") or ((lbl("mgr:awaiting-approval") or lbl("mgr:awaiting-plan"))|not)),
                        blocked_by: []})) as $IX |
     ($IO + $IX) as $I |
     def agent_for($n): ($ag | map(select(.name == ("issue-" + ($n|tostring)))) | .[0] // null);
@@ -1179,9 +1192,10 @@ cmd_board() {
            else $s + "→" + $m end)};
     ([$I[] | select(.inflight) | row] | sort_by(.number)) as $inflight |
     ([$I[] | select(.awaiting and (.inflight|not)) | row] | sort_by(.number)) as $awaiting |
-    ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.blocked_by|length)==0)
+    ([$I[] | select(.plan_awaiting and (.inflight|not)) | row] | sort_by(.number)) as $awaiting_plan |
+    ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.plan_awaiting|not) and (.blocked_by|length)==0)
             | {number,title,policy,size,blocked_by}] | sort_by(.number)) as $ready |
-    ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.blocked_by|length)>0)
+    ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.plan_awaiting|not) and (.blocked_by|length)>0)
             | {number,title,policy,size,blocked_by}] | sort_by(.number)) as $blocked |
     ([$ag[] | select(.name != null and (.name|startswith("adopt-")))
             | {pane_id,tab_id,agent:.name,agent_status,cwd}] | sort_by(.pane_id)) as $adopting |
@@ -1195,12 +1209,12 @@ cmd_board() {
                requested:(($requests[.pane_id] // null) != null),
                requested_at:($requests[.pane_id].requested_at // null),
                requested_issue:($requests[.pane_id].issue // null)}] | sort_by(.pane_id)) as $unmanaged |
-    ([ ($I[] | select(.inflight or .awaiting)
+    ([ ($I[] | select(.inflight or .awaiting or .plan_awaiting)
              | select(agent_for(.number) == null)
              | {number,title,reason:"label-without-agent"}),
        ($ag[] | select(.name != null and (.name|test("^issue-[0-9]+$")))
               | ((.name|capture("^issue-(?<n>[0-9]+)$").n)|tonumber) as $n
-              | select([$I[] | select(.number==$n and (.inflight or .awaiting))] | length == 0)
+              | select([$I[] | select(.number==$n and (.inflight or .awaiting or .plan_awaiting))] | length == 0)
               | {number:$n,
                  title:([$I[] | select(.number==$n) | .title][0] // null),
                  reason:"agent-without-label"})
@@ -1225,6 +1239,7 @@ cmd_board() {
      in_flight:[$inflight[] | .number as $rn
                 | . + {quota_stalled: (($qstalled | index($rn)) != null)}],
      awaiting_approval:$awaiting,
+     awaiting_plan:$awaiting_plan,
      ready:$ready, blocked:$blocked, orphans:$orphans,
      adopting:$adopting, unmanaged:$unmanaged,
      quota:{guard:$gs,
@@ -1438,13 +1453,15 @@ def workline:
       else
         ($m.in_flight // 0) as $inf | ($m.ready // 0) as $rd
         | ($m.blocked // 0) as $bl | ($m.awaiting_approval // 0) as $aa
-        | if ($inf + $rd + $bl + $aa) == 0 then ("work"|pad9) + "nothing running, nothing queued"
+        | ($m.awaiting_plan // 0) as $ap
+        | if ($inf + $rd + $bl + $aa + $ap) == 0 then ("work"|pad9) + "nothing running, nothing queued"
           else
             ( (if ($m.cap // 0) > 0 then "\($inf) of \($m.cap) builders running"
                else (if $inf == 1 then "1 builder running" else "\($inf) builders running" end) end)
               + (if $rd > 0 then ", \($rd) ready" else "" end)
               + (if $bl > 0 then ", \($bl) blocked" else "" end)
               + (if $aa > 0 then ", \($aa) waiting for approval" else "" end)
+              + (if $ap > 0 then ", \($ap) waiting on the plan" else "" end)
             ) as $item1
             | ( if ($m.idle_slots // 0) > 0 then
                   "\($m.idle_slots) free slot" + (if $m.idle_slots == 1 then "" else "s" end) + ", nothing ready to launch"
@@ -1505,7 +1522,8 @@ def nextline:
       else
         ($m.in_flight // 0) as $inf | ($m.ready // 0) as $rd
         | ($m.blocked // 0) as $bl | ($m.awaiting_approval // 0) as $aa
-        | if ($inf + $rd + $bl + $aa) == 0 then empty
+        | ($m.awaiting_plan // 0) as $ap
+        | if ($inf + $rd + $bl + $aa + $ap) == 0 then empty
           else
             (.timeline.shown // []) as $S
             | [ $S[] | select((.repo // "") == $repo) ] as $own
@@ -1589,12 +1607,13 @@ cmd_launch() {
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || die 3 "not running inside herdr (HERDR_WORKSPACE_ID unset)"
   require_agents
 
-  local ij state title policy size srsz=0
+  local ij state title policy plan_policy size srsz=0
   ij=$(issue_json "$n")
   state=$(jq -r '.state' <<<"$ij")
   [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
   has_label "$ij" 'mgr:in-flight' && die 3 "issue #$n is already labeled mgr:in-flight"
   has_label "$ij" 'mgr:awaiting-approval' && die 3 "issue #$n is already labeled mgr:awaiting-approval"
+  has_label "$ij" 'mgr:awaiting-plan' && die 3 "issue #$n is already labeled mgr:awaiting-plan"
 
   local blk
   blk=$(open_blockers "$ij")
@@ -1637,6 +1656,7 @@ cmd_launch() {
 
   title=$(jq -r '.title' <<<"$ij")
   policy=$(policy_of "$ij")
+  plan_policy=$(plan_policy_of "$ij")
   local slug branch pri wt rp
   slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
   pri=$(primary)
@@ -1698,7 +1718,7 @@ cmd_launch() {
   $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
 
   local brief
-  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size. House: $house. Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Plan policy: $plan_policy. Size: $size. House: $house. Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
   brief=$(brief_with_extra "$brief")
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
@@ -1778,13 +1798,14 @@ cmd_adopt() {
   ensure_labels
 
   if [ -n "$n" ]; then
-    local ij state title policy size
+    local ij state title policy plan_policy size
     ij=$(issue_json "$n")
     state=$(jq -r '.state' <<<"$ij")
     [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
     [ -n "$(live_agent "issue-$n")" ] && die 3 "agent issue-$n is already live"
     title=$(jq -r '.title' <<<"$ij")
     policy=$(policy_of "$ij")
+    plan_policy=$(plan_policy_of "$ij")
     # an adoptee is already mid-work: an unlabelled or ambiguously labelled
     # issue is briefed as medium rather than refused
     size=$(size_of "$ij") || size=medium
@@ -1800,11 +1821,15 @@ cmd_adopt() {
       gh issue edit "$n" --remove-label 'mgr:awaiting-approval' >/dev/null \
         || warn "could not remove mgr:awaiting-approval from #$n"
     fi
+    if has_label "$ij" 'mgr:awaiting-plan'; then
+      gh issue edit "$n" --remove-label 'mgr:awaiting-plan' >/dev/null \
+        || warn "could not remove mgr:awaiting-plan from #$n"
+    fi
     gh issue comment "$n" --body "manager: adopted · tab $tab · agent issue-$n · cwd $cwd · branch $br_cmt · policy $policy" >/dev/null \
       || warn "gh issue comment #$n failed"
 
     local brief
-    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Size: $size.$hfrag Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Plan policy: $plan_policy. Size: $size.$hfrag Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
@@ -2050,6 +2075,10 @@ cmd_wait() {
         ensure_labels
         gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
           || warn "could not swap labels on #$n"
+      elif [ "$(jq -r '.status // ""' <<<"$report")" = "awaiting-plan-approval" ]; then
+        ensure_labels
+        gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-plan' >/dev/null 2>&1 \
+          || warn "could not swap labels on #$n"
       fi
     fi
 
@@ -2108,6 +2137,11 @@ cmd_prompt() {
   if has_label "$ij" 'mgr:awaiting-approval'; then
     ensure_labels
     gh issue edit "$n" --remove-label 'mgr:awaiting-approval' --add-label 'mgr:in-flight' >/dev/null 2>&1 \
+      || warn "could not swap labels on #$n"
+  fi
+  if has_label "$ij" 'mgr:awaiting-plan'; then
+    ensure_labels
+    gh issue edit "$n" --remove-label 'mgr:awaiting-plan' --add-label 'mgr:in-flight' >/dev/null 2>&1 \
       || warn "could not swap labels on #$n"
   fi
 
@@ -2231,7 +2265,9 @@ cmd_retire() {
             delegated_planning: ($report.delegated_planning // null),
             pre_existing_red: ($report.pre_existing_red // null | if . == null then null
                                else (tonumber? // null) end),
-            final_size: ($report.final_size // null)
+            final_size: ($report.final_size // null),
+            plan_rounds: ($report.plan_rounds // null | if . == null then null
+                          else (tonumber? // null) end)
           },
           session: $session
         }' 2>/dev/null); then
@@ -2255,7 +2291,7 @@ cmd_retire() {
     fi
   fi
 
-  gh issue edit "$n" --remove-label 'mgr:in-flight' --remove-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
+  gh issue edit "$n" --remove-label 'mgr:in-flight' --remove-label 'mgr:awaiting-approval' --remove-label 'mgr:awaiting-plan' >/dev/null 2>&1 \
     || warn "could not remove mgr labels from #$n"
 
   if $close; then
@@ -2312,7 +2348,7 @@ cmd_size() {
 cmd_labels() {
   ensure_labels
   jq -nc --arg sizes "$MGR_SIZES" \
-    '{labels:(["mgr:in-flight","mgr:awaiting-approval","mgr:manual-approve"]
+    '{labels:(["mgr:in-flight","mgr:awaiting-approval","mgr:awaiting-plan","mgr:manual-approve","mgr:plan-approve"]
               + ($sizes | split(" ") | map("size:" + .)))}'
 }
 
@@ -2352,9 +2388,9 @@ usage() {
 mgr — manager CLI for herdr-hosted omp builders
 
   mgr labels                          ensure the mgr:* and size:* labels exist
-  mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
-                                      blocked / orphans / adopting / unmanaged (+requested) / quota /
-                                      overview
+  mgr board [--cap N]                 full state: in_flight / awaiting_approval /
+                                      awaiting_plan / ready / blocked / orphans / adopting /
+                                      unmanaged (+requested) / quota / overview
   mgr overview [--json] [--limit N]   the picture every manager turn ends with: the burn
                                       of this manager's own subscription, then the
                                       backlog and projected timeline of every live

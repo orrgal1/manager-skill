@@ -374,7 +374,7 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
            + " reason=" + $reason)}'
 
 # open issues of one repo -> the backlog snapshot state.json carries for that manager.
-# The ready/blocked/in_flight/awaiting rules mirror `mgr board` (bin/mgr JQ_BLOCKERS plus
+# The ready/blocked/in_flight/awaiting/awaiting_plan rules mirror `mgr board` (bin/mgr JQ_BLOCKERS plus
 # cmd_board): a `Blocked by:` reference counts only when it names an issue that is still
 # open in this list. Only the scan spelling differs — jaq's `scan` stops at the first hit,
 # so the blocker numbers come out of `match(...; "g")` here.
@@ -394,7 +394,8 @@ def lbl($n): (([.labels[]?.name] | index($n)) != null);
 | ($issues | map({number: .number, title: (.title // ""),
                   blocked_by: [blockers[] | select(. as $n | $open | index($n))],
                   inflight: lbl("mgr:in-flight"),
-                  awaiting: lbl("mgr:awaiting-approval")})) as $I
+                  awaiting: lbl("mgr:awaiting-approval"),
+                  plan_awaiting: lbl("mgr:awaiting-plan")})) as $I
 | ([$I[] | select(.inflight)
          | (.number | tostring) as $key
          | (($launches[$key] // null) | if type == "object" then . else null end) as $stamp
@@ -405,18 +406,22 @@ def lbl($n): (([.labels[]?.name] | index($n)) != null);
    | sort_by(.number)) as $in_flight
 | ([$I[] | select(.awaiting and (.inflight | not)) | {number: .number, title: .title}]
    | sort_by(.number)) as $awaiting
-| ([$I[] | select((.inflight | not) and (.awaiting | not) and ((.blocked_by | length) == 0))
+| ([$I[] | select(.plan_awaiting and (.inflight | not)) | {number: .number, title: .title}]
+   | sort_by(.number)) as $awaiting_plan
+| ([$I[] | select((.inflight | not) and (.awaiting | not) and (.plan_awaiting | not) and ((.blocked_by | length) == 0))
          | {number: .number, title: .title, blocked_by: .blocked_by}] | sort_by(.number)) as $ready
-| ([$I[] | select((.inflight | not) and (.awaiting | not) and ((.blocked_by | length) > 0))
+| ([$I[] | select((.inflight | not) and (.awaiting | not) and (.plan_awaiting | not) and ((.blocked_by | length) > 0))
          | {number: .number, title: .title, blocked_by: .blocked_by}] | sort_by(.number)) as $blocked
 # The ledger row keeps 50 entries per list; `full` is what the timeline simulates over, so a
 # repo with hundreds of queued issues still gets an ETA for every one of them.
 | {ledger: {ready: ($ready | .[0:50]), blocked: ($blocked | .[0:50]),
             in_flight: $in_flight, awaiting_approval: $awaiting,
+            awaiting_plan: $awaiting_plan,
             cap: $cap,
             slots_free: ([0, ($cap - ($in_flight | length) - $adopting)] | max),
             counts: {ready: ($ready | length), blocked: ($blocked | length),
                      in_flight: ($in_flight | length), awaiting_approval: ($awaiting | length),
+                     awaiting_plan: ($awaiting_plan | length),
                      open: ($issues | length)}},
    full: {ready: $ready, blocked: $blocked}}'
 
@@ -590,6 +595,7 @@ def sim($m):
              stall_window: $mwin, cap: $cap, ready: $nready,
              blocked: ($c.blocked // 0), in_flight: ($c.in_flight // 0),
              awaiting_approval: ($c.awaiting_approval // 0),
+             awaiting_plan: ($c.awaiting_plan // 0),
              idle_slots: $idle, starving: ($idle > 0),
              starves_at: (if ($snap == null) or ($cap <= 0) then null
                           elif $idle > 0 then $now
@@ -613,6 +619,7 @@ def sim($m):
                       blocked: ([$mrows[] | .blocked] | add // 0),
                       in_flight: ([$mrows[] | .in_flight] | add // 0),
                       awaiting_approval: ([$mrows[] | .awaiting_approval] | add // 0),
+                      awaiting_plan: ([$mrows[] | .awaiting_plan] | add // 0),
                       cap: ([$mrows[] | .cap] | add // 0),
                       idle_slots: ([$mrows[] | .idle_slots] | add // 0),
                       open: ([$sims[] | .open] | add // 0)},

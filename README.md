@@ -13,7 +13,8 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 ## What you get
 
 - **The board is GitHub issues.** No local state. Labels carry the lifecycle
-  (`mgr:in-flight`, `mgr:awaiting-approval`) and the per-issue policy (`mgr:manual-approve`).
+  (`mgr:in-flight`, `mgr:awaiting-approval`, `mgr:awaiting-plan`) and the per-issue policy
+  (`mgr:manual-approve`, `mgr:plan-approve`).
 - **One builder per issue**, in a [herdr](https://herdr.dev) tab named `#N <slug>`, on branch
   `issue-N-<slug>`, in worktree `<repo>-issue-N-<slug>`. The primary checkout stays clean.
 - **Every issue is sized.** Intake puts exactly one `size:tiny` / `size:small` / `size:medium` /
@@ -119,6 +120,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 |---|---|
 | add dark mode to settings | hygiene check → `gh issue create` → `mgr board` → launch or queue |
 | I want to approve that one myself | adds `mgr:manual-approve` before launching |
+| I want to see the plan first | adds `mgr:plan-approve` before launching |
 | what's on the board | `mgr board` as a table |
 | approve #12 | tells the builder to land; retires the tab when it reports merged |
 | pause the project | `mgr pause` — a launch gate: a persisted cap 0 for this repo until `mgr unpause`, so nothing new launches. The builders already running keep going to their report; nothing is retired, no tab, worktree or issue is touched |
@@ -318,9 +320,10 @@ next     #49 running on claude-opus-5 (launched on claude-fable-5-1), 15m left �
   provider — because filtering to nothing would hide readings that do exist; its board still
   reports `quota.provider: null`.
 - **`work`** — this repo only: how many builders are running out of the cap, how many issues are
-  ready / blocked / awaiting approval, whether a slot is free right now — and if so, whether
-  nothing is ready to fill it (`N free slot(s), nothing ready to launch`) — or when the last slot
-  runs out of work, and when this repo's own queue clears. Nothing to report at all renders as
+  ready / blocked / awaiting approval / waiting on the plan, whether a slot is free right now —
+  and if so, whether nothing is ready to fill it (`N free slot(s), nothing ready to launch`) — or
+  when the last slot runs out of work, and when this repo's own queue clears. Nothing to report
+  at all renders as
   `nothing running, nothing queued` (no `next` line follows); an unregistered repo reads `this repo
   is not registered with the guard`; outside a repo entirely it reads `not inside a repo, so there
   is no queue to show`.
@@ -435,6 +438,7 @@ operator's only pace dial.
 | `report.delegated_planning` | string | report `delegated_planning=` (`sketch`\|`plan`\|`none`) | — | yes |
 | `report.pre_existing_red` | int | report `pre_existing_red=` via `tonumber?` | count | yes |
 | `report.final_size` | string | report `final_size=` | — | yes |
+| `report.plan_rounds` | int | report `plan_rounds=` via `tonumber?` | count | yes |
 | `session.read` | bool | session file readable | — | no |
 | `session.turns` | int | count of `.type=="message" and .message.role=="assistant"` | count | yes |
 | `session.tokens.input/output/cache_read/cache_write` | int | sums of `.message.usage.{input,output,cacheRead,cacheWrite}` (`// 0` per message) | tokens | yes |

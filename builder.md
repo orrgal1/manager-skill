@@ -130,6 +130,24 @@ slice table.
 gh issue comment <N> --body "builder: started · <the plan your size file asks for>"
 ```
 
+Your brief also carries `Plan policy: approve` or `Plan policy: none` beside `Policy:`.
+
+- **approve** → report `status=awaiting-plan-approval plan=<url of that marker comment>` (§12),
+  add one short line saying what is waiting, and stop. Do not read code, do not dispatch slices,
+  and do not touch the worktree beyond the plan.
+- **none** → fall through into §7, as today.
+
+While awaiting plan approval, two things can arrive:
+
+| Message | Do |
+|---|---|
+| `Plan feedback: …` | revise the plan, post a **fresh** `builder: started · <plan>` marker so the latest comment is always the current plan, report a fresh `status=awaiting-plan-approval plan=<new comment url>`, stop |
+| `Plan approved. Build it.` | continue into §7, as if the policy were absent |
+
+Under this policy `plan_rounds` starts at 1 — the plan you posted above — and each round through
+the table adds one; it rides in your final §12 report. The two policies compose: an issue may stop
+here under `mgr:plan-approve` and again at §9 under `mgr:manual-approve`.
+
 ## 7. Build and verify — your size
 
 Your brief named your size, your rigor, your sizing bias and the absolute path of the workflow
@@ -421,8 +439,9 @@ gh issue comment <N> --body "manager-report: status=<status> <key>=<value> …"
 
 | `status` | Keys |
 |---|---|
-| `merged` | `sha=<main tip sha>` `pr=<url>` `review=<reviewer\|sweep\|none>` `review_verdict="<text>"` `checks=<comma,list>` `escalations=<int>` `delegated_planning=<sketch\|plan\|none>` `pre_existing_red=<int>` `final_size=<tiny\|small\|medium\|large>` |
+| `merged` | `sha=<main tip sha>` `pr=<url>` `review=<reviewer\|sweep\|none>` `review_verdict="<text>"` `checks=<comma,list>` `escalations=<int>` `delegated_planning=<sketch\|plan\|none>` `pre_existing_red=<int>` `final_size=<tiny\|small\|medium\|large>` `plan_rounds=<int>` |
 | `awaiting-approval` | `pr=<url>` |
+| `awaiting-plan-approval` | `plan=<comment-url>` |
 | `blocked` | `reason="<text>"` |
 | `failed` | `reason="<text>"` |
 
@@ -430,17 +449,20 @@ Rules: the comment MUST start with `manager-report:`; values with spaces are dou
 be the last command you run before going idle; exactly one report per stop. After it, print one
 short line for the human reading your pane, and stop.
 
-The seven keys after `pr=` are the builder-only half of the execution record `mgr retire`
+The eight keys after `pr=` are the builder-only half of the execution record `mgr retire`
 writes on the issue and the throughput ledger; they are recorded for tuning the workflows and
 are not read by the manager's flow (`status`, `sha`, `pr` are). On a `merged` report a missing
 key is a defect, not an option — `checks` is the comma-separated list of the checks that
 actually ran (no spaces), `escalations` and `pre_existing_red` are counts (`0` when none),
-`delegated_planning` is the planner dispatched or `none`, and `final_size` is the size you
-finished under.
+`delegated_planning` is the planner dispatched or `none`, `final_size` is the size you
+finished under, and `plan_rounds` is the number of plan rounds under the policy — `1` when the
+first plan was approved, one more for each `Plan feedback:` round, and `0` when the policy was
+absent.
 
 **The manager reads only your latest `manager-report` comment.** So every stop needs its own fresh
-one: after a round of `Changes requested: …` you post a new `status=awaiting-approval`, and after
-approval a new `status=merged`. Skip it and the stale report wins — the manager will keep telling
+one: after a round of `Changes requested: …` you post a new `status=awaiting-approval`, after a
+round of `Plan feedback: …` you post a new `status=awaiting-plan-approval`, and after approval a
+new `status=merged`. Skip it and the stale report wins — the manager will keep telling
 the operator you are still waiting on something you already finished.
 
 This comment is how the manager learns you are done. Without it, your tab sits idle and the next

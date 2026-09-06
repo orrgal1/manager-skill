@@ -71,8 +71,9 @@ is already taken by another workspace's manager — then rename the agent to `ma
 the tab rename.** `$MGR board` echoes `manager` — the manager tab it detected — so you can confirm
 you are the one being found.
 
-Report the board to the operator: `in_flight`, `awaiting_approval`, `ready`, `blocked`,
-`orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, `house`, `rigor`, `sizing`, and `quota` —
+Report the board to the operator: `in_flight`, `awaiting_approval`, `awaiting_plan`, `ready`,
+`blocked`, `orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, `house`, `rigor`, `sizing`,
+and `quota` —
 `provider`, `guard`, `limits`, `reason`, `stalled`. Then close the turn with the `$MGR overview`
 block — `quota` scoped to your own provider, `work`/`next` scoped to this repo — as every turn
 ends (§7).
@@ -259,7 +260,10 @@ three comments needs anything from you.
 ### (c) Policy
 
 Default is auto-merge: the builder lands its own work. If the operator wants to approve, review or
-merge it themselves, add `--label mgr:manual-approve` at create time.
+merge it themselves, add `--label mgr:manual-approve` at create time. If the operator wants to
+review the plan before any code is written, add `--label mgr:plan-approve` at create time too —
+the two compose: an issue may carry both, and then stops twice, once at the plan and once at the
+PR.
 
 ### (d) Place it
 
@@ -320,6 +324,7 @@ Otherwise branch on `report.status`:
 |---|---|
 | `merged` | `$MGR retire N --close`. It records the execution record (classification, timings, turns, tokens, review) on the issue as an `execution:` comment and on the throughput ledger; you do not read it. Then check what landed — `gh pr view <pr> --json files`: if the merged PR touched `omp/agents/` or `omp/packages/`, run `$MGR setup` before you launch anything, because an added agent or role reaches this machine only through it. Then `$MGR board`, then launch every `ready` issue while `slots_free > 0` — each with its own background wait. Tell the operator what merged (`sha`, `pr`), any agents or roles installed or changed, and what went out next. |
 | `awaiting-approval` | Give the operator the PR URL and the builder's own summary (its last non-report issue comment). Do **not** retire — the tab stays alive for the fixes. The slot frees itself. |
+| `awaiting-plan-approval` | Relay the plan to the operator — the builder's latest `builder: started · <plan>` comment is always the current plan — with the two options, `plan feedback on #N` and `approve the plan on #N`. Do **not** retire — the tab stays alive. The slot frees itself. |
 | `blocked` / `failed` | Relay `reason` verbatim, keep the tab, ask the operator how to proceed: `$MGR prompt N "<answer>"` + wait again, or `$MGR retire N`. Never guess the answer for them. |
 
 `report` is `null` — the builder stopped without reporting, which almost always means it asked a
@@ -350,6 +355,8 @@ that pane exactly as above, and report the mapping to the operator.
 |---|---|
 | approve #N | `$MGR prompt N "Approved. Land it now per the Landing section of builder.md."` then wait |
 | request changes on #N | `$MGR prompt N "Changes requested: <verbatim feedback>"` then wait |
+| plan feedback on #N | `$MGR prompt N "Plan feedback: <verbatim feedback>"` then wait |
+| approve the plan on #N / build it | `$MGR prompt N "Plan approved. Build it."` then wait |
 | cancel #N | `herdr agent send-keys issue-N ctrl+c`, then `$MGR retire N` — add `--close` only if the work is dropped, not deferred |
 | size #N `<size>` / resize #N `<size>` | `$MGR size N <size>` — swaps the `size:` label for the new one, sized the way intake sizes (§3(b)). Refused with exit `3` while the issue is `mgr:in-flight`: a live builder resizes itself, upward, and comments when it does. Then `$MGR board` |
 | set the cap to N | `$MGR config set cap N` (persisted in the repo, shared by every worktree), then `$MGR board`. The cap is the only pace dial there is — nothing lowers it behind your back |
@@ -372,8 +379,9 @@ that pane exactly as above, and report the mapping to the operator.
 
 ## 7. Rules
 
-- Cap is 3 unless `config`/`MGR_CAP`/`--cap` say otherwise. `awaiting_approval` does **not** count against it;
-  `adopting` does. The cap gates `launch` only — **`adopt` never enforces it** and returns
+- Cap is 3 unless `config`/`MGR_CAP`/`--cap` say otherwise. `awaiting_approval` and `awaiting_plan`
+  do **not** count against it; `adopting` does. The cap gates `launch` only — **`adopt` never
+  enforces it** and returns
   `over_cap: true` instead: a requested adoption (§2) is work already in flight, not a launch you
   get to hold back. Unmanaged work nobody asked you to adopt is the operator's own by default —
   there is nothing to rescue by sweeping it in, so the absence of a request costs nothing.
@@ -469,10 +477,10 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `overview.timeline.beyond` | the queued issues not shown: `count`, how many of those are `blocked`, `last_eta`, `drains_at`; `null` when nothing is hidden |
 | `overview.timeline.drains_at` | machine-wide: the ETA of the last queued issue of any manager (`last_eta` is the same number) |
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
-| `in_flight[].size` `ready[].size` `blocked[].size` `awaiting_approval[].size` | that issue's size from its `size:` label — `tiny` \| `small` \| `medium` \| `large`, or `null` when it has none (`launch` refuses on `null`) |
-| `in_flight[].model` `awaiting_approval[].model` | the bare model id from the last assistant message in the builder's session transcript, or `null` before one lands |
-| `in_flight[].launch_model` `awaiting_approval[].launch_model` | the model the house package named at launch (`modelRoles.builder`), verbatim including provider and effort (e.g. `anthropic/claude-fable-5-1:high`), or `null` for an adopted builder |
-| `in_flight[].model_changed` `awaiting_approval[].model_changed` | `"<launch model>→<model>"`, both shortened to the bare id, when the harness switched the builder off its launch model, else `null` |
+| `in_flight[].size` `ready[].size` `blocked[].size` `awaiting_approval[].size` `awaiting_plan[].size` | that issue's size from its `size:` label — `tiny` \| `small` \| `medium` \| `large`, or `null` when it has none (`launch` refuses on `null`) |
+| `in_flight[].model` `awaiting_approval[].model` `awaiting_plan[].model` | the bare model id from the last assistant message in the builder's session transcript, or `null` before one lands |
+| `in_flight[].launch_model` `awaiting_approval[].launch_model` `awaiting_plan[].launch_model` | the model the house package named at launch (`modelRoles.builder`), verbatim including provider and effort (e.g. `anthropic/claude-fable-5-1:high`), or `null` for an adopted builder |
+| `in_flight[].model_changed` `awaiting_approval[].model_changed` `awaiting_plan[].model_changed` | `"<launch model>→<model>"`, both shortened to the bare id, when the harness switched the builder off its launch model, else `null` |
 | `unmanaged[].requested` `unmanaged[].requested_at` `unmanaged[].requested_issue` | the pane asked to be adopted via `mgr register` — `true` / ms epoch / the issue number it named, or `null`; cleared once `adopt` runs |
 
 ### Labels
@@ -481,7 +489,9 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 |---|---|
 | `mgr:in-flight` | a builder is live on it; counts against the cap |
 | `mgr:awaiting-approval` | PR open, waiting on the operator; does not count |
+| `mgr:awaiting-plan` | plan posted, waiting on the operator; does not count |
 | `mgr:manual-approve` | policy: the operator lands it. Absent → auto-merge |
+| `mgr:plan-approve` | policy: the operator approves the plan before any code. Absent → the builder builds straight on |
 | `size:tiny` `size:small` `size:medium` `size:large` | the builder's workflow file, and the size of the agents it dispatches to; exactly one per issue |
 
 ### Issue body
