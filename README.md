@@ -434,10 +434,11 @@ operator's only pace dial.
 | `report.review_verdict` | string | report `review_verdict=` | — | yes |
 | `report.checks` | string[] | report `checks=` comma list split | — | yes (absent → null) |
 | `report.escalations` | int | report `escalations=` via `tonumber?` | count | yes |
-| `report.delegated_planning` | string | report `delegated_planning=` (`sketch`\|`plan`\|`none`) | — | yes |
+| `report.delegated_planning` | string | report `delegated_planning=`, closed set `sketch`\|`plan`\|`none` — an out-of-set value is recorded as given and flagged in `report_warnings` | — | yes |
 | `report.pre_existing_red` | int | report `pre_existing_red=` via `tonumber?` | count | yes |
 | `report.final_size` | string | report `final_size=` | — | yes |
 | `report.plan_rounds` | int | report `plan_rounds=` via `tonumber?` | count | yes |
+| `report_warnings` | string[] | one entry per report value outside its documented set, e.g. `delegated_planning=medium not a planner role` | — | **yes** (null when the report is clean) |
 | `session.read` | bool | session file readable | — | no |
 | `session.turns` | int | count of `.type=="message" and .message.role=="assistant"` | count | yes |
 | `session.tokens.input/output/cache_read/cache_write` | int | sums of `.message.usage.{input,output,cacheRead,cacheWrite}` (`// 0` per message) | tokens | yes |
@@ -453,6 +454,12 @@ operator's only pace dial.
 | `session.subagents.agents` | object | histogram of `session_init.agent` | count | yes |
 | `session.subagents.roles` | object | histogram of `session_init.modelRole` | count | yes |
 | `session.subagents.models` | object | histogram of `session_init.resolvedModel` | count | yes |
+
+Report values are recorded, never coerced. Where a key has a documented value set — today
+`report.delegated_planning` — a value outside it is written to the ledger exactly as the builder
+reported it and flagged: an entry lands in `report_warnings` and the same text is appended to the
+`execution:` comment line, where a human reads it. The manager never rewrites the value, and a
+flagged row is still a row: nothing about retiring changes.
 
 `session` comes from the builder's own omp session JSONL, resolved through herdr's
 `agent_session`, plus `<stem>/<Agent>.jsonl` subagent transcripts.

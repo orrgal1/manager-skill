@@ -2246,6 +2246,9 @@ cmd_retire() {
         ($lm | if . == "" then null else short_model end) as $lm_short |
         ([$lm_short] + ($session.models // {} | keys) | map(select(. != null))
           | reduce .[] as $x ([]; if any(.[]; . == $x) then . else . + [$x] end)) as $models |
+        $report.delegated_planning as $dp |
+        (if $dp == null or (["sketch","plan","none"] | any(.[]; . == $dp)) then []
+         else ["delegated_planning=\($dp) not a planner role"] end) as $warnings |
         {
           repo: $repo, number: $n, launched_at: $launched, merged_at: $b,
           duration_s: (if $launched == null then null
@@ -2263,13 +2266,14 @@ cmd_retire() {
                      else (split(",") | map(select(. != ""))) end),
             escalations: ($report.escalations // null | if . == null then null
                           else (tonumber? // null) end),
-            delegated_planning: ($report.delegated_planning // null),
+            delegated_planning: $dp,
             pre_existing_red: ($report.pre_existing_red // null | if . == null then null
                                else (tonumber? // null) end),
             final_size: ($report.final_size // null),
             plan_rounds: ($report.plan_rounds // null | if . == null then null
                           else (tonumber? // null) end)
           },
+          report_warnings: (if ($warnings | length) == 0 then null else $warnings end),
           session: $session
         }' 2>/dev/null); then
         append_throughput "$n" "$record" && tp_appended=true
@@ -2278,7 +2282,9 @@ cmd_retire() {
           def q: if . == null then "?" else (. | tostring) end;
           "execution: #\(.number) · \(.launched_size|q)→\(.report.final_size|q) · \(.duration_s|q)s · " +
           "\(.session.turns|q) turns · \(.session.tokens.total|q) tokens · $\(.session.cost_usd|q) · " +
-          "review \(.report.review|q)/\(.report.review_verdict|q) · merged_at from \(.merged_at_source)"
+          "review \(.report.review|q)/\(.report.review_verdict|q) · merged_at from \(.merged_at_source)" +
+          (if (.report_warnings // []) == [] then ""
+           else " · warnings: " + (.report_warnings | join("; ")) end)
           ' <<<"$record" 2>/dev/null) || hdr="execution: #$n"
         if cf=$(mktemp 2>/dev/null); then
           { printf '%s\n\n```json\n' "$hdr"; jq . <<<"$record"; printf '```\n'; } >"$cf" \

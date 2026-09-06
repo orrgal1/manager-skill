@@ -454,10 +454,16 @@ writes on the issue and the throughput ledger; they are recorded for tuning the 
 are not read by the manager's flow (`status`, `sha`, `pr` are). On a `merged` report a missing
 key is a defect, not an option — `checks` is the comma-separated list of the checks that
 actually ran (no spaces), `escalations` and `pre_existing_red` are counts (`0` when none),
-`delegated_planning` is the planner dispatched or `none`, `final_size` is the size you
+`delegated_planning` is the planner dispatched, and its value set is closed — exactly one of
+`sketch`, `plan` or `none`, never a size and never a phrase, `none` when you planned in-session;
+`final_size` is the size you
 finished under, and `plan_rounds` is the number of plan rounds under the policy — `1` when the
 first plan was approved, one more for each `Plan feedback:` round, and `0` when the policy was
 absent.
+
+A value outside a documented set is not corrected for you: `mgr retire` records it verbatim and
+flags it on the record and on the `execution:` comment, so a wrong one is visible for as long as
+the ledger keeps it.
 
 **The manager reads only your latest `manager-report` comment.** So every stop needs its own fresh
 one: after a round of `Changes requested: …` you post a new `status=awaiting-approval`, after a

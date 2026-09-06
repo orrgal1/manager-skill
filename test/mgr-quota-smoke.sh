@@ -1907,6 +1907,7 @@ assert_jq 'session.resizes'                             "$row" '.session.resizes
 assert_jq 'session.subagents'                           "$row" \
   '.session.subagents == {count:3,agents:{scout:2,sketch:1},roles:{scout:2,sketch:1},models:{"anthropic/claude-x":3}}'
 assert_jq 'report.delegated_planning'                   "$row" '.report.delegated_planning == "sketch"'
+assert_jq 'a planner-role value raises no warning'      "$row" '.report_warnings == null'
 assert_jq 'session.active_ms'                           "$row" '.session.active_ms == 600'
 
 comment_line=$(grep -n '^gh issue comment 7 --body-file' "$MGR_TEST_LOG" | head -1 | cut -d: -f1)
@@ -2008,6 +2009,24 @@ check 'comment-9 header line (legacy stamp)' \
   'execution: #9 · ?→small · 10800s · 3 turns · 678 tokens · $0.6 · review none/skipped · merged_at from comment' \
   "$(sed -n '1p' "$comment9")"
 check 'the legacy stamp was consumed' '{}' "$(jq -c '.' "$launches")"
+
+# a report whose delegated_planning is a size, not a planner: the value is
+# recorded exactly as reported and flagged, never rewritten (a fresh sha so
+# the ledger's dedupe lets the row through)
+sed -e 's/sha=ghi/sha=jkl/' -e 's/delegated_planning=plan/delegated_planning=medium/' \
+  "$fix/comments-9.json" >"$fix/comments-9.json.next" \
+  && mv "$fix/comments-9.json.next" "$fix/comments-9.json"
+out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 9 2>/dev/null)
+check 'retire reports the row #9 (bad delegated_planning)' true \
+  "$(jq -r '.throughput_appended' <<<"$out")"
+row9b=$(jq -sc '.[-1]' "$thru")
+assert_jq 'the out-of-set value survives verbatim' "$row9b" \
+  '.report.delegated_planning == "medium"'
+assert_jq 'and is flagged in report_warnings'      "$row9b" \
+  '.report_warnings == ["delegated_planning=medium not a planner role"]'
+check 'comment-9 header line names the warning' \
+  'execution: #9 · ?→small · ?s · 3 turns · 678 tokens · $0.6 · review none/skipped · merged_at from comment · warnings: delegated_planning=medium not a planner role' \
+  "$(sed -n '1p' "$comment9")"
 
 # ---------------------------- 10b. two builders binding at the same time
 
