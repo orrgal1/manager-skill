@@ -166,7 +166,7 @@ check 'omp was handed review' openai-codex/gpt-6-astra:high \
 check 'omp was handed the whole role set' 21 "$(jq -r 'length' <<<"$(roles_set)")"
 check 'config.yml modelRoles.review' openai-codex/gpt-6-astra:high "$(cfg_role review)"
 check 'config.yml modelRoles.builder is the top rung' openai-codex/gpt-6-astra:high "$(cfg_role builder)"
-check 'config.yml modelRoles.sketch is the work rung' openai-codex/gpt-5.6-sol:high "$(cfg_role sketch)"
+check 'config.yml modelRoles.sketch is the top rung, with plan' openai-codex/gpt-6-astra:high "$(cfg_role sketch)"
 check 'config.yml modelRoles.sweep is the work rung, below review' openai-codex/gpt-5.6-sol:high \
   "$(cfg_role sweep)"
 check 'config.yml modelRoles.tiny is the bottom rung' openai-codex/gpt-5.6-luna:low \
@@ -187,7 +187,7 @@ check 'config.yml is restamped' 1 \
   "$(grep -cx 'activePackage: anthropic' "$agent/config.yml" || true)"
 check 'plan is the top rung' anthropic/claude-fable-5-1:high "$(cfg_role plan)"
 check 'builder is the top rung' anthropic/claude-fable-5-1:high "$(cfg_role builder)"
-check 'sketch is the work rung, below plan' anthropic/claude-opus-5:high "$(cfg_role sketch)"
+check 'sketch is the top rung, with plan' anthropic/claude-fable-5-1:high "$(cfg_role sketch)"
 check 'sweep is the work rung, below review' anthropic/claude-opus-5:high "$(cfg_role sweep)"
 
 # --------------------------------------------------- 3. refusals
@@ -227,7 +227,7 @@ check 'setup skipped nothing' '[]' "$(jq -c '.agents.skipped' <<<"$out")"
 check 'setup names the agents dir' "$agent/agents" "$(jq -r '.agents.dir' <<<"$out")"
 check 'setup applied the named house' gemini "$(jq -r '.house' <<<"$out")"
 check 'setup reports the package too' gemini "$(jq -r '.package.package' <<<"$out")"
-check 'gemini: sketch collapses onto Pro with plan' google-antigravity/gemini-3.1-pro:high "$(cfg_role sketch)"
+check 'gemini: sketch is the top rung, with plan' google-antigravity/gemini-3.1-pro:high "$(cfg_role sketch)"
 check 'gemini: sweep collapses onto Pro with review' google-antigravity/gemini-3.1-pro:high "$(cfg_role sweep)"
 check 'the tiny agent runs on the small model' 'model: "@small"' \
   "$(grep '^model:' "$agent/agents/tiny.md")"

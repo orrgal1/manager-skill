@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Deep planner - plans a request against a repo and returns the plan plus a slice table; writes no code. The light rung is sketch.
+description: Deep planner - plans a request against a repo and returns the plan plus a slice table; writes no code. sketch is the same rung with a narrower contract.
 model: "@plan"
 thinkingLevel: high
 spawns: "scout"

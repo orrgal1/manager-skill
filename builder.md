@@ -122,7 +122,7 @@ comments too: the manager and the operator put decisions there.
 ## 6. Start marker
 
 Post the marker before you build, with the plan at the length your size file asks for: one line at
-`tiny` and `small`; at `medium` the plan the light planner returned, as you amended it — or, only
+`tiny` and `small`; at `medium` the plan `sketch` returned, as you amended it — or, only
 under the escape hatch `workflows/medium.md` names, your own 3–8 lines; at `large` the plan and its
 slice table.
 
