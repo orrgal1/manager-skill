@@ -20,7 +20,7 @@ jobs:
           sudo install "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
           shellcheck --version
       - name: Lint
-        run: shellcheck -S warning bin/mgr bin/mgr-guard bin/mgr-package install.sh test/*.sh
+        run: shellcheck -S warning bin/mgr bin/mgr-guard bin/mgr-lib.sh bin/mgr-package install.sh test/*.sh
 
   test:
     strategy:

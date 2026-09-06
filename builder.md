@@ -300,6 +300,16 @@ A finding is a finding whoever returned it. Fix it or decline it with a reason, 
 check set, and keep the declines with the change. A decline escalates to a fresh `crux` only on the
 terms the escalation dial above sets.
 
+Today a review pass otherwise leaves no machine-readable trace. When the review pass finishes —
+or when the list above says no pass — post the marker, recorded for tuning:
+
+```bash
+gh issue comment <N> --body "builder: review <reviewer|sweep|none> · <verdict>"
+```
+
+`<verdict>` is one short phrase (`clean`, `2 fixed`, `1 fixed 1 declined`, or `skipped` when no
+pass runs).
+
 ## 8. Pull request
 
 ```bash
@@ -411,7 +421,7 @@ gh issue comment <N> --body "manager-report: status=<status> <key>=<value> …"
 
 | `status` | Keys |
 |---|---|
-| `merged` | `sha=<main tip sha>` `pr=<url>` |
+| `merged` | `sha=<main tip sha>` `pr=<url>` `review=<reviewer\|sweep\|none>` `review_verdict="<text>"` `checks=<comma,list>` `escalations=<int>` `delegated_planning=<sketch\|plan\|none>` `pre_existing_red=<int>` `final_size=<tiny\|small\|medium\|large>` |
 | `awaiting-approval` | `pr=<url>` |
 | `blocked` | `reason="<text>"` |
 | `failed` | `reason="<text>"` |
@@ -419,6 +429,14 @@ gh issue comment <N> --body "manager-report: status=<status> <key>=<value> …"
 Rules: the comment MUST start with `manager-report:`; values with spaces are double-quoted; it MUST
 be the last command you run before going idle; exactly one report per stop. After it, print one
 short line for the human reading your pane, and stop.
+
+The seven keys after `pr=` are the builder-only half of the execution record `mgr retire`
+writes on the issue and the throughput ledger; they are recorded for tuning the workflows and
+are not read by the manager's flow (`status`, `sha`, `pr` are). On a `merged` report a missing
+key is a defect, not an option — `checks` is the comma-separated list of the checks that
+actually ran (no spaces), `escalations` and `pre_existing_red` are counts (`0` when none),
+`delegated_planning` is the planner dispatched or `none`, and `final_size` is the size you
+finished under.
 
 **The manager reads only your latest `manager-report` comment.** So every stop needs its own fresh
 one: after a round of `Changes requested: …` you post a new `status=awaiting-approval`, and after

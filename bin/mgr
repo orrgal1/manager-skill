@@ -232,6 +232,14 @@ MGR_STATUS_EXT="$MGR_ROOT/extensions/mgr-status.ts"
 MGR_OMP_DIR="$MGR_ROOT/omp"
 MGR_PACKAGE_BIN="$MGR_ROOT/bin/mgr-package"
 
+# The mechanical half of the execution record (session_metrics) is shared
+# with mgr-guard, so it lives in a sourced library next to this script
+# instead of being duplicated in both.
+MGR_LIB="$MGR_ROOT/bin/mgr-lib.sh"
+[ -f "$MGR_LIB" ] || die 4 "mgr-lib.sh not found at $MGR_LIB"
+# shellcheck source=bin/mgr-lib.sh
+. "$MGR_LIB"
+
 # ---------------------------------------------------------------- github
 
 # The four sizes, smallest first: a `size:` label per workflow file. Every
@@ -432,7 +440,8 @@ ws_agents() {
       '{name:(.name//null),pane_id,tab_id,cwd:(.cwd//null),agent_status:(.agent_status//null),
         workspace_id,agent_kind:(.agent//null),
         worktree:(if $wt=="" then null else $wt end),
-        branch:(if $br=="" then null else $br end)}' <<<"$a")
+        branch:(if $br=="" then null else $br end),
+        agent_session:(.agent_session//null)}' <<<"$a")
     out+=$'\n'
   done < <(agents_raw | jq -c --arg ws "$ws" '.[] | select(.workspace_id==$ws)')
   MGR_WSAGENTS_CACHE=$(printf '%s' "$out" | jq -sc .)
@@ -583,17 +592,26 @@ take_launch() { # take_launch <N> -> that stamp ("" when unknown); drops the ent
   printf '%s' "$at"
 }
 
-append_throughput() { # append_throughput <N> <launched_at> <merged_at>
-  local rp f dur
+append_throughput() { # append_throughput <N> <record-json> — record is already compact JSON
+  local rp f
   rp=$(own_repo)
   [ -n "$rp" ] || { warn "cannot append the throughput row for #$1 (no repo)"; return 1; }
   f="$guard_state_dir/throughput/$(repo_key "$rp").jsonl"
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
-  dur=$(jq -nr --argjson a "$2" --argjson b "$3" '[0, (($b - $a) / 1000 | round)] | max')
-  jq -nc --arg repo "$rp" --argjson n "$1" --argjson a "$2" --argjson b "$3" \
-    --argjson d "$dur" \
-    '{repo:$repo, number:$n, launched_at:$a, merged_at:$b, duration_s:$d}' >>"$f" \
+  printf '%s\n' "$2" >>"$f" \
     || { warn "could not append the throughput row for #$1 to $f"; return 1; }
+}
+
+# `gh pr view --json mergedAt` is the actual merge instant; report_merged_at
+# (the manager-report comment's timestamp) is only the fallback for when the
+# PR lookup fails or the report carries no pr=.
+pr_merged_at() { # pr_merged_at <pr-url> -> ms ("" when empty/unparseable)
+  local pr="${1:-}" t="" ms=""
+  [ -n "$pr" ] || { printf ''; return; }
+  t=$(gh pr view "$pr" --json mergedAt -q .mergedAt 2>/dev/null) || t=""
+  [ -n "$t" ] || { printf ''; return; }
+  ms=$(jq -rn --arg t "$t" '$t | fromdateiso8601 * 1000' 2>/dev/null) || ms=""
+  case "$ms" in ''|*[!0-9]*) printf '';; *) printf '%s' "$ms";; esac
 }
 
 # `manager-report:` is the builder's last word on an issue, so the time of that
@@ -1847,13 +1865,14 @@ cmd_retire() {
   case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac
   require_agents
 
-  local a tab_closed=false wt_removed=0 br_deleted=false closed=false
+  local a tab_closed=false wt_removed=0 br_deleted=false closed=false sess=""
   a=$(live_agent "issue-$n")
   local pri; pri=$(primary)
   local wt="" br=""
   if [ -n "$a" ]; then
     wt=$(jq -r '.worktree // ""' <<<"$a")
     br=$(jq -r '.branch // ""' <<<"$a")
+    sess=$(jq -r '.agent_session.value // ""' <<<"$a")
     local tab; tab=$(jq -r '.tab_id' <<<"$a")
     if herdr tab close "$tab" >/dev/null 2>&1; then tab_closed=true
     else warn "herdr tab close $tab failed"; fi
@@ -1887,20 +1906,68 @@ cmd_retire() {
     fi
   done <<<"$wtlist"
 
-  # the builder's own last word plus the launch stamp is the only measurement
-  # of how long an issue takes in this repo, and the guard turns those rows
-  # into the medians `mgr overview` projects with. Read before the labels go,
-  # and never fatal: a retire that races a `gh` outage still drops the stamp.
-  local report launched_at merged_at tp_appended=false
+  # The execution record: the builder's own last word (the manager-report)
+  # plus the mechanical facts only its session JSONL knows (turns, tokens,
+  # cost, subagent fan-out). One row on the throughput ledger, one
+  # human-readable comment on the issue — both posted before the labels go,
+  # and never fatal: a retire that races a `gh` outage still records what it can.
+  local report launched_at merged_at merged_at_source size metrics record \
+    tp_appended=false execution_recorded=false
   report=$(parse_report "$n" 2>/dev/null || printf 'null')
   launched_at=$(take_launch "$n")
   if [ "$(jq -r '.status // ""' <<<"$report")" = merged ]; then
-    if [ -n "$launched_at" ]; then
+    local pr; pr=$(jq -r '.pr // ""' <<<"$report")
+    merged_at=$(pr_merged_at "$pr")
+    merged_at_source="pr"
+    if [ -z "$merged_at" ]; then
       merged_at=$(report_merged_at "$n")
-      append_throughput "$n" "$launched_at" "$merged_at" && tp_appended=true
-    else
-      warn "no launched_at for #$n; throughput row skipped"
+      merged_at_source="comment"
+      warn "merged_at for #$n from the report comment (gh pr view failed or no pr=)"
     fi
+    metrics=$(session_metrics "$sess")
+    size=$(gh issue view "$n" --json labels 2>/dev/null \
+      | jq -r '[.labels[]?.name | select(startswith("size:")) | ltrimstr("size:")] | first // empty' 2>/dev/null \
+      || printf '')
+    local rp; rp=$(own_repo)
+    record=$(jq -nc \
+      --arg repo "$rp" --argjson n "$n" --arg a "$launched_at" --argjson b "$merged_at" \
+      --arg src "$merged_at_source" --arg size "$size" --argjson report "$report" \
+      --argjson session "$metrics" '
+      ($a | if . == "" then null else tonumber end) as $launched |
+      {
+        repo: $repo, number: $n, launched_at: $launched, merged_at: $b,
+        duration_s: (if $launched == null then null
+                     else ([0, (($b - $launched) / 1000 | round)] | max) end),
+        schema: 1, merged_at_source: $src,
+        size: (if $size == "" then null else $size end),
+        pr: ($report.pr // null), sha: ($report.sha // null),
+        report: {
+          review: ($report.review // null),
+          review_verdict: ($report.review_verdict // null),
+          checks: ($report.checks // null | if . == null then null
+                   else (split(",") | map(select(. != ""))) end),
+          escalations: ($report.escalations // null | if . == null then null
+                        else (tonumber? // null) end),
+          delegated_planning: ($report.delegated_planning // null),
+          pre_existing_red: ($report.pre_existing_red // null | if . == null then null
+                             else (tonumber? // null) end),
+          final_size: ($report.final_size // null)
+        },
+        session: $session
+      }')
+    append_throughput "$n" "$record" && tp_appended=true
+    local cf hdr
+    cf=$(mktemp)
+    hdr=$(jq -r '
+      def q: if . == null then "?" else (. | tostring) end;
+      "execution: #\(.number) · \(.size|q)→\(.report.final_size|q) · \(.duration_s|q)s · " +
+      "\(.session.turns|q) turns · \(.session.tokens.total|q) tokens · $\(.session.cost_usd|q) · " +
+      "review \(.report.review|q)/\(.report.review_verdict|q) · merged_at from \(.merged_at_source)"
+      ' <<<"$record")
+    { printf '%s\n\n```json\n' "$hdr"; jq . <<<"$record"; printf '```\n'; } >"$cf"
+    gh issue comment "$n" --body-file "$cf" >/dev/null 2>&1 && execution_recorded=true \
+      || warn "could not post the execution record on #$n"
+    rm -f "$cf"
   fi
 
   gh issue edit "$n" --remove-label 'mgr:in-flight' --remove-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
@@ -1920,8 +1987,9 @@ cmd_retire() {
 
   jq -nc --argjson number "$n" --argjson t "$tab_closed" --argjson w "$wt_removed" \
     --argjson b "$br_deleted" --argjson c "$closed" --argjson tp "$tp_appended" \
+    --argjson er "$execution_recorded" \
     '{number:$number,tab_closed:$t,worktree_removed:$w,branch_deleted:$b,closed:$c,
-      throughput_appended:$tp}'
+      throughput_appended:$tp,execution_recorded:$er}'
 }
 
 # ---------------------------------------------------------------- size

@@ -311,7 +311,7 @@ Otherwise branch on `report.status`:
 
 | `status` | Do |
 |---|---|
-| `merged` | `$MGR retire N --close`. Then check what landed — `gh pr view <pr> --json files`: if the merged PR touched `omp/agents/` or `omp/packages/`, run `$MGR setup` before you launch anything, because an added agent or role reaches this machine only through it. Then `$MGR board`, then launch every `ready` issue while `slots_free > 0` — each with its own background wait. Tell the operator what merged (`sha`, `pr`), any agents or roles installed or changed, and what went out next. |
+| `merged` | `$MGR retire N --close`. It records the execution record (classification, timings, turns, tokens, review) on the issue as an `execution:` comment and on the throughput ledger; you do not read it. Then check what landed — `gh pr view <pr> --json files`: if the merged PR touched `omp/agents/` or `omp/packages/`, run `$MGR setup` before you launch anything, because an added agent or role reaches this machine only through it. Then `$MGR board`, then launch every `ready` issue while `slots_free > 0` — each with its own background wait. Tell the operator what merged (`sha`, `pr`), any agents or roles installed or changed, and what went out next. |
 | `awaiting-approval` | Give the operator the PR URL and the builder's own summary (its last non-report issue comment). Do **not** retire — the tab stays alive for the fixes. The slot frees itself. |
 | `blocked` / `failed` | Relay `reason` verbatim, keep the tab, ask the operator how to proceed: `$MGR prompt N "<answer>"` + wait again, or `$MGR retire N`. Never guess the answer for them. |
 

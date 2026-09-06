@@ -29,14 +29,29 @@ EOF
 cat >"$fix/issue-49.json" <<'EOF'
 {"number":49,"title":"Do the thing","state":"OPEN","labels":[{"name":"mgr:in-flight"},{"name":"size:medium"}],"body":""}
 EOF
+# issue 9: an adoptee for the execution-record tests below — never bound (no
+# launch stamp), size:small, merged via a report whose pr the PR-lookup can
+# never resolve (its fixture is removed before that test runs).
+cat >"$fix/issue-9.json" <<'EOF'
+{"number":9,"title":"Adopted thing","state":"OPEN","labels":[{"name":"size:small"}],"body":""}
+EOF
 
 # issue 7's comment thread: the builder's merged report, with the createdAt the
-# throughput row measures against
+# comment-fallback throughput row measures against (the PR-sourced path in the
+# "10" tests below uses a separate fixture and lands 1h later than this).
 cat >"$fix/comments-7.json" <<'EOF'
 {"comments":[
   {"body":"manager: bound · tab w9:t2 · agent issue-7","createdAt":"2026-09-04T12:00:00Z"},
-  {"body":"manager-report: status=merged sha=abc pr=https://github.com/owner/name/pull/9",
+  {"body":"manager-report: status=merged sha=abc pr=https://github.com/owner/name/pull/70 review=sweep review_verdict=\"2 fixed\" checks=run.sh,shellcheck escalations=0 delegated_planning=sketch pre_existing_red=1 final_size=medium",
    "createdAt":"2026-09-04T13:00:00Z"}]}
+EOF
+
+# issue 9's report: no pr fixture will exist for it, so merged_at must fall
+# back to this comment's own createdAt.
+cat >"$fix/comments-9.json" <<'EOF'
+{"comments":[
+  {"body":"manager-report: status=merged sha=def pr=https://github.com/owner/name/pull/91 review=none review_verdict=skipped checks=run.sh escalations=1 delegated_planning=plan pre_existing_red=0 final_size=small",
+   "createdAt":"2026-09-04T15:00:00Z"}]}
 EOF
 
 sess="$tmp/session-49.jsonl"
@@ -48,6 +63,35 @@ cat >"$msess" <<'EOF'
 {"type":"message","timestamp":"2026-09-04T11:59:00Z","message":{"role":"user","content":"hi"}}
 {"type":"message","timestamp":"2026-09-04T11:59:30Z","message":{"role":"assistant","provider":"anthropic","model":"claude-fable-5-1","stopReason":"end_turn"}}
 EOF
+
+# issue 7's builder session: known turns/tokens/subagents so the execution
+# record's derived metrics can be asserted exactly. Three assistant turns
+# (two claude-fable-5-1, one claude-smol that hit a 429), one user message
+# (not a turn), a model change, a resize, and one garbage line.
+bsess="$tmp/session-7.jsonl"
+cat >"$bsess" <<'EOF'
+{"type":"message","timestamp":"2026-09-04T12:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-fable-5-1","stopReason":"end_turn","duration":100,"usage":{"input":100,"output":10,"cacheRead":5,"cacheWrite":1,"totalTokens":116,"cost":{"total":0.1}}}}
+{"type":"message","timestamp":"2026-09-04T12:00:02.000Z","message":{"role":"user","content":"go on"}}
+{"type":"message","timestamp":"2026-09-04T12:00:03.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-fable-5-1","stopReason":"end_turn","duration":200,"usage":{"input":200,"output":20,"cacheRead":5,"cacheWrite":1,"totalTokens":226,"cost":{"total":0.2}}}}
+{"type":"model_change","timestamp":"2026-09-04T12:00:04.000Z"}
+{"type":"message","timestamp":"2026-09-04T12:00:05.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-smol","stopReason":"error","errorStatus":429,"errorMessage":"rate limit","duration":300,"usage":{"input":300,"output":30,"cacheRead":5,"cacheWrite":1,"totalTokens":336,"cost":{"total":0.3}}}}
+{"type":"title_change","trigger":"replan","timestamp":"2026-09-04T12:00:06.000Z"}
+not json garbage {{{
+EOF
+mkdir -p "$tmp/session-7"
+cat >"$tmp/session-7/Scout1.jsonl" <<'EOF'
+{"type":"session_init","agent":"scout","modelRole":"scout","resolvedModel":"anthropic/claude-x"}
+{"type":"message","timestamp":"2026-09-04T12:00:10.000Z","message":{"role":"assistant","content":"ok"}}
+EOF
+cat >"$tmp/session-7/Scout2.jsonl" <<'EOF'
+{"type":"session_init","agent":"scout","modelRole":"scout","resolvedModel":"anthropic/claude-x"}
+{"type":"message","timestamp":"2026-09-04T12:00:11.000Z","message":{"role":"assistant","content":"ok"}}
+EOF
+cat >"$tmp/session-7/Sketch1.jsonl" <<'EOF'
+{"type":"session_init","agent":"sketch","modelRole":"sketch","resolvedModel":"anthropic/claude-x"}
+{"type":"message","timestamp":"2026-09-04T12:00:12.000Z","message":{"role":"assistant","content":"ok"}}
+EOF
+
 jq -n --arg cwd "$repo" --arg sess "$sess" --arg msess "$msess" '
   {result:{agents:[
     {name:"issue-49",pane_id:"w9:p2",tab_id:"w9:t2",workspace_id:"w9",cwd:$cwd,
@@ -338,6 +382,10 @@ case "${1:-}" in
       edit|comment|close) exit 0;;
       *) exit 1;;
     esac;;
+  pr) case "${2:-}" in
+        view) f="$MGR_TEST_FIX/pr-mergedat.txt"; [ -f "$f" ] || exit 1; cat "$f";;
+        *) exit 1;;
+      esac;;
   *) exit 1;;
 esac
 EOF
@@ -440,6 +488,14 @@ check() { # check <name> <expected> <actual>
     printf 'ok   %s = %s\n' "$1" "$3"
   else
     printf 'FAIL %s\n       expected: %s\n       actual:   %s\n' "$1" "$2" "$3"
+    fails=$((fails + 1))
+  fi
+}
+assert_jq() { # assert_jq <label> <json> <filter>
+  if printf '%s' "$2" | jq -e "$3" >/dev/null 2>&1; then
+    printf 'ok   %s\n' "$1"
+  else
+    printf 'FAIL %s\n       filter: %s\n       json:   %s\n' "$1" "$3" "$2"
     fails=$((fails + 1))
   fi
 }
@@ -977,7 +1033,7 @@ check 'briefs use the resolved mgr' 3 \
 # a published package reached through a node_modules/.bin symlink
 pkg="$tmp/pkg"
 mkdir -p "$pkg/bin" "$tmp/nm/.bin"
-cp "$MGR" "$pkg/bin/mgr"
+cp "$MGR" "$root/bin/mgr-lib.sh" "$pkg/bin/"      # mgr plus the library it sources
 cp "$bin/mgr-guard" "$pkg/bin/mgr-guard"       # the fake guard, as shipped next to mgr
 cp "$root/SKILL.md" "$root/builder.md" "$pkg/"
 printf '{"version":"9.9.9"}' >"$pkg/package.json"
@@ -1010,9 +1066,17 @@ check 'paths without gh/herdr/git root' "$real_pkg" "$(jq -r '.root' <<<"$out")"
 check 'version without gh/herdr/git' '{"version":"9.9.9"}' \
   "$(PATH="$mini" "$link" --version)"
 
+# a checkout without its library is an install defect, said as JSON
+mkdir -p "$tmp/nolib/bin"
+cp "$MGR" "$tmp/nolib/bin/mgr"
+err=$("$tmp/nolib/bin/mgr" --version 2>&1 >/dev/null); rc=$?
+check 'mgr without mgr-lib.sh exits 4' 4 "$rc"
+check 'mgr without mgr-lib.sh says where it looked' true \
+  "$(jq -r '.error.message | startswith("mgr-lib.sh not found at")' <<<"$err")"
+
 # a checkout without package.json cannot answer --version
 mkdir -p "$tmp/nopkg/bin"
-cp "$MGR" "$tmp/nopkg/bin/mgr"
+cp "$MGR" "$root/bin/mgr-lib.sh" "$tmp/nopkg/bin/"
 err=$("$tmp/nopkg/bin/mgr" --version 2>&1 >/dev/null); rc=$?
 check 'version without package.json exits 1' 1 "$rc"
 check 'version without package.json explains why' true \
@@ -1486,21 +1550,58 @@ check 'bind number'              7 "$(jq -r '.number' <<<"$out")"
 check 'the launch stamp landed' "7/$pin" \
   "$(jq -r '."7" | "\(.number)/\(.launched_at)"' "$launches")"
 
+# issue 7 goes live only now that bind's own "already live" gate has already
+# passed, so wiring in its builder session here cannot perturb bind itself.
+# The PR mergedAt lands 1h after the report comment's own createdAt, so
+# asserting merged_at_source=="pr" can never be satisfied by the comment
+# fallback path by accident.
+jq --arg cwd "$repo" --arg sess "$bsess" \
+  '.result.agents += [{name:"issue-7",pane_id:"w9:p2",tab_id:"w9:t2",workspace_id:"w9",cwd:$cwd,
+     agent:"omp",agent_status:"blocked",agent_session:{value:$sess}}]' \
+  "$fix/agents.json" >"$fix/agents.json.next" && mv "$fix/agents.json.next" "$fix/agents.json"
+date -u -r $((pin / 1000 + 7200)) +%Y-%m-%dT%H:%M:%SZ >"$fix/pr-mergedat.txt"
+
+: >"$MGR_TEST_LOG"
 out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>/dev/null); rc=$?
 check 'retire exit'               0 "$rc"
 check 'retire reports the row'  true "$(jq -r '.throughput_appended' <<<"$out")"
-check 'one row, measured from the report comment' \
-  "{\"repo\":\"owner/name\",\"number\":7,\"launched_at\":$pin,\"merged_at\":$((pin + 3600000)),\"duration_s\":3600}" \
-  "$(jq -sc '.[0]' "$thru")"
+check 'execution recorded'      true "$(jq -r '.execution_recorded' <<<"$out")"
+row=$(jq -sc '.[0]' "$thru")
+assert_jq 'the five original ledger keys, measured from the PR mergedAt' "$row" \
+  "{repo,number,launched_at,merged_at,duration_s} == {repo:\"owner/name\",number:7,launched_at:$pin,merged_at:$((pin + 7200000)),duration_s:7200}"
 check 'exactly one row'           1 "$(jq -s 'length' "$thru")"
 check 'the stamp was consumed'   '{}' "$(jq -c '.' "$launches")"
 
-err=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>&1 >/dev/null)
-check 'a merged report with no stamp warns' 1 \
-  "$(printf '%s\n' "$err" | grep -c 'no launched_at for #7; throughput row skipped' || true)"
-out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>/dev/null)
-check 'and appends nothing'     false "$(jq -r '.throughput_appended' <<<"$out")"
-check 'still one row'             1 "$(jq -s 'length' "$thru")"
+assert_jq 'merged_at came from the pr, not the comment' "$row" '.merged_at_source == "pr"'
+assert_jq 'schema is 1'                                 "$row" '.schema == 1'
+assert_jq 'size from the size: label'                   "$row" '.size == "small"'
+assert_jq 'pr from the report'                          "$row" '.pr == "https://github.com/owner/name/pull/70"'
+assert_jq 'sha from the report'                         "$row" '.sha == "abc"'
+assert_jq 'report.review'                               "$row" '.report.review == "sweep"'
+assert_jq 'report.review_verdict'                       "$row" '.report.review_verdict == "2 fixed"'
+assert_jq 'report.checks'                               "$row" '.report.checks == ["run.sh","shellcheck"]'
+assert_jq 'report.escalations'                          "$row" '.report.escalations == 0'
+assert_jq 'report.pre_existing_red'                     "$row" '.report.pre_existing_red == 1'
+assert_jq 'report.final_size'                           "$row" '.report.final_size == "medium"'
+assert_jq 'session.read'                                "$row" '.session.read == true'
+assert_jq 'session.turns'                               "$row" '.session.turns == 3'
+assert_jq 'session.tokens'                              "$row" \
+  '.session.tokens == {input:600,output:60,cache_read:15,cache_write:3,total:678}'
+assert_jq 'session.cost_usd'                            "$row" '(.session.cost_usd - 0.6 | fabs) < 1e-9'
+assert_jq 'session.models'                              "$row" \
+  '.session.models == {"claude-fable-5-1":2,"claude-smol":1}'
+assert_jq 'session.stop_reasons'                        "$row" '.session.stop_reasons == {end_turn:2,error:1}'
+assert_jq 'session.rate_limit_hits'                     "$row" '.session.rate_limit_hits == 1'
+assert_jq 'session.model_changes'                       "$row" '.session.model_changes == 1'
+assert_jq 'session.resizes'                             "$row" '.session.resizes == 1'
+assert_jq 'session.subagents'                           "$row" \
+  '.session.subagents == {count:3,agents:{scout:2,sketch:1},roles:{scout:2,sketch:1},models:{"anthropic/claude-x":3}}'
+
+comment_line=$(grep -n '^gh issue comment 7 --body-file' "$MGR_TEST_LOG" | head -1 | cut -d: -f1)
+label_line=$(grep -n '^gh issue edit 7 --remove-label' "$MGR_TEST_LOG" | head -1 | cut -d: -f1)
+check 'the execution comment posted'      1 "$([ -n "$comment_line" ] && printf 1 || printf 0)"
+check 'posted before the labels came off' true \
+  "$([ -n "$comment_line" ] && [ -n "$label_line" ] && [ "$comment_line" -lt "$label_line" ] && printf true || printf false)"
 
 # a builder that never reported merged: the stamp is dropped, no row is written
 HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
@@ -1510,6 +1611,31 @@ out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 49 2>/dev/null)
 check 'no report, no row'       false "$(jq -r '.throughput_appended' <<<"$out")"
 check 'the stamp is dropped anyway' '{}' "$(jq -c '.' "$launches")"
 check 'the throughput file is untouched' 1 "$(jq -s 'length' "$thru")"
+
+printf '\n# 10a. an adopted builder gets a record too: no stamp, no pr, unreadable session\n'
+rm -f "$fix/pr-mergedat.txt"
+# issue 9 goes live only now: its builder session pointer names a file that is
+# never created, so the record must degrade to session.read=false, never skip
+# the row. Adding it earlier would change every in_flight count above.
+jq --arg cwd "$repo" --arg missing "$tmp/session-9-missing.jsonl" \
+  '.result.agents += [{name:"issue-9",pane_id:"w9:p4",tab_id:"w9:t4",workspace_id:"w9",cwd:$cwd,
+     agent:"omp",agent_status:"blocked",agent_session:{value:$missing}}]' \
+  "$fix/agents.json" >"$fix/agents.json.next" && mv "$fix/agents.json.next" "$fix/agents.json"
+out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 9 2>/dev/null); rc=$?
+check 'retire exit'               0 "$rc"
+check 'retire reports the row'  true "$(jq -r '.throughput_appended' <<<"$out")"
+check 'execution recorded'      true "$(jq -r '.execution_recorded' <<<"$out")"
+row9=$(jq -sc '.[-1]' "$thru")
+assert_jq 'no launch stamp -> launched_at is null'            "$row9" '.launched_at == null'
+assert_jq 'no launch stamp -> duration_s is null'             "$row9" '.duration_s == null'
+assert_jq 'no pr reading -> merged_at came from the comment'  "$row9" '.merged_at_source == "comment"'
+assert_jq 'the report still comes through for an adoptee'     "$row9" '.report.review == "none"'
+# issue-9's agent_session.value names a file that was never created: this
+# folds the "unreadable session" case in alongside the adoptee/comment-
+# fallback one — the record degrades to session.read=false, never skips.
+assert_jq 'unreadable session: read is false'                 "$row9" '.session.read == false'
+assert_jq 'unreadable session: turns is null'                 "$row9" '.session.turns == null'
+assert_jq 'unreadable session: subagent count is null'        "$row9" '.session.subagents.count == null'
 
 # ---------------------------- 10b. two builders binding at the same time
 
