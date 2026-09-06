@@ -49,9 +49,11 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   in the issue body.
 - **Self-review and auto-merge by default.** Per issue the operator can ask for manual approval;
   the builder then opens a PR and waits, and *"approve #N"* lands it.
-- **Adoption.** Opened after other tabs are already working? The manager adopts them: a tab whose
-  branch names an issue is bound to it; a tab with no issue pauses, writes its own issue, binds,
-  and continues under the builder contract.
+- **Adoption.** A tab you did not launch is adopted only on request: it runs `mgr register [N]`
+  under the `register-builder` skill, the manager gets its `register-builder:` message and
+  answers with `mgr adopt` — a request naming its own issue (or a branch that names one) binds to
+  it; one with no issue pauses, writes its own issue, binds, and continues under the builder
+  contract. The operator can also name a pane by id directly.
 - **A quota guard.** A plain daemon — not an agent — with two jobs: re-prompt sessions whose turn
   died on a provider rate limit once the quota renews, the manager's own session included, and keep
   a burn projection the manager reports to the operator. It never dials pace: the cap is the
@@ -81,7 +83,7 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
 
 ```sh
 git clone https://github.com/orrgal1/manager-skill ~/code/manager-skill
-~/code/manager-skill/install.sh          # symlinks ~/.claude/skills/manager -> the clone
+~/code/manager-skill/install.sh          # symlinks ~/.claude/skills/manager and ~/.claude/skills/register-builder -> the clone
 ~/code/manager-skill/install.sh --omp-extension   # also links extensions/mgr-status.ts into ~/.omp/agent/extensions/ (adopted and manager sessions)
 ~/code/manager-skill/install.sh --omp             # also runs `bin/mgr-package setup`: the eight agents (tiny, small, medium, large, plan, sketch, crux, sweep) into ~/.omp/agent/agents/ and the house's model package into its config.yml
 ```
@@ -118,6 +120,7 @@ In a project, in a herdr tab: *"act as the manager"*. Then talk to it:
 | pause the project | `mgr pause` — a launch gate: a persisted cap 0 for this repo until `mgr unpause`, so nothing new launches. The builders already running keep going to their report; nothing is retired, no tab, worktree or issue is touched |
 | unpause / resume the project | `mgr unpause` (alias `mgr resume`) — the cap goes back to `--cap`/`MGR_CAP`/config/`3` and the ready issues launch |
 | quota status / overview / what's coming | `mgr overview` — one block: quota (the calling manager's own provider), this repo's work and queue (see **Overview**) |
+| register this session with the manager | that session runs `mgr register [N]` itself (the `register-builder` skill); the manager answers its `register-builder:` message with `mgr adopt` |
 | cancel #12 / set the cap to 2 / adopt the other tabs / dedupe the issues | see `SKILL.md` |
 
 ## Headless use
@@ -150,9 +153,10 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 | File | Role |
 |---|---|
 | `SKILL.md` | The manager's instructions (frontmatter is the trigger description) |
+| `register-builder/SKILL.md` | The instructions a session follows to ask the manager to adopt it — `mgr register [N]` from its own pane |
 | `builder.md` | The builder contract every launched or adopted session follows |
 | `workflows/<size>.md` | The four size workflows — `tiny` · `small` · `medium` · `large` — that `builder.md` hands build and verify off to |
-| `bin/mgr` | `labels` · `board` · `overview` · `launch` · `adopt` · `bind` · `wait` · `prompt` · `retire` · `size` · `guard` · `pause` · `unpause` (`resume`) · `config` · `package` · `setup` · `house` · `paths` · `--version` — on a merged report `retire` also writes the execution record to the ledger and the issue, and returns `execution_recorded` |
+| `bin/mgr` | `labels` · `board` · `overview` · `launch` · `adopt` · `bind` · `register` · `wait` · `prompt` · `retire` · `size` · `guard` · `pause` · `unpause` (`resume`) · `config` · `package` · `setup` · `house` · `paths` · `--version` — on a merged report `retire` also writes the execution record to the ledger and the issue, and returns `execution_recorded` |
 | `bin/mgr-guard` | `start` · `stop` · `status` · `overview` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
 | `bin/mgr-package` | `package` · `setup` — installs the size agents and applies a model package into the omp config; reached as `mgr package` / `mgr setup` |
 | `omp/packages/<house>.yml` | One model package per subscription — `anthropic` · `openai` · `gemini`: `modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains` |
@@ -178,6 +182,7 @@ operator ──▶ manager ──gh issue create──▶ GitHub issue #N
                 │                         ▼
                 │              gh issue comment "manager-report: status=merged sha=… pr=…"
                 ◀─────────────────────────┘
+                ├─ session mgr register [N] ──▶ "register-builder: pane P [issue N]" ──▶ mgr adopt P [N] ──▶ (no N) mgr bind N
                 └─ mgr retire N --close ──▶ mgr board ──▶ launch next ready issue
 ```
 

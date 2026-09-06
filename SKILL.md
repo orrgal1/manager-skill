@@ -96,18 +96,24 @@ Orphans need a decision, so raise them rather than fixing them silently:
 
 Then start a background `$MGR wait N` for every `in_flight` issue and a background
 `$MGR wait <pane_id>` for every `adopting` entry (see **Waiting**) — you inherited those builders
-and nothing will tell you they finished otherwise. Then run **Adoption** on `unmanaged`.
+and nothing will tell you they finished otherwise. `unmanaged` stays on the board as information:
+report it, act on none of it uninvited. What you act on is an `unmanaged` entry with
+`requested: true` — a session that asked to be adopted (§2, §5) — and any pane the operator names
+by id.
 
 ## 2. Adoption
 
-You are usually opened *after* other tabs are already working. Those sessions are builders that
-do not know it yet. Adopt every one of them now — not later, not on request. Also the path for
-"adopt the other tabs".
+A tab you did not launch is a builder that does not know it yet — but you never reach for it
+uninvited. Adopt one only on an explicit request: an incoming `register-builder:` prompt in your
+own pane (§5), an `unmanaged` entry from `$MGR board` with `requested: true`, or the operator
+naming a pane by id. This is also the path for "adopt the other tabs" (§6) — over the requested
+entries, never the whole `unmanaged` list.
 
-For each `unmanaged` entry from `$MGR board`:
+For the requested entry (or the pane the operator named):
 
 | Case | Do |
 |---|---|
+| the request names its own issue (`requested_issue` on the board, or `issue <N>` in the message) | `$MGR adopt <pane_id> <N>` |
 | `issue_guess` is a number | `$MGR adopt <pane_id> <issue_guess>` |
 | operator names the issue | `$MGR adopt <pane_id> <N>` |
 | otherwise | `$MGR adopt <pane_id>` — no N |
@@ -331,6 +337,11 @@ agent on a fumble trigger (builder.md §7) and kept its size, workflow file and 
 
 Trust the report, not the idle state.
 
+A `register-builder: pane <pane_id> [issue <N>]` message arriving in your own pane is not a
+builder report — it is a session asking to be adopted (§2). Do not look up an issue for it and do
+not parse it as `manager-report`. Run `$MGR adopt <pane_id> [N]`, start the background wait for
+that pane exactly as above, and report the mapping to the operator.
+
 ## 6. Operator commands
 
 | Operator says | Do |
@@ -352,14 +363,17 @@ Trust the report, not the idle state.
 | quota status | `$MGR overview` — the block *is* the answer, nothing of your own on top of it. `quota` is your own provider's subscription; `work`/`next` are this repo's own. Name the builders in `quota.stalled` if there are any: the guard is reigniting those, there is nothing to do about them |
 | show the whole queue / what's coming | `$MGR overview --limit 50` |
 | dedupe the issues | Intake (a) over the whole open list |
-| adopt the other tabs | **Adoption** |
+| adopt the other tabs | **Adoption** — over the `unmanaged` entries whose `requested` is `true`; a pane the operator names by id is adopted regardless |
+| register this pane / register pane P | not yours to run — the session runs `$MGR register [N]` itself (the `register-builder` skill); you'll get its `register-builder:` message and answer it per §5 |
 | launch the next one | `$MGR board`, then `$MGR launch` the lowest `ready` number |
 
 ## 7. Rules
 
 - Cap is 3 unless `config`/`MGR_CAP`/`--cap` say otherwise. `awaiting_approval` does **not** count against it;
   `adopting` does. The cap gates `launch` only — **`adopt` never enforces it** and returns
-  `over_cap: true` instead, because refusing to adopt would leave live work unmanaged.
+  `over_cap: true` instead: a requested adoption (§2) is work already in flight, not a launch you
+  get to hold back. Unmanaged work nobody asked you to adopt is the operator's own by default —
+  there is nothing to rescue by sweeping it in, so the absence of a request costs nothing.
 - One issue per builder, one builder per issue. Never two agents on the same issue.
 - The primary checkout is touched only through `gh` and `mgr`. You never write there.
 - Never run the project's build, typecheck or tests. That is the builder's self-review.
@@ -402,6 +416,7 @@ Trust the report, not the idle state.
 | `$MGR launch <N> [--cap N] [--house <anthropic\|openai\|gemini>]` | worktree + tab + omp builder + brief + label + comment; `--house` overlays that house's package for this launch only |
 | `$MGR adopt <pane_id\|tab_id> [N]` | make a live session a builder; without N it self-registers |
 | `$MGR bind <N>` | builder-side only; you never run this |
+| `$MGR register [N]` | session-side only; you never run this — the pre-adopt request an unmanaged session sends the manager (the `register-builder` skill); the manager answers its `register-builder:` message per §5 |
 | `$MGR wait <N\|pane_id> [--no-quota-block]` | block until idle, return the parsed `manager-report`; a rate-limit stall is waited through — the guard reignites the pane — unless `--no-quota-block`, which returns `agent_status: quota-stalled` instead |
 | `$MGR prompt <N> <text…>` | send text to builder `issue-N` |
 | `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue; on a merged report it also writes the execution record to the ledger and an `execution:` comment on the issue, and returns `execution_recorded` |
@@ -448,6 +463,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `overview.timeline.drains_at` | machine-wide: the ETA of the last queued issue of any manager (`last_eta` is the same number) |
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
 | `in_flight[].size` `ready[].size` `blocked[].size` `awaiting_approval[].size` | that issue's size from its `size:` label — `tiny` \| `small` \| `medium` \| `large`, or `null` when it has none (`launch` refuses on `null`) |
+| `unmanaged[].requested` `unmanaged[].requested_at` `unmanaged[].requested_issue` | the pane asked to be adopted via `mgr register` — `true` / ms epoch / the issue number it named, or `null`; cleared once `adopt` runs |
 
 ### Labels
 
