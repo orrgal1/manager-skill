@@ -1,11 +1,15 @@
 # shellcheck shell=bash
-# mgr-lib.sh — shared library sourced by bin/mgr; bin/mgr-guard reaches it the
-# same way (`$(dirname "$0")/mgr-lib.sh`) whenever it needs these. Holds the
-# session-metrics jq behind the execution record `mgr retire` writes.
+# mgr-lib.sh — shared library sourced by both bin/mgr and bin/mgr-guard. Holds
+# the session-metrics jq behind the execution record `mgr retire` writes, and
+# the RATE_RE pattern both scripts key their rate-limit detection off of.
 
 declare -F warn >/dev/null 2>&1 || warn() { printf 'mgr: warning: %s\n' "$*" >&2; }
 
 # ---------------------------------------------------------------- jq programs
+
+# the single rate-limit pattern mgr-guard's stall detection and mgr's
+# session_metrics both test errorMessage against
+RATE_RE='rate.?limit|too many requests|(^|[^0-9])429([^0-9]|$)|resource_exhausted|quota_exhausted|usage.?limit|insufficient_quota|overloaded'
 
 # raw session-jsonl lines on stdin -> the `session` sub-object (minus read/subagents)
 JQ_SESSION_METRICS='
@@ -23,7 +27,7 @@ JQ_SESSION_METRICS='
       total: ($msgs | map(.usage.totalTokens // ((.usage.input // 0) + (.usage.output // 0))) | add // 0)
     },
     cost_usd: (($msgs | map(.usage.cost.total) | map(select(. != null))) as $c
-               | if ($c | length) == 0 then null else ($c | add) end),
+               | if ($c | length) == 0 then null else ($c | add * 1e6 | round / 1e6) end),
     active_ms: (($msgs | map(.duration) | map(select(. != null))) as $d
                 | if ($d | length) == 0 then null else ($d | add) end),
     models: ($msgs | map(.model) | map(select(. != null)) | group_by(.) | map({key: .[0], value: length}) | from_entries),
@@ -32,7 +36,7 @@ JQ_SESSION_METRICS='
     stop_reasons: ($msgs | map(.stopReason) | map(select(. != null)) | group_by(.) | map({key: .[0], value: length}) | from_entries),
     rate_limit_hits: ($msgs
       | map(select(.stopReason == "error"
-          and ((.errorStatus == 429) or ((.errorMessage // "") | test("rate.?limit|429|too many requests"; "i")))))
+          and ((.errorStatus == 429) or ((.errorMessage // "") | test($re; "i")))))
       | length)
   }
 '
@@ -60,7 +64,7 @@ session_metrics() { # session_metrics <session.jsonl> -> session sub-object; nev
     return 0
   fi
 
-  if ! parent=$(jq -Rnc "$JQ_SESSION_METRICS" <"$f" 2>/dev/null); then
+  if ! parent=$(jq -Rnc --arg re "$RATE_RE" "$JQ_SESSION_METRICS" <"$f" 2>/dev/null); then
     warn "session file unreadable: $f"
     printf '%s\n' "$null_shape"
     return 0

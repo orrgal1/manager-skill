@@ -404,7 +404,7 @@ Trust the report, not the idle state.
 | `$MGR bind <N>` | builder-side only; you never run this |
 | `$MGR wait <N\|pane_id> [--no-quota-block]` | block until idle, return the parsed `manager-report`; a rate-limit stall is waited through — the guard reignites the pane — unless `--no-quota-block`, which returns `agent_status: quota-stalled` instead |
 | `$MGR prompt <N> <text…>` | send text to builder `issue-N` |
-| `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue; on a merged report it also records the issue's duration for the overview timeline |
+| `$MGR retire <N> [--close]` | close tab, remove worktree + branch, drop labels, optionally close issue; on a merged report it also writes the execution record to the ledger and an `execution:` comment on the issue, and returns `execution_recorded` |
 | `$MGR guard start [--interval S]` | start the quota-guard daemon; idempotent, shared by all managers |
 | `$MGR guard stop` | stop it — read the Rules before you ever do |
 | `$MGR guard status` | the guard's whole state, machine-wide and unscoped by design — every provider it polled this tick with its limits and burn projection, the registered managers with the board data the guard collects for them (`managers[].backlog`, `backlog_at`, `backlog_error`, `throughput`, `provider`, `house`), the stalled panes with their reignite attempts, and `last_exit_at`/`last_exit_reason` when the daemon is not running. A manager is live while its herdr pane exists — `managers[].pane_alive` is that pane check and is what `live` means; `managers[].seen_at` is only the last time it ran an `mgr` command |

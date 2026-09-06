@@ -379,7 +379,15 @@ case "${1:-}" in
         f="$MGR_TEST_FIX/issue-${3:-}.json"
         [ -f "$f" ] || exit 1
         cat "$f";;
-      edit|comment|close) exit 0;;
+      edit|close) exit 0;;
+      comment)
+        bf=""; prev=""
+        for a in "$@"; do
+          [ "$prev" = "--body-file" ] && bf="$a"
+          prev="$a"
+        done
+        [ -n "$bf" ] && cp "$bf" "$MGR_TEST_FIX/comment-${3:-}.md"
+        exit 0;;
       *) exit 1;;
     esac;;
   pr) case "${2:-}" in
@@ -1550,8 +1558,9 @@ check 'bind number'              7 "$(jq -r '.number' <<<"$out")"
 check 'the launch stamp landed' "7/$pin" \
   "$(jq -r '."7" | "\(.number)/\(.launched_at)"' "$launches")"
 
-# issue 7 goes live only now that bind's own "already live" gate has already
-# passed, so wiring in its builder session here cannot perturb bind itself.
+# issue 7 goes live only now; §10b below binds 7 again with this agent live,
+# which is safe only because the injected pane_id (w9:p2) equals
+# HERDR_PANE_ID, so cmd_bind's already-live gate is a no-op.
 # The PR mergedAt lands 1h after the report comment's own createdAt, so
 # asserting merged_at_source=="pr" can never be satisfied by the comment
 # fallback path by accident.
@@ -1563,9 +1572,9 @@ date -u -r $((pin / 1000 + 7200)) +%Y-%m-%dT%H:%M:%SZ >"$fix/pr-mergedat.txt"
 
 : >"$MGR_TEST_LOG"
 out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>/dev/null); rc=$?
-check 'retire exit'               0 "$rc"
-check 'retire reports the row'  true "$(jq -r '.throughput_appended' <<<"$out")"
-check 'execution recorded'      true "$(jq -r '.execution_recorded' <<<"$out")"
+check 'retire exit #7'               0 "$rc"
+check 'retire reports the row #7'  true "$(jq -r '.throughput_appended' <<<"$out")"
+check 'execution recorded #7'      true "$(jq -r '.execution_recorded' <<<"$out")"
 row=$(jq -sc '.[0]' "$thru")
 assert_jq 'the five original ledger keys, measured from the PR mergedAt' "$row" \
   "{repo,number,launched_at,merged_at,duration_s} == {repo:\"owner/name\",number:7,launched_at:$pin,merged_at:$((pin + 7200000)),duration_s:7200}"
@@ -1596,12 +1605,22 @@ assert_jq 'session.model_changes'                       "$row" '.session.model_c
 assert_jq 'session.resizes'                             "$row" '.session.resizes == 1'
 assert_jq 'session.subagents'                           "$row" \
   '.session.subagents == {count:3,agents:{scout:2,sketch:1},roles:{scout:2,sketch:1},models:{"anthropic/claude-x":3}}'
+assert_jq 'report.delegated_planning'                   "$row" '.report.delegated_planning == "sketch"'
+assert_jq 'session.active_ms'                           "$row" '.session.active_ms == 600'
 
 comment_line=$(grep -n '^gh issue comment 7 --body-file' "$MGR_TEST_LOG" | head -1 | cut -d: -f1)
 label_line=$(grep -n '^gh issue edit 7 --remove-label' "$MGR_TEST_LOG" | head -1 | cut -d: -f1)
 check 'the execution comment posted'      1 "$([ -n "$comment_line" ] && printf 1 || printf 0)"
 check 'posted before the labels came off' true \
   "$([ -n "$comment_line" ] && [ -n "$label_line" ] && [ "$comment_line" -lt "$label_line" ] && printf true || printf false)"
+
+comment7="$MGR_TEST_FIX/comment-7.md"
+check 'comment-7 header line' \
+  'execution: #7 · small→medium · 7200s · 3 turns · 678 tokens · $0.6 · review sweep/2 fixed · merged_at from pr' \
+  "$(sed -n '1p' "$comment7")"
+assert_jq 'comment-7 fenced json equals the ledger row' \
+  "$(sed -n '/^```json$/,/^```$/p' "$comment7" | sed '1d;$d' | jq -Sc .)" \
+  ". == $(jq -Sc . <<<"$row")"
 
 # a builder that never reported merged: the stamp is dropped, no row is written
 HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
@@ -1611,6 +1630,12 @@ out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 49 2>/dev/null)
 check 'no report, no row'       false "$(jq -r '.throughput_appended' <<<"$out")"
 check 'the stamp is dropped anyway' '{}' "$(jq -c '.' "$launches")"
 check 'the throughput file is untouched' 1 "$(jq -s 'length' "$thru")"
+
+# a second retire of the same landing (same number and sha) is a no-op
+out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>/dev/null)
+check 'a second retire appends nothing #7' false "$(jq -r '.throughput_appended' <<<"$out")"
+check 'a second retire posts nothing #7'   false "$(jq -r '.execution_recorded' <<<"$out")"
+check 'still one row #7'                   1     "$(jq -s 'length' "$thru")"
 
 printf '\n# 10a. an adopted builder gets a record too: no stamp, no pr, unreadable session\n'
 rm -f "$fix/pr-mergedat.txt"
@@ -1622,9 +1647,9 @@ jq --arg cwd "$repo" --arg missing "$tmp/session-9-missing.jsonl" \
      agent:"omp",agent_status:"blocked",agent_session:{value:$missing}}]' \
   "$fix/agents.json" >"$fix/agents.json.next" && mv "$fix/agents.json.next" "$fix/agents.json"
 out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 9 2>/dev/null); rc=$?
-check 'retire exit'               0 "$rc"
-check 'retire reports the row'  true "$(jq -r '.throughput_appended' <<<"$out")"
-check 'execution recorded'      true "$(jq -r '.execution_recorded' <<<"$out")"
+check 'retire exit #9'               0 "$rc"
+check 'retire reports the row #9'  true "$(jq -r '.throughput_appended' <<<"$out")"
+check 'execution recorded #9'      true "$(jq -r '.execution_recorded' <<<"$out")"
 row9=$(jq -sc '.[-1]' "$thru")
 assert_jq 'no launch stamp -> launched_at is null'            "$row9" '.launched_at == null'
 assert_jq 'no launch stamp -> duration_s is null'             "$row9" '.duration_s == null'
@@ -1636,6 +1661,14 @@ assert_jq 'the report still comes through for an adoptee'     "$row9" '.report.r
 assert_jq 'unreadable session: read is false'                 "$row9" '.session.read == false'
 assert_jq 'unreadable session: turns is null'                 "$row9" '.session.turns == null'
 assert_jq 'unreadable session: subagent count is null'        "$row9" '.session.subagents.count == null'
+
+comment9="$MGR_TEST_FIX/comment-9.md"
+check 'comment-9 header line' \
+  'execution: #9 · small→small · ?s · ? turns · ? tokens · $? · review none/skipped · merged_at from comment' \
+  "$(sed -n '1p' "$comment9")"
+assert_jq 'comment-9 fenced json equals the ledger row' \
+  "$(sed -n '/^```json$/,/^```$/p' "$comment9" | sed '1d;$d' | jq -Sc .)" \
+  ". == $(jq -Sc . <<<"$row9")"
 
 # ---------------------------- 10b. two builders binding at the same time
 

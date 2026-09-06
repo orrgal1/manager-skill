@@ -345,7 +345,9 @@ dataset) and posts the same record as an `execution:` comment on the issue (one 
 a fenced JSON block); only `duration_s` is read back by the guard's projections. Under 3 rows for
 a repo it falls back to the machine-wide median over every repo, and with no history anywhere to
 `MGR_DEFAULT_TASK_S` (2700 s, 45 min). Both fallbacks are flagged `estimated` and render as `~` —
-durations are a heuristic, and the block says so instead of hiding it.
+durations are a heuristic, and the block says so instead of hiding it. A second `mgr retire N`
+on the same landing (same `number` and `sha`) appends nothing to the ledger and posts no
+additional `execution:` comment — the record is per landing, not per call.
 
 From there, per manager: an in-flight issue is due at
 `launched_at + max(median, elapsed + ¼ median)`, so a builder that has already outrun the median is
@@ -422,14 +424,14 @@ operator's only pace dial.
 | `session.turns` | int | count of `.type=="message" and .message.role=="assistant"` | count | yes |
 | `session.tokens.input/output/cache_read/cache_write` | int | sums of `.message.usage.{input,output,cacheRead,cacheWrite}` (`// 0` per message) | tokens | yes |
 | `session.tokens.total` | int | sum of `.message.usage.totalTokens`, per-message fallback `input+output` | tokens | yes |
-| `session.cost_usd` | number | sum of `.message.usage.cost.total`; **null when no message carries one** | USD | yes |
+| `session.cost_usd` | number | sum of `.message.usage.cost.total`, rounded to 6 decimals; **null when no message carries one** | USD | yes |
 | `session.active_ms` | int | sum of `.message.duration`; null when none | ms | yes |
 | `session.models` | object{string:int} | histogram of `.message.model` (assistant messages) | count | yes |
 | `session.model_changes` | int | count of `.type=="model_change"` | count | yes |
 | `session.resizes` | int | count of `.type=="title_change" and .trigger=="replan"` | count | yes |
 | `session.stop_reasons` | object{string:int} | histogram of `.message.stopReason` | count | yes |
-| `session.rate_limit_hits` | int | count of `stopReason=="error" and (errorStatus==429 or errorMessage matches /rate.?limit\|429\|too many requests/i)` | count | yes |
-| `session.subagents.count` | int | number of `<stem>/*.jsonl` files with a session_init | count | yes |
+| `session.rate_limit_hits` | int | count of `stopReason=="error"` with `errorStatus==429` or an `errorMessage` matching the guard's `RATE_RE` (shared via `bin/mgr-lib.sh`) | count | yes |
+| `session.subagents.count` | int | number of `session_init` records under `<stem>/` | count | yes |
 | `session.subagents.agents` | object | histogram of `session_init.agent` | count | yes |
 | `session.subagents.roles` | object | histogram of `session_init.modelRole` | count | yes |
 | `session.subagents.models` | object | histogram of `session_init.resolvedModel` | count | yes |

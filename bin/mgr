@@ -521,6 +521,10 @@ launch_file() { # launch_file <owner/repo>
   printf '%s/launches/%s.json' "$guard_state_dir" "$(repo_key "$1")"
 }
 
+throughput_file() { # throughput_file <owner/repo> -> that repo's execution ledger
+  printf '%s/throughput/%s.jsonl' "$guard_state_dir" "$(repo_key "$1")"
+}
+
 mtime_of() { # mtime_of <path> -> epoch seconds, 0 when unknown
   # GNU stat spells mtime -c %Y; BSD/macOS stat spells it -f %m
   if stat --version >/dev/null 2>&1; then
@@ -596,10 +600,19 @@ append_throughput() { # append_throughput <N> <record-json> — record is alread
   local rp f
   rp=$(own_repo)
   [ -n "$rp" ] || { warn "cannot append the throughput row for #$1 (no repo)"; return 1; }
-  f="$guard_state_dir/throughput/$(repo_key "$rp").jsonl"
+  f=$(throughput_file "$rp")
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
   printf '%s\n' "$2" >>"$f" \
     || { warn "could not append the throughput row for #$1 to $f"; return 1; }
+}
+
+# A retire that races a gh outage and gets re-run must not double the ledger
+# or double-comment the issue: the same (number, sha) landing is one row.
+already_recorded() { # already_recorded <repo> <N> <sha> -> success iff that row is already on the ledger
+  local f; f=$(throughput_file "$1")
+  [ -f "$f" ] || return 1
+  jq -e --argjson n "$2" --arg sha "$3" \
+    'select(.number == $n and .sha == $sha)' "$f" >/dev/null 2>&1
 }
 
 # `gh pr view --json mergedAt` is the actual merge instant; report_merged_at
@@ -610,7 +623,7 @@ pr_merged_at() { # pr_merged_at <pr-url> -> ms ("" when empty/unparseable)
   [ -n "$pr" ] || { printf ''; return; }
   t=$(gh pr view "$pr" --json mergedAt -q .mergedAt 2>/dev/null) || t=""
   [ -n "$t" ] || { printf ''; return; }
-  ms=$(jq -rn --arg t "$t" '$t | fromdateiso8601 * 1000' 2>/dev/null) || ms=""
+  ms=$(jq -rn --arg t "$t" '$t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 * 1000' 2>/dev/null) || ms=""
   case "$ms" in ''|*[!0-9]*) printf '';; *) printf '%s' "$ms";; esac
 }
 
@@ -1910,7 +1923,8 @@ cmd_retire() {
   # plus the mechanical facts only its session JSONL knows (turns, tokens,
   # cost, subagent fan-out). One row on the throughput ledger, one
   # human-readable comment on the issue — both posted before the labels go,
-  # and never fatal: a retire that races a `gh` outage still records what it can.
+  # and never fatal: a retire that races a `gh` outage still records what it
+  # can and always reaches the label removal, close and JSON return below.
   local report launched_at merged_at merged_at_source size metrics record \
     tp_appended=false execution_recorded=false
   report=$(parse_report "$n" 2>/dev/null || printf 'null')
@@ -1924,50 +1938,61 @@ cmd_retire() {
       merged_at_source="comment"
       warn "merged_at for #$n from the report comment (gh pr view failed or no pr=)"
     fi
-    metrics=$(session_metrics "$sess")
-    size=$(gh issue view "$n" --json labels 2>/dev/null \
-      | jq -r '[.labels[]?.name | select(startswith("size:")) | ltrimstr("size:")] | first // empty' 2>/dev/null \
-      || printf '')
-    local rp; rp=$(own_repo)
-    record=$(jq -nc \
-      --arg repo "$rp" --argjson n "$n" --arg a "$launched_at" --argjson b "$merged_at" \
-      --arg src "$merged_at_source" --arg size "$size" --argjson report "$report" \
-      --argjson session "$metrics" '
-      ($a | if . == "" then null else tonumber end) as $launched |
-      {
-        repo: $repo, number: $n, launched_at: $launched, merged_at: $b,
-        duration_s: (if $launched == null then null
-                     else ([0, (($b - $launched) / 1000 | round)] | max) end),
-        schema: 1, merged_at_source: $src,
-        size: (if $size == "" then null else $size end),
-        pr: ($report.pr // null), sha: ($report.sha // null),
-        report: {
-          review: ($report.review // null),
-          review_verdict: ($report.review_verdict // null),
-          checks: ($report.checks // null | if . == null then null
-                   else (split(",") | map(select(. != ""))) end),
-          escalations: ($report.escalations // null | if . == null then null
-                        else (tonumber? // null) end),
-          delegated_planning: ($report.delegated_planning // null),
-          pre_existing_red: ($report.pre_existing_red // null | if . == null then null
-                             else (tonumber? // null) end),
-          final_size: ($report.final_size // null)
-        },
-        session: $session
-      }')
-    append_throughput "$n" "$record" && tp_appended=true
-    local cf hdr
-    cf=$(mktemp)
-    hdr=$(jq -r '
-      def q: if . == null then "?" else (. | tostring) end;
-      "execution: #\(.number) · \(.size|q)→\(.report.final_size|q) · \(.duration_s|q)s · " +
-      "\(.session.turns|q) turns · \(.session.tokens.total|q) tokens · $\(.session.cost_usd|q) · " +
-      "review \(.report.review|q)/\(.report.review_verdict|q) · merged_at from \(.merged_at_source)"
-      ' <<<"$record")
-    { printf '%s\n\n```json\n' "$hdr"; jq . <<<"$record"; printf '```\n'; } >"$cf"
-    gh issue comment "$n" --body-file "$cf" >/dev/null 2>&1 && execution_recorded=true \
-      || warn "could not post the execution record on #$n"
-    rm -f "$cf"
+
+    local rp sha; rp=$(own_repo); sha=$(jq -r '.sha // ""' <<<"$report")
+    if [ -z "$rp" ]; then
+      warn "cannot record the execution for #$n (no repo)"
+    elif [ -n "$sha" ] && already_recorded "$rp" "$n" "$sha"; then
+      warn "execution record for #$n (sha $sha) is already on the ledger; not recorded again"
+    else
+      metrics=$(session_metrics "$sess")
+      size=$(gh issue view "$n" --json labels 2>/dev/null \
+        | jq -r '[.labels[]?.name | select(startswith("size:")) | ltrimstr("size:")] | first // empty' 2>/dev/null \
+        || printf '')
+      if record=$(jq -nc \
+        --arg repo "$rp" --argjson n "$n" --arg a "$launched_at" --argjson b "$merged_at" \
+        --arg src "$merged_at_source" --arg size "$size" --argjson report "$report" \
+        --argjson session "$metrics" '
+        ($a | tonumber? // null) as $launched |
+        {
+          repo: $repo, number: $n, launched_at: $launched, merged_at: $b,
+          duration_s: (if $launched == null then null
+                       else ([0, (($b - $launched) / 1000 | round)] | max) end),
+          schema: 1, merged_at_source: $src,
+          size: (if $size == "" then null else $size end),
+          pr: ($report.pr // null), sha: ($report.sha // null),
+          report: {
+            review: ($report.review // null),
+            review_verdict: ($report.review_verdict // null),
+            checks: ($report.checks // null | if . == null then null
+                     else (split(",") | map(select(. != ""))) end),
+            escalations: ($report.escalations // null | if . == null then null
+                          else (tonumber? // null) end),
+            delegated_planning: ($report.delegated_planning // null),
+            pre_existing_red: ($report.pre_existing_red // null | if . == null then null
+                               else (tonumber? // null) end),
+            final_size: ($report.final_size // null)
+          },
+          session: $session
+        }' 2>/dev/null); then
+        append_throughput "$n" "$record" && tp_appended=true
+        local cf hdr
+        hdr=$(jq -r '
+          def q: if . == null then "?" else (. | tostring) end;
+          "execution: #\(.number) · \(.size|q)→\(.report.final_size|q) · \(.duration_s|q)s · " +
+          "\(.session.turns|q) turns · \(.session.tokens.total|q) tokens · $\(.session.cost_usd|q) · " +
+          "review \(.report.review|q)/\(.report.review_verdict|q) · merged_at from \(.merged_at_source)"
+          ' <<<"$record" 2>/dev/null) || hdr="execution: #$n"
+        if cf=$(mktemp 2>/dev/null); then
+          { printf '%s\n\n```json\n' "$hdr"; jq . <<<"$record"; printf '```\n'; } >"$cf" \
+            && gh issue comment "$n" --body-file "$cf" >/dev/null 2>&1 && execution_recorded=true
+          rm -f "$cf"
+        fi
+        [ "$execution_recorded" = true ] || warn "could not post the execution record on #$n"
+      else
+        warn "could not build the execution record for #$n"
+      fi
+    fi
   fi
 
   gh issue edit "$n" --remove-label 'mgr:in-flight' --remove-label 'mgr:awaiting-approval' >/dev/null 2>&1 \

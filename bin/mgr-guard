@@ -27,6 +27,13 @@ command -v jq >/dev/null 2>&1 || { printf 'mgr-guard: missing dependency: jq\n' 
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
+# RATE_RE and session_metrics live in the sourced lib; mgr reaches it the
+# same way, so both scripts stay in sync on what counts as a rate-limit stall.
+MGR_LIB="$(dirname "$SELF")/mgr-lib.sh"
+[ -f "$MGR_LIB" ] || die 1 "mgr-lib.sh not found at $MGR_LIB"
+# shellcheck source=bin/mgr-lib.sh
+. "$MGR_LIB"
+
 STATE_DIR="${MGR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mgr-guard}"
 PIDFILE="$STATE_DIR/guard.pid"
 LOGFILE="$STATE_DIR/guard.log"
@@ -129,8 +136,6 @@ read_exit() { # read_exit -> {at,reason}, nulls when the file is absent or junk
 }
 
 # ---------------------------------------------------------------- jq programs
-
-RATE_RE='rate.?limit|too many requests|(^|[^0-9])429([^0-9]|$)|resource_exhausted|quota_exhausted|usage.?limit|insufficient_quota|overloaded'
 
 # raw session lines on stdin -> {provider,model,stall}
 JQ_SESSION_FACTS='
