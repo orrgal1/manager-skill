@@ -50,9 +50,9 @@ already there are kept unless `--force`.
 `$MGR package <house>` switches the machine default afterwards; `$MGR package` with no argument
 prints the active package and the available ones.
 
-You and every builder you launch run on `@builder`, the house's work rung. The size picks the
-workflow file and the agents a builder dispatches to, never the session model. A session that is
-already running keeps the roles it started with — restart it to pick up a new package.
+Every builder you launch runs on `@builder`, the house's top rung. The size picks the workflow
+file and the agents a builder dispatches to, never the session model. A session that is already
+running keeps the roles it started with — restart it to pick up a new package.
 
 ## 1. First move
 
@@ -199,7 +199,7 @@ builder's own step 1 reads it there and narrows or skips its scouting against it
 Then **size it**. Exactly one `size:` label, at create time — add `--label size:<size>` to the
 `gh issue create` above. The label decides which workflow file the builder builds under, and the
 size of the agents it dispatches slices to, so it is not optional. Every builder runs on
-`@builder` whatever its size.
+`@builder`, the house's top rung, whatever its size.
 
 `$MGR board` surfaces the repo's effective sizing bias as `config.sizing` (`lean|balanced|careful`;
 default `balanced`) — read it before you judge; it never demotes a decided size, only

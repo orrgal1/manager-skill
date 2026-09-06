@@ -1,12 +1,14 @@
 # Agent package: Anthropic subscription. Apply with: mgr package anthropic
 # Rungs: Fable (top) > Opus (work) > Sonnet (mid) > Haiku (bottom, no Haiku 5 id
 # exists here, so the bottom rung collapses onto Sonnet at low).
-# Top rung: plan (deep, for large builders), review (the reviewer and security-reviewer
-# agents, for the surfaces builder.md §7 sends to the top rung), and crux (the fumble
-# target: a fresh executor for a step a builder has failed);
+# Top rung: builder (every builder session — `mgr launch` passes `--model @builder`), plan
+# (deep, for large builders), review (the reviewer and security-reviewer agents, for the
+# surfaces builder.md §7 sends to the top rung), and crux (the fumble target: a fresh
+# executor for a step a builder has failed — the same rung as the builder, so crux buys a
+# fresh context, not a bigger model);
 # sketch (light, for medium builders and small planning triggers) and sweep (the reviewer
-# for everything §7 sends to the work rung) sit with default/builder/large/medium on the
-# work rung; small and smol (scouts feed the plan) the mid rung; tiny (omp's own role) and
+# for everything §7 sends to the work rung) sit with default/large/medium on the work
+# rung; small and smol (scouts feed the plan) the mid rung; tiny (omp's own role) and
 # commit the bottom rung at low.
 # Effort: high for everything that writes or decides code, medium for the roles
 # that decide nothing, low for the bottom rung. high is the ceiling, never a tier above it.
@@ -20,7 +22,7 @@ modelRoles:
   crux: anthropic/claude-fable-5-1:high
   large: anthropic/claude-opus-5:high
   medium: anthropic/claude-opus-5:high
-  builder: anthropic/claude-opus-5:high
+  builder: anthropic/claude-fable-5-1:high
   sketch: anthropic/claude-opus-5:high
   sweep: anthropic/claude-opus-5:high
   small: anthropic/claude-sonnet-5:high

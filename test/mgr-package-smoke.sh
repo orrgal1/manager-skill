@@ -165,7 +165,7 @@ check 'omp was handed review' openai-codex/gpt-6-astra:high \
   "$(jq -r '.review' <<<"$(roles_set)")"
 check 'omp was handed the whole role set' 21 "$(jq -r 'length' <<<"$(roles_set)")"
 check 'config.yml modelRoles.review' openai-codex/gpt-6-astra:high "$(cfg_role review)"
-check 'config.yml modelRoles.builder' openai-codex/gpt-5.6-sol:high "$(cfg_role builder)"
+check 'config.yml modelRoles.builder is the top rung' openai-codex/gpt-6-astra:high "$(cfg_role builder)"
 check 'config.yml modelRoles.sketch is the work rung' openai-codex/gpt-5.6-sol:high "$(cfg_role sketch)"
 check 'config.yml modelRoles.sweep is the work rung, below review' openai-codex/gpt-5.6-sol:high \
   "$(cfg_role sweep)"

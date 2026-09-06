@@ -1,11 +1,13 @@
 # Agent package: OpenAI subscription. Apply with: mgr package openai
 # Rungs: Astra (top) > Sol (work) > Terra (mid) > Luna (bottom).
-# Top rung: plan (deep, for large builders), review (the reviewer and security-reviewer
-# agents, for the surfaces builder.md §7 sends to the top rung), and crux (the fumble
-# target: a fresh executor for a step a builder has failed);
+# Top rung: builder (every builder session — `mgr launch` passes `--model @builder`), plan
+# (deep, for large builders), review (the reviewer and security-reviewer agents, for the
+# surfaces builder.md §7 sends to the top rung), and crux (the fumble target: a fresh
+# executor for a step a builder has failed — the same rung as the builder, so crux buys a
+# fresh context, not a bigger model);
 # sketch (light, for medium builders and small planning triggers) and sweep (the reviewer
-# for everything §7 sends to the work rung) sit with default/builder/large/medium on the
-# work rung; small and smol (scouts feed the plan) the mid rung; tiny (omp's own role) and
+# for everything §7 sends to the work rung) sit with default/large/medium on the work
+# rung; small and smol (scouts feed the plan) the mid rung; tiny (omp's own role) and
 # commit the bottom rung at low.
 # Effort: high for everything that writes or decides code, medium for the roles
 # that decide nothing, low for the bottom rung. high is the ceiling, never a tier above it.
@@ -18,7 +20,7 @@ modelRoles:
   crux: openai-codex/gpt-6-astra:high
   large: openai-codex/gpt-5.6-sol:high
   medium: openai-codex/gpt-5.6-sol:high
-  builder: openai-codex/gpt-5.6-sol:high
+  builder: openai-codex/gpt-6-astra:high
   sketch: openai-codex/gpt-5.6-sol:high
   sweep: openai-codex/gpt-5.6-sol:high
   small: openai-codex/gpt-5.6-terra:high
