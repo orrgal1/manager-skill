@@ -562,7 +562,7 @@ launch_unlock() { # launch_unlock <launches-file>
   rmdir "${1%.json}.lock" 2>/dev/null || true
 }
 
-record_launch() { # record_launch <N> — stamp the moment a builder took issue N
+record_launch() { # record_launch <N> [size] — stamp the moment a builder took issue N, and the size it was briefed with
   local rp f cur held=false
   rp=$(own_repo)
   [ -n "$rp" ] || { warn "cannot record launched_at for #$1 (no repo)"; return 0; }
@@ -572,14 +572,15 @@ record_launch() { # record_launch <N> — stamp the moment a builder took issue 
   cur=""
   [ -f "$f" ] && cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
   [ -n "$cur" ] || cur='{}'
-  jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" \
-    '$cur + {($n): {number: ($n | tonumber), launched_at: $at}}' \
+  jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" --arg size "${2:-}" \
+    '$cur + {($n): {number: ($n | tonumber), launched_at: $at,
+                    launched_size: (if $size == "" then null else $size end)}}' \
     | atomic_write "$f" || warn "could not record launched_at for #$1 in $f"
   if $held; then launch_unlock "$f"; fi
 }
 
-take_launch() { # take_launch <N> -> that stamp ("" when unknown); drops the entry
-  local rp f cur at="" rest held=false
+take_launch() { # take_launch <N> -> that stamp as JSON ("" when unknown); drops the entry
+  local rp f cur stamp="" rest held=false
   rp=$(own_repo)
   [ -n "$rp" ] || return 0
   f=$(launch_file "$rp")
@@ -587,13 +588,13 @@ take_launch() { # take_launch <N> -> that stamp ("" when unknown); drops the ent
   launch_lock "$f" && held=true
   cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || cur=""
   if [ -n "$cur" ]; then
-    at=$(jq -r --arg n "$1" '(.[$n].launched_at // empty) | tostring' <<<"$cur")
+    stamp=$(jq -c --arg n "$1" '.[$n] // empty | select(type == "object")' <<<"$cur")
     rest=$(jq -c --arg n "$1" 'del(.[$n])' <<<"$cur") || rest=""
     [ -n "$rest" ] && { printf '%s' "$rest" | atomic_write "$f" \
       || warn "could not drop the launch stamp of #$1 from $f"; }
   fi
   if $held; then launch_unlock "$f"; fi
-  printf '%s' "$at"
+  printf '%s' "$stamp"
 }
 
 append_throughput() { # append_throughput <N> <record-json> — record is already compact JSON
@@ -1546,7 +1547,7 @@ cmd_launch() {
 
   # the builder is live and the issue is labelled: from here on retire can
   # measure how long it took
-  record_launch "$n"
+  record_launch "$n" "$size"
 
   jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
     --arg agent "issue-$n" --arg tab "$tab_id" --arg pane "$pane_id" \
@@ -1643,7 +1644,7 @@ cmd_adopt() {
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
-    record_launch "$n"
+    record_launch "$n" "$size"
 
     jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
       --arg agent "issue-$n" --arg tab "$tab" --arg pane "$pane" \
@@ -1716,7 +1717,12 @@ cmd_bind() {
   gh issue comment "$n" --body "manager: bound · tab $tab · agent issue-$n · cwd $cwd · branch $br_cmt · policy $policy" >/dev/null \
     || warn "gh issue comment #$n failed"
 
-  record_launch "$n"
+  # the size the issue carries as it is taken — the self-registering session
+  # labels it before binding; no usable label stamps null, never a guess
+  local size
+  size=$(size_of "$ij") || size=""
+  size_valid "$size" || size=""
+  record_launch "$n" "$size"
 
   jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
     --arg agent "issue-$n" --arg tab "$tab" --arg pane "$pane" \
@@ -1925,10 +1931,12 @@ cmd_retire() {
   # human-readable comment on the issue — both posted before the labels go,
   # and never fatal: a retire that races a `gh` outage still records what it
   # can and always reaches the label removal, close and JSON return below.
-  local report launched_at merged_at merged_at_source size metrics record \
+  local report stamp launched_at launched_size merged_at merged_at_source size metrics record \
     tp_appended=false execution_recorded=false
   report=$(parse_report "$n" 2>/dev/null || printf 'null')
-  launched_at=$(take_launch "$n")
+  stamp=$(take_launch "$n")
+  launched_at=$(jq -r '(.launched_at // empty) | tostring' <<<"${stamp:-null}" 2>/dev/null || printf '')
+  launched_size=$(jq -r '.launched_size // empty' <<<"${stamp:-null}" 2>/dev/null || printf '')
   if [ "$(jq -r '.status // ""' <<<"$report")" = merged ]; then
     local pr; pr=$(jq -r '.pr // ""' <<<"$report")
     merged_at=$(pr_merged_at "$pr")
@@ -1951,8 +1959,8 @@ cmd_retire() {
         || printf '')
       if record=$(jq -nc \
         --arg repo "$rp" --argjson n "$n" --arg a "$launched_at" --argjson b "$merged_at" \
-        --arg src "$merged_at_source" --arg size "$size" --argjson report "$report" \
-        --argjson session "$metrics" '
+        --arg src "$merged_at_source" --arg size "$size" --arg ls "$launched_size" \
+        --argjson report "$report" --argjson session "$metrics" '
         ($a | tonumber? // null) as $launched |
         {
           repo: $repo, number: $n, launched_at: $launched, merged_at: $b,
@@ -1960,6 +1968,7 @@ cmd_retire() {
                        else ([0, (($b - $launched) / 1000 | round)] | max) end),
           schema: 1, merged_at_source: $src,
           size: (if $size == "" then null else $size end),
+          launched_size: (if $ls == "" then null else $ls end),
           pr: ($report.pr // null), sha: ($report.sha // null),
           report: {
             review: ($report.review // null),
@@ -1979,7 +1988,7 @@ cmd_retire() {
         local cf hdr
         hdr=$(jq -r '
           def q: if . == null then "?" else (. | tostring) end;
-          "execution: #\(.number) · \(.size|q)→\(.report.final_size|q) · \(.duration_s|q)s · " +
+          "execution: #\(.number) · \(.launched_size|q)→\(.report.final_size|q) · \(.duration_s|q)s · " +
           "\(.session.turns|q) turns · \(.session.tokens.total|q) tokens · $\(.session.cost_usd|q) · " +
           "review \(.report.review|q)/\(.report.review_verdict|q) · merged_at from \(.merged_at_source)"
           ' <<<"$record" 2>/dev/null) || hdr="execution: #$n"

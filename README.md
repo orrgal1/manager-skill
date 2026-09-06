@@ -411,6 +411,7 @@ operator's only pace dial.
 | `schema` | int | constant `1` | — | no |
 | `merged_at_source` | `"pr"` \| `"comment"` | mgr | — | no |
 | `size` | string | `size:` label at retire (`gh issue view <N> --json labels`, jq locally, no `-q`) | — | yes |
+| `launched_size` | string | launch stamp (the `size:` label as `launch`/`adopt`/`bind` took the issue) | — | **yes** (no stamp, or none carried) |
 | `pr` | string | report `pr=` | — | yes |
 | `sha` | string | report `sha=` | — | yes |
 | `report.review` | string | report `review=` (`reviewer`\|`sweep`\|`none`) | — | yes |

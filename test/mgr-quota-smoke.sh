@@ -1555,8 +1555,14 @@ out=$(HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
   "$MGR" bind 7 2>/dev/null); rc=$?
 check 'bind exit'                 0 "$rc"
 check 'bind number'              7 "$(jq -r '.number' <<<"$out")"
-check 'the launch stamp landed' "7/$pin" \
-  "$(jq -r '."7" | "\(.number)/\(.launched_at)"' "$launches")"
+check 'the launch stamp landed' "7/$pin/small" \
+  "$(jq -r '."7" | "\(.number)/\(.launched_at)/\(.launched_size)"' "$launches")"
+
+# issue 7 is resized after launch: the label at retire reads medium, and the
+# record must keep the small it was launched as beside it
+cat >"$fix/issue-7.json" <<'EOF'
+{"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:medium"}],"body":""}
+EOF
 
 # issue 7 goes live only now; §10b below binds 7 again with this agent live,
 # which is safe only because the injected pane_id (w9:p2) equals
@@ -1583,7 +1589,8 @@ check 'the stamp was consumed'   '{}' "$(jq -c '.' "$launches")"
 
 assert_jq 'merged_at came from the pr, not the comment' "$row" '.merged_at_source == "pr"'
 assert_jq 'schema is 1'                                 "$row" '.schema == 1'
-assert_jq 'size from the size: label'                   "$row" '.size == "small"'
+assert_jq 'size from the size: label at retire'         "$row" '.size == "medium"'
+assert_jq 'launched_size from the launch stamp'         "$row" '.launched_size == "small"'
 assert_jq 'pr from the report'                          "$row" '.pr == "https://github.com/owner/name/pull/70"'
 assert_jq 'sha from the report'                         "$row" '.sha == "abc"'
 assert_jq 'report.review'                               "$row" '.report.review == "sweep"'
@@ -1625,7 +1632,8 @@ assert_jq 'comment-7 fenced json equals the ledger row' \
 # a builder that never reported merged: the stamp is dropped, no row is written
 HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
   "$MGR" bind 49 >/dev/null 2>&1
-check 'the stamp for #49 landed' "$pin" "$(jq -r '."49".launched_at' "$launches")"
+check 'the stamp for #49 landed' "$pin/medium" \
+  "$(jq -r '."49" | "\(.launched_at)/\(.launched_size)"' "$launches")"
 out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 49 2>/dev/null)
 check 'no report, no row'       false "$(jq -r '.throughput_appended' <<<"$out")"
 check 'the stamp is dropped anyway' '{}' "$(jq -c '.' "$launches")"
@@ -1652,6 +1660,7 @@ check 'retire reports the row #9'  true "$(jq -r '.throughput_appended' <<<"$out
 check 'execution recorded #9'      true "$(jq -r '.execution_recorded' <<<"$out")"
 row9=$(jq -sc '.[-1]' "$thru")
 assert_jq 'no launch stamp -> launched_at is null'            "$row9" '.launched_at == null'
+assert_jq 'no launch stamp -> launched_size is null'          "$row9" '.launched_size == null'
 assert_jq 'no launch stamp -> duration_s is null'             "$row9" '.duration_s == null'
 assert_jq 'no pr reading -> merged_at came from the comment'  "$row9" '.merged_at_source == "comment"'
 assert_jq 'the report still comes through for an adoptee'     "$row9" '.report.review == "none"'
@@ -1664,7 +1673,7 @@ assert_jq 'unreadable session: subagent count is null'        "$row9" '.session.
 
 comment9="$MGR_TEST_FIX/comment-9.md"
 check 'comment-9 header line' \
-  'execution: #9 · small→small · ?s · ? turns · ? tokens · $? · review none/skipped · merged_at from comment' \
+  'execution: #9 · ?→small · ?s · ? turns · ? tokens · $? · review none/skipped · merged_at from comment' \
   "$(sed -n '1p' "$comment9")"
 assert_jq 'comment-9 fenced json equals the ledger row' \
   "$(sed -n '/^```json$/,/^```$/p' "$comment9" | sed '1d;$d' | jq -Sc .)" \
