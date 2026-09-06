@@ -525,6 +525,63 @@ throughput_file() { # throughput_file <owner/repo> -> that repo's execution ledg
   printf '%s/throughput/%s.jsonl' "$guard_state_dir" "$(repo_key "$1")"
 }
 
+# ---- registration requests
+#
+# A session that wants to be adopted asks first: `mgr register` stamps this
+# per-workspace ledger, keyed by pane_id, then prompts the manager tab. `mgr
+# adopt` clears the pane's entry the moment it renames the agent; a refused
+# adopt leaves the request in place so the next `mgr board`/adopt still sees
+# it. Same posture as the launch ledger above: nothing here is worth failing
+# a command over.
+
+request_file() { # request_file -> this workspace's registration-request ledger
+  printf '%s/requests/ws-%s.json' "$guard_state_dir" "${HERDR_WORKSPACE_ID:-}"
+}
+
+record_request() { # record_request <pane_id> <tab_id> <agent|""> <N|"">
+  local pane="$1" tab="$2" agent="$3" n="$4" f cur held=false
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || { warn "cannot record a registration request for $pane (no workspace)"; return 0; }
+  f=$(request_file)
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  launch_lock "$f" && held=true
+  cur=""
+  [ -f "$f" ] && cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
+  [ -n "$cur" ] || cur='{}'
+  jq -nc --argjson cur "$cur" --arg p "$pane" --arg t "$tab" --arg a "$agent" --arg n "$n" --argjson at "$(now_ms)" \
+    '$cur + {($p): {pane_id: $p, tab_id: $t,
+                     agent: (if $a == "" then null else $a end),
+                     issue: (if $n == "" then null else ($n | tonumber) end),
+                     requested_at: $at}}' \
+    | atomic_write "$f" || warn "could not record the registration request for $pane in $f"
+  if $held; then launch_unlock "$f"; fi
+}
+
+take_request() { # take_request <pane_id> -> that request as JSON ("" when unknown); drops the entry
+  local pane="$1" f cur entry="" rest held=false
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || return 0
+  f=$(request_file)
+  [ -f "$f" ] || return 0
+  launch_lock "$f" && held=true
+  cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || cur=""
+  if [ -n "$cur" ]; then
+    entry=$(jq -c --arg p "$pane" '.[$p] // empty | select(type == "object")' <<<"$cur")
+    rest=$(jq -c --arg p "$pane" 'del(.[$p])' <<<"$cur") || rest=""
+    [ -n "$rest" ] && { printf '%s' "$rest" | atomic_write "$f" \
+      || warn "could not drop the registration request for $pane from $f"; }
+  fi
+  if $held; then launch_unlock "$f"; fi
+  printf '%s' "$entry"
+}
+
+requests_json() { # requests_json -> the whole per-workspace request map ({} when none)
+  local f out
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || { printf '{}'; return; }
+  f=$(request_file)
+  [ -f "$f" ] || { printf '{}'; return; }
+  out=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
+  [ -n "$out" ] && printf '%s' "$out" || printf '{}'
+}
+
 mtime_of() { # mtime_of <path> -> epoch seconds, 0 when unknown
   # GNU stat spells mtime -c %Y; BSD/macOS stat spells it -f %m
   if stat --version >/dev/null 2>&1; then
@@ -961,13 +1018,14 @@ cmd_board() {
   # primary is resolved (and cached) here for the same reason: the operator's
   # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
-  local b_manager b_overview b_house b_prov b_rigor b_sizing board
+  local b_manager b_overview b_house b_prov b_rigor b_sizing b_requests board
   primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
   b_primary=$(primary)
   b_issues=$(open_issues)
   b_agents=$(ws_agents)
+  b_requests=$(requests_json)
   b_extra=$(tracked_missing_issues "$b_issues" "$b_agents")
   b_guard=$(guard_state)
   # the config reports the store, so it keeps the configured cap even when the
@@ -997,6 +1055,7 @@ cmd_board() {
     --argjson issues "$b_issues" \
     --argjson extra "$b_extra" \
     --argjson ag "$b_agents" \
+    --argjson requests "$b_requests" \
     --argjson cap "$cap" \
     --argjson paused "$b_paused" \
     --argjson overview "$b_overview" \
@@ -1052,7 +1111,10 @@ cmd_board() {
             | {pane_id,tab_id,name,agent_kind,agent_status,cwd,branch,
                issue_guess:(if (.branch // "") | test("^issue-[0-9]+-") then
                               ((.branch|capture("^issue-(?<n>[0-9]+)-").n)|tonumber)
-                            else null end)}] | sort_by(.pane_id)) as $unmanaged |
+                            else null end),
+               requested:(($requests[.pane_id] // null) != null),
+               requested_at:($requests[.pane_id].requested_at // null),
+               requested_issue:($requests[.pane_id].issue // null)}] | sort_by(.pane_id)) as $unmanaged |
     ([ ($I[] | select(.inflight or .awaiting)
              | select(agent_for(.number) == null)
              | {number,title,reason:"label-without-agent"}),
@@ -1629,6 +1691,7 @@ cmd_adopt() {
     local slug; slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
 
     herdr_or_die "herdr agent rename $pane issue-$n failed" herdr agent rename "$pane" "issue-$n"
+    take_request "$pane" >/dev/null
     herdr tab rename "$tab" "#$n $slug" >/dev/null 2>&1 || warn "herdr tab rename $tab failed"
     gh issue edit "$n" --add-label 'mgr:in-flight' >/dev/null \
       || die 1 "gh issue edit #$n --add-label mgr:in-flight failed"
@@ -1657,6 +1720,7 @@ cmd_adopt() {
     local newname
     newname="adopt-$(sanitize_pane "$pane")"
     herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
+    take_request "$pane" >/dev/null
     # no issue yet, so nothing carries a size: the session labels the issue it
     # creates and sizes itself from that label, so the brief names no size
     local brief
@@ -1730,6 +1794,72 @@ cmd_bind() {
     '{number:$number,title:$title,policy:$policy,agent:$agent,tab_id:$tab,pane_id:$pane,
       worktree:(if $wt=="" then null else $wt end),
       branch:(if $br=="" then null else $br end)}'
+}
+
+# ---------------------------------------------------------------- register
+
+cmd_register() {
+  local n=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*) die 2 "usage: mgr register [N]";;
+      *)
+        if [ -z "$n" ]; then n="$1"; else die 2 "usage: mgr register [N]"; fi
+        shift;;
+    esac
+  done
+  [ -n "$n" ] && { case "$n" in ''|*[!0-9]*) die 2 "issue number must be an integer: $n";; esac; }
+  [ -n "${HERDR_WORKSPACE_ID:-}" ] || die 3 "not running inside herdr (HERDR_WORKSPACE_ID unset)"
+  [ -n "${HERDR_PANE_ID:-}" ] || die 3 "mgr register must run inside the requesting pane (HERDR_PANE_ID unset)"
+  require_agents
+
+  local ag mgr
+  ag=$(ws_agents)
+  mgr=$(manager_json "$ag")
+  [ "$mgr" != "null" ] || die 3 "no manager tab in workspace $HERDR_WORKSPACE_ID (nothing to register with)"
+
+  local mgr_pane mgr_tab mgr_agent
+  mgr_pane=$(jq -r '.pane_id' <<<"$mgr")
+  mgr_tab=$(jq -r '.tab_id' <<<"$mgr")
+  mgr_agent=$(jq -r '.agent // empty' <<<"$mgr")
+  [ "$mgr_pane" = "$HERDR_PANE_ID" ] && die 3 "refusing to register the manager's own pane $HERDR_PANE_ID"
+
+  local a
+  a=$(agent_by_target "$HERDR_PANE_ID")
+  [ -n "$a" ] || die 3 "pane $HERDR_PANE_ID hosts no agent"
+
+  local pane tab name
+  pane=$(jq -r '.pane_id' <<<"$a")
+  tab=$(jq -r '.tab_id' <<<"$a")
+  name=$(jq -r '.name // ""' <<<"$a")
+  case "$name" in
+    issue-*) die 3 "agent $name on $pane is already managed";;
+    adopt-*) die 3 "agent $name on $pane is already adopted (self-registration pending)";;
+  esac
+
+  [ -n "$mgr_agent" ] || die 3 "manager tab $mgr_tab hosts no named agent to prompt"
+
+  record_request "$pane" "$tab" "$name" "$n"
+
+  local req_at
+  req_at=$(jq -r --arg p "$pane" '.[$p].requested_at // empty' <<<"$(requests_json)")
+  [ -n "$req_at" ] || req_at=null
+
+  local text
+  if [ -n "$n" ]; then
+    text="register-builder: pane $pane issue $n"
+  else
+    text="register-builder: pane $pane"
+  fi
+  herdr_or_die "herdr agent prompt $mgr_agent failed" herdr agent prompt "$mgr_agent" "$text"
+
+  jq -nc --arg pane "$pane" --arg tab "$tab" --arg agent "$name" --arg n "$n" \
+    --arg mpane "$mgr_pane" --arg mtab "$mgr_tab" --arg magent "$mgr_agent" \
+    --argjson at "$req_at" \
+    '{pane_id:$pane, tab_id:$tab, agent:(if $agent=="" then null else $agent end),
+      issue:(if $n=="" then null else ($n|tonumber) end),
+      manager:{pane_id:$mpane, tab_id:$mtab, agent:$magent},
+      requested_at:$at, submitted:true}'
 }
 
 # ---------------------------------------------------------------- report
@@ -2102,7 +2232,7 @@ mgr — manager CLI for herdr-hosted omp builders
 
   mgr labels                          ensure the mgr:* and size:* labels exist
   mgr board [--cap N]                 full state: in_flight / awaiting_approval / ready /
-                                      blocked / orphans / adopting / unmanaged / quota /
+                                      blocked / orphans / adopting / unmanaged (+requested) / quota /
                                       overview
   mgr overview [--json] [--limit N]   the picture every manager turn ends with: the burn
                                       of this manager's own subscription, then the
@@ -2124,6 +2254,10 @@ mgr — manager CLI for herdr-hosted omp builders
   mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
                                       without N it self-registers via `mgr bind`)
   mgr bind <N>                        run BY a builder in its own pane to bind to issue N
+  mgr register [N]                    run BY a session in its own pane to ask the manager to
+                                      adopt it (N: the issue it already works on). The
+                                      pre-adopt request; `mgr bind` is the post-adopt step an
+                                      adoptee runs itself — never the other way round
   mgr size <N> <size>                 set issue N's size label (tiny|small|medium|large),
                                       removing any other; refuses while mgr:in-flight —
                                       a live builder resizes itself
@@ -2177,7 +2311,7 @@ env: MGR_CAP        default concurrency cap
      MGR_STATUS_INTERVAL_S  status-line poll interval, default 5
      MGR_STATUS_BURN  1 shows the burn item in the status line
      HERDR_WORKSPACE_ID  target workspace (all commands; headless use sets it explicitly)
-     HERDR_PANE_ID       the caller's pane (bind, board.self, and the guard
+     HERDR_PANE_ID       the caller's pane (bind, register, board.self, and the guard
                          heartbeat every command stamps)
 EOF
 }
@@ -2206,6 +2340,7 @@ main() {
     launch)        cmd_launch "$@";;
     adopt)         cmd_adopt "$@";;
     bind)          cmd_bind "$@";;
+    register)      cmd_register "$@";;
     size)          cmd_size "$@";;
     wait)          cmd_wait "$@";;
     prompt)        cmd_prompt "$@";;
