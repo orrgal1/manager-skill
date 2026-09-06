@@ -50,7 +50,8 @@ failure resizes at every setting.
 
 **Escalation.** A fumble trigger (builder.md §7), or a **HIGH** review finding you intend to
 decline (a MEDIUM or LOW one you decline with a reason, builder.md §7): hand that step to a fresh
-`crux` agent — the top rung — and never retry it at your own level.
+`crux` agent — the top rung, which is the builder's own rung too, so what it buys is a fresh
+context, not a bigger model — and never retry it yourself.
 
 ## Verification
 

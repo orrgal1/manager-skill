@@ -186,6 +186,7 @@ check 'a second apply reports the previous package' openai "$(jq -r '.previous' 
 check 'config.yml is restamped' 1 \
   "$(grep -cx 'activePackage: anthropic' "$agent/config.yml" || true)"
 check 'plan is the top rung' anthropic/claude-fable-5-1:high "$(cfg_role plan)"
+check 'builder is the top rung' anthropic/claude-fable-5-1:high "$(cfg_role builder)"
 check 'sketch is the work rung, below plan' anthropic/claude-opus-5:high "$(cfg_role sketch)"
 check 'sweep is the work rung, below review' anthropic/claude-opus-5:high "$(cfg_role sweep)"
 

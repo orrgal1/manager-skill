@@ -226,8 +226,8 @@ in-session by design, and the ceiling is the only thing that makes it fan out.
 
 Two precedences, so that one event never has two outcomes. A file that would also fail your size
 file's scope test is a resize, never a fan-out: the ceiling only moves work that is still in scope.
-And when a fumble trigger and the ceiling fire on the same edit, escalate — a failing step never
-goes to a slice agent on your own rung.
+And when a fumble trigger and the ceiling fire on the same edit, escalate — a failing step goes to
+`crux` and its fresh context, never to a slice agent on your own rung or below it.
 
 ### Your sizing bias
 
