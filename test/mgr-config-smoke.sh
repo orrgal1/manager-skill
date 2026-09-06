@@ -659,6 +659,85 @@ check 'adopt (unbound) starts no agent' 0 \
 check 'adopt (unbound) passes no --env' 0 \
   "$(grep -c -- '--env' "$MGR_TEST_LOG" || true)"
 
+# --------------------------------------------------- 4b. register
+
+printf '\n# 4b. register: mgr register asks the manager to adopt; mgr adopt clears the request\n'
+reqfile="$MGR_STATE_DIR/requests/ws-w9.json"
+
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
+out=$(HERDR_PANE_ID=w9:p3 HERDR_TAB_ID=w9:t3 "$MGR" register 7); rc=$?
+check 'register (with N) exit' 0 "$rc"
+check 'register (with N) prompt text' 'register-builder: pane w9:p3 issue 7' \
+  "$(cat "$MGR_TEST_PROMPT")"
+check 'register (with N) prompts the manager agent' true \
+  "$(contains 'herdr agent prompt manager register-builder: pane w9:p3 issue 7' \
+     "$(cat "$MGR_TEST_LOG")")"
+check 'register (with N) records pane_id' w9:p3 "$(jq -r '."w9:p3".pane_id' "$reqfile")"
+check 'register (with N) records tab_id' w9:t3 "$(jq -r '."w9:p3".tab_id' "$reqfile")"
+check 'register (with N) records the requesting agent' feature-x \
+  "$(jq -r '."w9:p3".agent' "$reqfile")"
+check 'register (with N) records issue' 7 "$(jq -r '."w9:p3".issue' "$reqfile")"
+check 'register (with N) records a numeric requested_at' true \
+  "$(jq -r '."w9:p3".requested_at | type == "number"' "$reqfile")"
+check 'register (with N) stdout submitted' true "$(jq -r '.submitted' <<<"$out")"
+check 'register (with N) stdout pane_id' w9:p3 "$(jq -r '.pane_id' <<<"$out")"
+check 'register (with N) stdout tab_id' w9:t3 "$(jq -r '.tab_id' <<<"$out")"
+check 'register (with N) stdout agent' feature-x "$(jq -r '.agent' <<<"$out")"
+check 'register (with N) stdout issue' 7 "$(jq -r '.issue' <<<"$out")"
+check 'register (with N) stdout manager pane_id' w9:p1 "$(jq -r '.manager.pane_id' <<<"$out")"
+check 'register (with N) stdout manager agent' manager "$(jq -r '.manager.agent' <<<"$out")"
+
+out=$("$MGR" board)
+check 'board unmanaged w9:p3 requested' true \
+  "$(jq -r '.unmanaged[] | select(.pane_id=="w9:p3") | .requested' <<<"$out")"
+check 'board unmanaged w9:p3 requested_issue' 7 \
+  "$(jq -r '.unmanaged[] | select(.pane_id=="w9:p3") | .requested_issue' <<<"$out")"
+check 'board unmanaged w9:p3 requested_at is numeric' true \
+  "$(jq -r '.unmanaged[] | select(.pane_id=="w9:p3") | (.requested_at|type=="number")' <<<"$out")"
+check 'board unmanaged row keys' \
+  '["pane_id","tab_id","name","agent_kind","agent_status","cwd","branch","issue_guess","requested","requested_at","requested_issue"]' \
+  "$(jq -c '.unmanaged[] | select(.pane_id=="w9:p3") | keys_unsorted' <<<"$out")"
+
+# re-registering the same still-unmanaged pane without N overwrites its entry
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
+out=$(HERDR_PANE_ID=w9:p3 HERDR_TAB_ID=w9:t3 "$MGR" register); rc=$?
+check 'register (no N) exit' 0 "$rc"
+check 'register (no N) prompt text' 'register-builder: pane w9:p3' \
+  "$(cat "$MGR_TEST_PROMPT")"
+check 'register (no N) overwrites the pending issue with null' null \
+  "$(jq -r '."w9:p3".issue' "$reqfile")"
+check 'register (no N) stdout issue is null' null "$(jq -r '.issue' <<<"$out")"
+
+# adopting the pane fulfils and clears the pending request
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
+out=$("$MGR" adopt w9:p3 7); rc=$?
+check 'adopt after register exit' 0 "$rc"
+check 'adopt clears the pending request from state' false \
+  "$(jq -r 'has("w9:p3")' "$reqfile")"
+out=$("$MGR" board)
+check 'board no longer marks w9:p3 requested after adopt' false \
+  "$(jq -r '[.in_flight[],.adopting[],.unmanaged[]]
+     | map(select(.pane_id=="w9:p3")) | map(.requested // false) | any' <<<"$out")"
+
+# the three registration refusals
+err=$(MGR_TEST_TABS="$fix/tabs-nomanager.json" HERDR_PANE_ID=w9:p3 HERDR_TAB_ID=w9:t3 \
+  "$MGR" register 2>&1 >/dev/null); rc=$?
+check 'register (no manager tab) exit' 3 "$rc"
+check 'register (no manager tab) message' \
+  'no manager tab in workspace w9 (nothing to register with)' \
+  "$(jq -r '.error.message' <<<"$err")"
+
+err=$(HERDR_PANE_ID=w9:p1 HERDR_TAB_ID=w9:t1 "$MGR" register 2>&1 >/dev/null); rc=$?
+check 'register (the managers own pane) exit' 3 "$rc"
+check 'register (the managers own pane) message' \
+  "refusing to register the manager's own pane w9:p1" \
+  "$(jq -r '.error.message' <<<"$err")"
+
+err=$(HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 "$MGR" register 2>&1 >/dev/null); rc=$?
+check 'register (already-managed pane) exit' 3 "$rc"
+check 'register (already-managed pane) message' true \
+  "$(contains 'already managed' "$(jq -r '.error.message' <<<"$err")")"
+
 # --------------------------------------------------- 5. board config/manager/self
 
 printf '\n# 5. board: config, manager, self\n'
@@ -742,6 +821,10 @@ err=$(hl bind 7 2>&1 >/dev/null); rc=$?
 check 'headless bind exit' 3 "$rc"
 check 'headless bind explains why' true \
   "$(contains 'HERDR_PANE_ID unset' "$(jq -r '.error.message' <<<"$err")")"
+err=$(hl register 7 2>&1 >/dev/null); rc=$?
+check 'headless register exit' 3 "$rc"
+check 'headless register explains why' true \
+  "$(contains 'HERDR_PANE_ID' "$(jq -r '.error.message' <<<"$err")")"
 
 # --------------------------------------------------- 7. usage
 
@@ -752,6 +835,8 @@ check 'usage mentions rigor in the config clause' true \
   "$(if [ "$("$MGR" --help | grep -c 'rigor' || true)" -ge 1 ]; then printf true; else printf false; fi)"
 check 'usage mentions sizing in the config clause' 1 \
   "$("$MGR" --help | grep -c '(lean|balanced|careful' || true)"
+check 'usage lists mgr register' 1 \
+  "$("$MGR" --help | grep -cF -- 'mgr register [N]' || true)"
 for v in MGR_OMP_ARGS MGR_ENV MGR_BRIEF_EXTRA MGR_CAP MGR_RIGOR MGR_SIZING HERDR_WORKSPACE_ID; do
   check "usage lists $v" 1 "$("$MGR" --help | grep -c "$v" || true)"
 done
