@@ -434,7 +434,7 @@ operator's only pace dial.
 | `report.review_verdict` | string | report `review_verdict=` | — | yes |
 | `report.checks` | string[] | report `checks=` comma list split | — | yes (absent → null) |
 | `report.escalations` | int | report `escalations=` via `tonumber?` | count | yes |
-| `report.delegated_planning` | string | report `delegated_planning=`, closed set `sketch`\|`plan`\|`none` — an out-of-set value is recorded as given and flagged in `report_warnings` | — | yes |
+| `report.delegated_planning` | string | report `delegated_planning=`, closed set `sketch`\|`plan`\|`none` | — | yes |
 | `report.pre_existing_red` | int | report `pre_existing_red=` via `tonumber?` | count | yes |
 | `report.final_size` | string | report `final_size=` | — | yes |
 | `report.plan_rounds` | int | report `plan_rounds=` via `tonumber?` | count | yes |

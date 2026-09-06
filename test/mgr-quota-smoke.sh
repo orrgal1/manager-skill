@@ -2013,7 +2013,7 @@ check 'the legacy stamp was consumed' '{}' "$(jq -c '.' "$launches")"
 # a report whose delegated_planning is a size, not a planner: the value is
 # recorded exactly as reported and flagged, never rewritten (a fresh sha so
 # the ledger's dedupe lets the row through)
-sed -e 's/sha=ghi/sha=jkl/' -e 's/delegated_planning=plan/delegated_planning=medium/' \
+sed -E -e 's/sha=[a-z]+/sha=jkl/' -e 's/delegated_planning=[a-z]+/delegated_planning=medium/' \
   "$fix/comments-9.json" >"$fix/comments-9.json.next" \
   && mv "$fix/comments-9.json.next" "$fix/comments-9.json"
 out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 9 2>/dev/null)
