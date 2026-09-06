@@ -1,6 +1,8 @@
 #!/bin/sh
 # Link this checkout into the machine-wide skills directory so every project
 # can say "act as the manager". Re-runnable; refuses to clobber a real directory.
+# Also links register-builder/ beside dest, so a builder session can ask to be
+# adopted.
 #
 # usage: install.sh [dest] [--omp-extension] [--omp]
 #
@@ -39,8 +41,16 @@ if [ -e "$dest" ] && [ ! -L "$dest" ]; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$dest")"
+skills_dir=$(dirname "$dest")
+register_dest="$skills_dir/register-builder"
+if [ -e "$register_dest" ] && [ ! -L "$register_dest" ]; then
+  echo "install: $register_dest exists and is not a symlink; move it aside first" >&2
+  exit 1
+fi
+
+mkdir -p "$skills_dir"
 ln -sfn "$here" "$dest"
+ln -sfn "$here/register-builder" "$register_dest"
 chmod +x "$here/bin/mgr" "$here/bin/mgr-package"
 
 for bin in gh jq git herdr; do
@@ -48,6 +58,7 @@ for bin in gh jq git herdr; do
 done
 
 echo "install: $dest -> $here"
+echo "install: $register_dest -> $here/register-builder"
 
 if [ "$omp_extension" = 1 ]; then
   agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"

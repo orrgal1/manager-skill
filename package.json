@@ -17,6 +17,7 @@
     "omp/",
     "SKILL.md",
     "builder.md",
+    "register-builder/",
     "README.md",
     "LICENSE"
   ],
