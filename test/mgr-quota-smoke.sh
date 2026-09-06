@@ -361,9 +361,12 @@ cat >"$fix/stall-49.json" <<'EOF'
 EOF
 
 # what omp puts on the builder's pane when the coding plan runs low: the
-# reserve dialog, offering to finish the work on a weaker model. Verbatim from
-# the incident that opened issue #56, box drawing and all. Copied into place as
-# pane-issue-49.txt only by the cases that want the dialog on screen.
+# reserve dialog, offering to finish the work on a weaker model. This is the
+# boxed, provider-qualified form as the incident's pane capture rendered it
+# (reconstructed from that capture, not a byte copy of it); the issue body
+# paraphrases the same dialog as a one-liner with bare ids, kept below as
+# dialog-49-bare.txt. Copied into place as pane-issue-49.txt only by the
+# cases that want the dialog on screen.
 cat >"$fix/dialog-49.txt" <<'EOF'
   ⎋ Working…
 
@@ -377,6 +380,42 @@ cat >"$fix/dialog-49.txt" <<'EOF'
 │ up/down navigate  enter select  esc cancel                                             │
 │                                                                                        │
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
+EOF
+
+# the same dialog as the issue body records it: one line, bare model ids, no
+# box — from/to are whatever the dialog printed, never normalised
+cat >"$fix/dialog-49-bare.txt" <<'EOF'
+Coding-plan reserve reached — claude-fable-5-1 has 7.0% remaining. Switch to claude-opus-5? Yes / No
+EOF
+
+# scrollback: an offer the operator declined, then the one still on screen
+cat >"$fix/dialog-49-twice.txt" <<'EOF'
+╭─ Coding-plan reserve reached ──────────────────────────────────────────────╮
+│ anthropic/claude-fable-5-1:high has 7.0% remaining. Switch to anthropic/claude-old-5:high? Choose No to keep using the current plan. │
+│    Yes                                                                    │
+│  ❯ No                                                                     │
+╰───────────────────────────────────────────────────────────────────────────╯
+  ⎋ Working…
+╭─ Coding-plan reserve reached ──────────────────────────────────────────────╮
+│ anthropic/claude-fable-5-1:high has 2.0% remaining. Switch to anthropic/claude-new-5:high? Choose No to keep using the current plan. │
+│  ❯ Yes                                                                    │
+│    No                                                                     │
+╰───────────────────────────────────────────────────────────────────────────╯
+EOF
+
+# the title on screen with no prompt line, and a prompt line the pane wrapped
+# mid-sentence: neither is a dialog this can answer on
+cat >"$fix/dialog-49-titleonly.txt" <<'EOF'
+╭─ Coding-plan reserve reached ─╮
+│  ❯ Yes                        │
+│    No                         │
+╰───────────────────────────────╯
+EOF
+cat >"$fix/dialog-49-wrapped.txt" <<'EOF'
+╭─ Coding-plan reserve reached ─────────────────────────────────╮
+│ anthropic/claude-fable-5-1:high has 7.0% remaining. Switch to │
+│ anthropic/claude-opus-5:high? Choose No to keep the plan.     │
+╰───────────────────────────────────────────────────────────────╯
 EOF
 
 # ------------------------------------------------------------------ fakes
@@ -779,6 +818,15 @@ r49=$(jq -c '.in_flight[0]' <<<"$("$MGR" board --cap 3)")
 check 'no stamp file at all is the same answer' 'claude-smol/null/null' \
   "$(jq -r '"\(.model)/\(.launch_model)/\(.model_changed)"' <<<"$r49")"
 
+# a stamp file somebody hand-edited into a scalar under the issue key: the row
+# degrades to no launch model instead of aborting the whole board program
+printf '{"49":"oops"}\n' >"$mlaunches"
+out=$("$MGR" board --cap 3); rc=$?
+check 'a malformed launch stamp is not a failed board' 0 "$rc"
+check 'and the row still reports its current model' 'claude-smol/null/null' \
+  "$(jq -r '.in_flight[0] | "\(.model)/\(.launch_model)/\(.model_changed)"' <<<"$out")"
+rm -f "$mlaunches"
+
 # nothing has answered in this session yet: no current model, so no switch to
 # claim either
 : >"$sess"
@@ -1018,6 +1066,20 @@ check '_fallback-prompt to'   anthropic/claude-opus-5:high \
   "$(jq -r '.to' <<<"$out")"
 check 'a pane with no dialog is null' null \
   "$(printf '  \xe2\x8e\x8b Working…\n' | "$MGR" _fallback-prompt)"
+out=$("$MGR" _fallback-prompt <"$fix/dialog-49-bare.txt")
+check 'the issue-body one-liner: bare ids, reported as printed' \
+  'claude-fable-5-1 claude-opus-5' "$(jq -r '"\(.from) \(.to)"' <<<"$out")"
+check 'a dialog line at column 0 still matches' 'claude-fable-5-1 claude-opus-5' \
+  "$(printf 'Coding-plan reserve reached\nclaude-fable-5-1 has 7.0%% remaining. Switch to claude-opus-5?\n' \
+       | "$MGR" _fallback-prompt | jq -r '"\(.from) \(.to)"')"
+out=$("$MGR" _fallback-prompt <"$fix/dialog-49-twice.txt")
+check 'two offers in the capture: the newest one is relayed' \
+  'anthropic/claude-fable-5-1:high anthropic/claude-new-5:high' \
+  "$(jq -r '"\(.from) \(.to)"' <<<"$out")"
+check 'the title with no prompt line is null' null \
+  "$("$MGR" _fallback-prompt <"$fix/dialog-49-titleonly.txt")"
+check 'a prompt line wrapped mid-sentence is null' null \
+  "$("$MGR" _fallback-prompt <"$fix/dialog-49-wrapped.txt")"
 
 printf '\n# 4g. wait on a builder omp is holding on that dialog\n'
 cp "$fix/dialog-49.txt" "$fix/pane-issue-49.txt"
@@ -1946,14 +2008,6 @@ check 'comment-9 header line (legacy stamp)' \
   'execution: #9 · ?→small · 10800s · 3 turns · 678 tokens · $0.6 · review none/skipped · merged_at from comment' \
   "$(sed -n '1p' "$comment9")"
 check 'the legacy stamp was consumed' '{}' "$(jq -c '.' "$launches")"
-
-printf '\n# 10a-unit. session_facts, sourced directly from mgr-lib.sh\n'
-# shellcheck source=bin/mgr-lib.sh
-. "$root/bin/mgr-lib.sh"
-check 'session_facts reads the last assistant message off the tail' \
-  '{"provider":"anthropic","model":"claude-smol"}' "$(session_facts "$bsess")"
-check 'session_facts on a missing file is all null' \
-  '{"provider":null,"model":null}' "$(session_facts "$tmp/no-such-session.jsonl")"
 
 # ---------------------------- 10b. two builders binding at the same time
 

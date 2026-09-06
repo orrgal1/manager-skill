@@ -126,6 +126,10 @@ roles_set() { # the JSON the last `omp config set modelRoles` was handed
   grep '^omp config set modelRoles ' "$OMP_FAKE_LOG" | tail -1 \
     | sed 's/^omp config set modelRoles //'
 }
+chains_set() { # the JSON the last `omp config set retry.fallbackChains` was handed
+  grep '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" | tail -1 \
+    | sed 's/^omp config set retry.fallbackChains //'
+}
 # a value out of config.yml's modelRoles block, so the file itself is asserted
 cfg_role() { # cfg_role <role>
   awk -v r="  $1: " '
@@ -178,24 +182,22 @@ check 'the unmanaged setting survived' 1 \
   "$(grep -cx 'emojiAutocomplete: false' "$agent/config.yml" || true)"
 check 'the overrides landed' 1 \
   "$(grep -c '^omp config set task.agentModelOverrides ' "$OMP_FAKE_LOG" || true)"
-check 'the chains do not land by default' 0 \
-  "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
-check 'MGR_MODEL_FALLBACK=ask still does not write chains' 0 \
+check 'the chains are cleared by default' '{}' "$(chains_set)"
+check 'MGR_MODEL_FALLBACK=ask also clears the chains' 0 \
   "$(out=$(MGR_MODEL_FALLBACK=ask "$PKG" package openai); jq -r '.fallback_chains' <<<"$out")"
-check 'ask still does not land in the log' 0 \
-  "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
+check 'ask writes an empty chain map too, not the real ones' '{}' "$(chains_set)"
 out=$(MGR_MODEL_FALLBACK=auto "$PKG" package openai)
 check 'MGR_MODEL_FALLBACK=auto reports the policy' auto "$(jq -r '.model_fallback' <<<"$out")"
-check 'MGR_MODEL_FALLBACK=auto writes the chains once' 1 "$(jq -r '.fallback_chains' <<<"$out")"
-check 'the chains landed exactly once, only under auto' 1 \
-  "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
-err=$(MGR_MODEL_FALLBACK=bogus "$PKG" package openai 2>&1 >/dev/null); rc=$?
-check 'a bogus MGR_MODEL_FALLBACK is refused' true \
-  "$(if [ "$rc" -ne 0 ]; then printf true; else printf false; fi)"
-check 'the bogus value is named in the error' true \
-  "$(jq -r '.error.message | test("bogus")' <<<"$err")"
-check 'a bogus MGR_MODEL_FALLBACK changed nothing in the log' 1 \
-  "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
+check 'MGR_MODEL_FALLBACK=auto writes the real chain count' 2 "$(jq -r '.fallback_chains' <<<"$out")"
+check 'auto writes the package chains verbatim' openai-codex/gpt-5.6-sol:high \
+  "$(jq -r '.["openai-codex/gpt-6-astra"][0]' <<<"$(chains_set)")"
+out=$(MGR_MODEL_FALLBACK=bogus "$PKG" package openai 2>"$tmp/fallback.warn"); rc=$?
+check 'a bogus MGR_MODEL_FALLBACK does not fail' 0 "$rc"
+check 'a bogus MGR_MODEL_FALLBACK warns once' 1 \
+  "$(grep -c 'MGR_MODEL_FALLBACK must be one of never|ask|auto: bogus' "$tmp/fallback.warn" || true)"
+check 'a bogus MGR_MODEL_FALLBACK degrades to never' never "$(jq -r '.model_fallback' <<<"$out")"
+check 'a bogus MGR_MODEL_FALLBACK reports zero chains written' 0 "$(jq -r '.fallback_chains' <<<"$out")"
+check 'a bogus MGR_MODEL_FALLBACK clears the chains rather than writing them' '{}' "$(chains_set)"
 check 'the list now reports it as active' openai "$("$PKG" package | jq -r '.active')"
 
 out=$("$PKG" package anthropic)

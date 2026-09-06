@@ -397,7 +397,7 @@ def lbl($n): (([.labels[]?.name] | index($n)) != null);
                   awaiting: lbl("mgr:awaiting-approval")})) as $I
 | ([$I[] | select(.inflight)
          | (.number | tostring) as $key
-         | (($launches[$key] // null)) as $stamp
+         | (($launches[$key] // null) | if type == "object" then . else null end) as $stamp
          | {number: .number, title: .title,
             launched_at: (if $stamp == null then null else ($stamp.launched_at // null) end),
             launch_model: (if $stamp == null then null else ($stamp.launch_model // null) end),
@@ -1049,6 +1049,10 @@ cmd_tick() {
     pane=$(jq -r '.pane_id' <<<"$c")
     text=$(jq -r '.text' <<<"$c")
     ok=false
+    # This is the one mgr-side path that can `herdr agent prompt` a pane that might be
+    # holding the model-fallback reserve dialog: it only fires for a pane with a recorded
+    # rate-limit stall, so it needs a 429 → reignite → dialog race, and under the default
+    # `never` policy that dialog cannot appear at all.
     if command -v herdr >/dev/null 2>&1 && herdr agent prompt "$pane" "$text" >/dev/null 2>&1; then
       ok=true
       log info "reignite $pane ok"

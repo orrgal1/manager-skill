@@ -297,8 +297,8 @@ render above filters it. `--limit N` decides how much of this repo's own queue i
 ```
 quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · weekly 20% used · shared with 1 other project
 work     1 of 2 builders running, 10 ready, 1 blocked · out of work in 6h45 (18:45Z) · queue clear in 7h30 (19:30Z)
-next     #49 running on claude-opus-5 (launched on claude-fable-5-1), 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30 · #10 in 3h45
-         #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · #15 in 6h30 · +2 more
+next     #49 running on claude-opus-5 (launched on claude-fable-5-1), 15m left · #7 in 2h30 (after the 5-hour reset)
+         #8 in 2h45 · #9 in 3h30 · #10 in 3h45 · #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · +3 more
 ```
 
 - **`quota`** — scoped to the calling manager's own provider, one entry per limit of that provider
@@ -515,7 +515,7 @@ set model-fallback`, `MGR_MODEL_FALLBACK`); the rule is `SKILL.md §6`.
 
 | `model-fallback` | omp overlay | dialog |
 |---|---|---|
-| `never` (default) | `retry.modelFallback: false`, `usageAwareFallback: false` | can't appear |
+| `never` (default) | `retry.modelFallback: false`, `usageAwareFallback: false` | can't appear — and no fallback on transient provider failures either (429s, outages); the guard reignites the pane instead |
 | `ask` | `retry.modelFallback: true`, `usageAwareFallback: true`, `usageReservePolicy: confirm` | appears; relayed to the operator, never answered |
 | `auto` | same, `usageReservePolicy: auto` | the harness switches on its own; `mgr setup`/`mgr package` also write `retry.fallbackChains` |
 

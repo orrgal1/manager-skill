@@ -62,8 +62,10 @@ JQ_SHORT_MODEL='def short_model: if . == null then null else (sub("^[^/]*/"; "")
 # raw session-jsonl lines on stdin -> {provider,model}: the last assistant
 # message's own facts (nulls when none). The one implementation of "what
 # answered this session": `mgr house`, every board row and the execution
-# record read it through session_facts below.
-JQ_SESSION_FACTS='
+# record read it through assistant_facts below. Named for the message it
+# reads, not the session, so it cannot be confused with mgr-guard's own
+# session_facts — a different shape over the same file.
+JQ_ASSISTANT_FACTS='
 [ inputs | (fromjson? // empty) | select(type == "object")
   | select((.type == "message") and ((.message | type) == "object")
            and (.message.role == "assistant")) ]
@@ -71,7 +73,7 @@ JQ_SESSION_FACTS='
 | if . == null then {provider:null, model:null}
   else {provider:(.message.provider // null), model:(.message.model // null)} end'
 
-session_facts() { # session_facts <session.jsonl> -> {provider,model} JSON; never fails
+assistant_facts() { # assistant_facts <session.jsonl> -> {provider,model} JSON; never fails
   local f="${1:-}" body size
   local none='{"provider":null,"model":null}'
 
@@ -88,7 +90,7 @@ session_facts() { # session_facts <session.jsonl> -> {provider,model} JSON; neve
     body=$(cat "$f" 2>/dev/null) || body=""
   fi
 
-  printf '%s\n' "$body" | jq -Rnc "$JQ_SESSION_FACTS" 2>/dev/null || printf '%s\n' "$none"
+  printf '%s\n' "$body" | jq -Rnc "$JQ_ASSISTANT_FACTS" 2>/dev/null || printf '%s\n' "$none"
 }
 
 session_metrics() { # session_metrics <session.jsonl> -> session sub-object; never fails

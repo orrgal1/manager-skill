@@ -540,6 +540,11 @@ check 'launch exit (model-fallback ask)' 0 "$rc"
 check 'the ask overlay is the second --config' 1 \
   "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-ask.yml" "$MGR_TEST_LOG" || true)"
 drop_wt
+MGR_MODEL_FALLBACK=auto "$MGR" launch 7 >/dev/null; rc=$?
+check 'launch exit (model-fallback auto)' 0 "$rc"
+check 'the auto overlay is the second --config' 1 \
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-auto.yml" "$MGR_TEST_LOG" || true)"
+drop_wt
 
 # an overlay omp could not read would fail at `herdr agent start`, with a
 # worktree and a tab already created: a checkout whose omp/policies is empty

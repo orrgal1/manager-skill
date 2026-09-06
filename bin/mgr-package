@@ -6,13 +6,14 @@
 # A package is omp/packages/<house>.yml holding exactly three keys: modelRoles,
 # task.agentModelOverrides, retry.fallbackChains. Applying one always replaces
 # modelRoles and task.agentModelOverrides in the omp config.yml (through
-# `omp config set`, which validates against the settings schema); it replaces
-# retry.fallbackChains too only when MGR_MODEL_FALLBACK=auto (mgr's dispatch
+# `omp config set`, which validates against the settings schema); retry.fallbackChains
+# is written from the package only when MGR_MODEL_FALLBACK=auto (mgr's dispatch
 # arm exports this from the resolved `model-fallback` config; direct and
-# installer runs default to never). Applying also writes activePackage, and
-# leaves every other setting alone. There are no symlinks in the result: a
-# herdr-spawned builder reads the same config.yml as the manager that
-# launched it.
+# installer runs default to never) and cleared to {} otherwise, so the applied
+# config always matches the policy regardless of what an earlier `mgr setup`
+# installed. Applying also writes activePackage, and leaves every other
+# setting alone. There are no symlinks in the result: a herdr-spawned builder
+# reads the same config.yml as the manager that launched it.
 #
 # Locations, so this runs from an installed copy or from a repo checkout:
 #   MGR_ROOT          skill checkout        default the dir above this script
@@ -26,6 +27,8 @@ die() { # die <exit-code> <message>
   jq -nc --argjson c "$code" --arg m "$*" '{error:{code:$c,message:$m}}' >&2
   exit "$code"
 }
+
+warn() { printf 'mgr-package: warning: %s\n' "$*" >&2; }
 
 for dep in omp jq; do
   command -v "$dep" >/dev/null 2>&1 || die 1 "missing dependency: $dep"
@@ -103,7 +106,8 @@ apply() { # apply <name> -> the applied-package JSON on stdout
   local policy="${MGR_MODEL_FALLBACK:-never}"
   case "$policy" in
     never|ask|auto) ;;
-    *) die 3 "MGR_MODEL_FALLBACK must be one of never|ask|auto: $policy";;
+    *) warn "MGR_MODEL_FALLBACK must be one of never|ask|auto: $policy — applying as never"
+       policy=never;;
   esac
 
   local json roles overrides chains before was backup tmp chains_written
@@ -144,7 +148,10 @@ apply() { # apply <name> -> the applied-package JSON on stdout
   if [ "$policy" = auto ]; then
     omp config set retry.fallbackChains "$chains" >/dev/null \
       || pkg_fail "omp config set retry.fallbackChains failed"
-    chains_written=1
+    chains_written=$(printf '%s' "$chains" | jq 'length')
+  else
+    omp config set retry.fallbackChains '{}' >/dev/null \
+      || pkg_fail "omp config set retry.fallbackChains failed"
   fi
 
   # `omp config set` rewrites the file without its comments and without a
@@ -237,8 +244,8 @@ mgr-package — omp agent packages and the size agent files
                                  the ones this checkout ships
   mgr package <house>            apply omp/packages/<house>.yml into the omp
                                  config.yml (modelRoles, task.agentModelOverrides,
-                                 and — only when MGR_MODEL_FALLBACK=auto —
-                                 retry.fallbackChains) and stamp activePackage;
+                                 and retry.fallbackChains — written under auto,
+                                 cleared otherwise) and stamp activePackage;
                                  prints the role changes
   mgr setup [--force] [--house <house>]
                                  install omp/agents/*.md into the omp agents dir
@@ -253,9 +260,10 @@ env: MGR_ROOT             skill checkout (default: the dir above this script)
      OMP_PACKAGES_DIR     package dir (default: $MGR_ROOT/omp/packages)
      OMP_AGENTS_DIR       agent-file source dir (default: $MGR_ROOT/omp/agents)
      PI_CODING_AGENT_DIR  omp agent dir (default: `omp config path`)
-     MGR_MODEL_FALLBACK   never|ask|auto (default: never); mgr's dispatch arm
-                          sets this from the resolved model-fallback config;
-                          retry.fallbackChains is written only when auto
+     MGR_MODEL_FALLBACK   never|ask|auto (default: never; a bad value warns and
+                          degrades to never); mgr's dispatch arm sets this from
+                          the resolved model-fallback config; retry.fallbackChains
+                          is written under auto and cleared otherwise
 EOF
 }
 

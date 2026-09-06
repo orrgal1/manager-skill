@@ -379,7 +379,7 @@ house_of() { # house_of <provider> -> anthropic|openai|gemini ("" when unknown)
 }
 
 # Which model house this manager's own session runs on: mgr-lib.sh's
-# `session_facts` reads the provider and model of the last assistant message in
+# `assistant_facts` reads the provider and model of the last assistant message in
 # its omp session file — the same helper the builders' rows and the execution
 # record use, so there is one implementation of "what answered this session".
 self_house() { # self_house -> {provider,model,house}  (nulls when unknown)
@@ -389,7 +389,7 @@ self_house() { # self_house -> {provider,model,house}  (nulls when unknown)
     sess=$(agents_raw | jq -r --arg p "$pane" \
       '[.[] | select(.pane_id == $p) | .agent_session.value // ""] | .[0] // ""')
   fi
-  if [ -n "$sess" ]; then facts=$(session_facts "$sess"); fi
+  if [ -n "$sess" ]; then facts=$(assistant_facts "$sess"); fi
   jq -c --arg h "$(house_of "$(jq -r '.provider // ""' <<<"$facts")")" \
     '. + {house:(if $h == "" then null else $h end)}' <<<"$facts"
 }
@@ -459,7 +459,7 @@ ws_agents() {
     IFS=$'\t' read -r wt br <<<"$(agent_git "$cwd")"
     sess=$(jq -r '.agent_session.value // ""' <<<"$a")
     model=""
-    if [ -n "$sess" ]; then model=$(session_facts "$sess" | jq -r '.model // ""'); fi
+    if [ -n "$sess" ]; then model=$(assistant_facts "$sess" | jq -r '.model // ""'); fi
     out+=$(jq -c --arg wt "$wt" --arg br "$br" --arg model "$model" \
       '{name:(.name//null),pane_id,tab_id,cwd:(.cwd//null),agent_status:(.agent_status//null),
         workspace_id,agent_kind:(.agent//null),
@@ -848,12 +848,14 @@ quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
 # are reported verbatim. Pure text matching over the pane — the title pins the
 # dialog, the prompt line carries the models — so a reworded dialog degrades to
 # the ordinary wait result instead of inventing a state.
+# The capture is scrollback, so it can hold a dialog the operator already
+# answered as well as the one still on screen: the last match wins.
 fallback_prompt_json() { # fallback_prompt_json <pane text on stdin>
   local pane pair from to
   pane=$(cat)
   case "$pane" in *'Coding-plan reserve reached'*) ;; *) return 0;; esac
-  pair=$(sed -n 's/.*[[:space:]]\([^[:space:]]*\) has [0-9.]*% remaining\. Switch to \([^[:space:]?]*\)?.*/\1 \2/p' <<<"$pane")
-  pair=${pair%%$'\n'*}
+  pair=$(sed -En 's/(^|.*[[:space:]])([^[:space:]]+) has [0-9.]+% remaining\. Switch to ([^[:space:]?]+)\?.*/\2 \3/p' <<<"$pane")
+  pair=${pair##*$'\n'}
   from="${pair% *}"; to="${pair#* }"
   [ -n "$pair" ] && [ -n "$from" ] && [ -n "$to" ] || return 0
   jq -nc --arg from "$from" --arg to "$to" '{from:$from,to:$to}'
@@ -1162,7 +1164,8 @@ cmd_board() {
     # so it can never be reported as switched.
     def row: . as $i | agent_for($i.number) as $a |
       (if $a then $a.model else null end) as $m |
-      ($launches[$i.number | tostring].launch_model // null) as $lm |
+      ($launches[$i.number | tostring]
+       | if type == "object" then (.launch_model // null) else null end) as $lm |
       {number:$i.number, title:$i.title, state:$i.state, policy:$i.policy, size:$i.size,
        agent:(if $a then $a.name else null end),
        agent_status:(if $a then $a.agent_status else null end),
