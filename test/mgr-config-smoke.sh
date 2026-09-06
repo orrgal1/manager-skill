@@ -65,6 +65,11 @@ EOF
 cat >"$fix/issue-7-planapprove.json" <<'EOF'
 {"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:small"},{"name":"mgr:plan-approve"}],"body":""}
 EOF
+# the same issue 49 after its builder parked on plan approval, for the board
+# section: outside the open list, so `board` reads it as a tracked-missing issue
+cat >"$fix/issue-49-planparked.json" <<'EOF'
+{"number":49,"title":"Do the thing","state":"CLOSED","labels":[{"name":"mgr:awaiting-plan"},{"name":"size:large"}],"body":""}
+EOF
 
 # the manager itself on w9:p1/w9:t1, one managed builder, and one unmanaged
 # session on w9:p3/w9:t3 that the adopt sections take over
@@ -715,7 +720,7 @@ check 'adopt (bound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
 check 'adopt (bound) brief carries the labelled size, the house and its workflow' true \
-  "$(contains "Size: small. House: anthropic. Rigor: production. Sizing: balanced. Read $MGR_REAL_BUILDER now and follow it exactly; it is your complete contract. Its Build section sends you to $wf/small.md," \
+  "$(contains "Policy: auto-merge. Plan policy: none. Size: small. House: anthropic. Rigor: production. Sizing: balanced. Read $MGR_REAL_BUILDER now and follow it exactly; it is your complete contract. Its Build section sends you to $wf/small.md," \
      "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (bound) starts no agent' 0 \
   "$(grep -c 'herdr agent start' "$MGR_TEST_LOG" || true)"
@@ -935,6 +940,18 @@ check 'awaiting-plan is not ready to launch again' '[7]' \
 check 'awaiting-plan is not in flight' '[]' "$(jq -c '[.in_flight[].number]' <<<"$out")"
 check 'a builder parked on the plan is not an orphan' '[]' "$(jq -c '.orphans' <<<"$out")"
 check 'awaiting-plan does not eat a slot' true \
+  "$(jq -r '.slots_free == .cap' <<<"$out")"
+# the same issue outside the open list: a tracked-missing issue is in flight by
+# default, unless it is parked on approval or on its plan
+cat >"$fix/issues.json" <<'EOF'
+[{"number":7,"title":"Another thing","labels":[{"name":"size:small"}],"body":""}]
+EOF
+out=$(MGR_TEST_ISSUE_VARIANT=-planparked "$MGR" board)
+check 'tracked-missing awaiting-plan keeps its own bucket' '[49]' \
+  "$(jq -c '[.awaiting_plan[].number]' <<<"$out")"
+check 'tracked-missing awaiting-plan is not in flight' '[]' \
+  "$(jq -c '[.in_flight[].number]' <<<"$out")"
+check 'tracked-missing awaiting-plan does not eat a slot' true \
   "$(jq -r '.slots_free == .cap' <<<"$out")"
 cp "$fix/issues-inflight.json" "$fix/issues.json"
 

@@ -144,9 +144,9 @@ While awaiting plan approval, two things can arrive:
 | `Plan feedback: …` | revise the plan, post a **fresh** `builder: started · <plan>` marker so the latest comment is always the current plan, report a fresh `status=awaiting-plan-approval plan=<new comment url>`, stop |
 | `Plan approved. Build it.` | continue into §7, as if the policy were absent |
 
-Under this policy `plan_rounds` starts at 1 — the plan you posted above — and each round through
-the table adds one; it rides in your final §12 report. The two policies compose: an issue may stop
-here under `mgr:plan-approve` and again at §9 under `mgr:manual-approve`.
+Under this policy `plan_rounds` starts at 1 — the plan you posted above — and each round of
+`Plan feedback: …` adds one; it rides in your final §12 report. The two policies compose: an issue
+may stop here under `mgr:plan-approve` and again at §9 under `mgr:manual-approve`.
 
 ## 7. Build and verify — your size
 

@@ -2054,7 +2054,7 @@ cmd_wait() {
 
   # the settle, then the verdict — and by default the verdict may be "the guard
   # is holding it again", which is not an answer for the caller but another lap.
-  local report ptext fp
+  local report ptext fp rstatus
   while :; do
     herdr agent wait "$target" >/dev/null 2>&1 || true
 
@@ -2071,11 +2071,12 @@ cmd_wait() {
     report='null'
     if [ -n "$n" ]; then
       report=$(parse_report "$n")
-      if [ "$(jq -r '.status // ""' <<<"$report")" = "awaiting-approval" ]; then
+      rstatus=$(jq -r '.status // ""' <<<"$report")
+      if [ "$rstatus" = "awaiting-approval" ]; then
         ensure_labels
         gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-approval' >/dev/null 2>&1 \
           || warn "could not swap labels on #$n"
-      elif [ "$(jq -r '.status // ""' <<<"$report")" = "awaiting-plan-approval" ]; then
+      elif [ "$rstatus" = "awaiting-plan-approval" ]; then
         ensure_labels
         gh issue edit "$n" --remove-label 'mgr:in-flight' --add-label 'mgr:awaiting-plan' >/dev/null 2>&1 \
           || warn "could not swap labels on #$n"

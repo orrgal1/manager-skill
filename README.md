@@ -320,13 +320,12 @@ next     #49 running on claude-opus-5 (launched on claude-fable-5-1), 15m left �
   provider — because filtering to nothing would hide readings that do exist; its board still
   reports `quota.provider: null`.
 - **`work`** — this repo only: how many builders are running out of the cap, how many issues are
-  ready / blocked / awaiting approval / waiting on the plan, whether a slot is free right now —
-  and if so, whether nothing is ready to fill it (`N free slot(s), nothing ready to launch`) — or
-  when the last slot runs out of work, and when this repo's own queue clears. Nothing to report
-  at all renders as
-  `nothing running, nothing queued` (no `next` line follows); an unregistered repo reads `this repo
-  is not registered with the guard`; outside a repo entirely it reads `not inside a repo, so there
-  is no queue to show`.
+  ready / blocked / awaiting approval / waiting on the plan, whether a slot is free right now — and
+  if so, whether nothing is ready to fill it (`N free slot(s), nothing ready to launch`) — or when
+  the last slot runs out of work, and when this repo's own queue clears. Nothing to report at all
+  renders as `nothing running, nothing queued` (no `next` line follows); an unregistered repo reads
+  `this repo is not registered with the guard`; outside a repo entirely it reads `not inside a
+  repo, so there is no queue to show`.
 - **`next`** — this repo's issues only: the in-flight ones first with the time left, then the
   queued ones with the wait. An in-flight entry reads `#N running on <model>, <time left>`, with
   ` (launched on <launch model>)` after the model — the bare id — when the harness switched the

@@ -73,10 +73,9 @@ you are the one being found.
 
 Report the board to the operator: `in_flight`, `awaiting_approval`, `awaiting_plan`, `ready`,
 `blocked`, `orphans`, `adopting`, `unmanaged`, `cap` / `slots_free`, `house`, `rigor`, `sizing`,
-and `quota` —
-`provider`, `guard`, `limits`, `reason`, `stalled`. Then close the turn with the `$MGR overview`
-block — `quota` scoped to your own provider, `work`/`next` scoped to this repo — as every turn
-ends (§7).
+and `quota` — `provider`, `guard`, `limits`, `reason`, `stalled`. Then close the turn with the
+`$MGR overview` block — `quota` scoped to your own provider, `work`/`next` scoped to this repo —
+as every turn ends (§7).
 
 `house` is the package every launch overlays. `null` → run `$MGR house`, which reads the house off
 your own session; still nothing → `$MGR config set house <anthropic|openai|gemini>` before any
@@ -92,7 +91,7 @@ Orphans need a decision, so raise them rather than fixing them silently:
 
 | `reason` | Meaning | Do |
 |---|---|---|
-| `label-without-agent` | issue says in-flight, no live agent | tell the operator the tab is gone; offer `$MGR retire N` |
+| `label-without-agent` | issue carries an `mgr:` state label, no live agent | tell the operator the tab is gone; offer `$MGR retire N` |
 | `agent-without-label` | agent live, label lost | `gh issue edit N --add-label mgr:in-flight` |
 
 Then start a background `$MGR wait N` for every `in_flight` issue and a background
@@ -324,7 +323,7 @@ Otherwise branch on `report.status`:
 |---|---|
 | `merged` | `$MGR retire N --close`. It records the execution record (classification, timings, turns, tokens, review) on the issue as an `execution:` comment and on the throughput ledger; you do not read it. Then check what landed — `gh pr view <pr> --json files`: if the merged PR touched `omp/agents/` or `omp/packages/`, run `$MGR setup` before you launch anything, because an added agent or role reaches this machine only through it. Then `$MGR board`, then launch every `ready` issue while `slots_free > 0` — each with its own background wait. Tell the operator what merged (`sha`, `pr`), any agents or roles installed or changed, and what went out next. |
 | `awaiting-approval` | Give the operator the PR URL and the builder's own summary (its last non-report issue comment). Do **not** retire — the tab stays alive for the fixes. The slot frees itself. |
-| `awaiting-plan-approval` | Relay the plan to the operator — the builder's latest `builder: started · <plan>` comment is always the current plan — with the two options, `plan feedback on #N` and `approve the plan on #N`. Do **not** retire — the tab stays alive. The slot frees itself. |
+| `awaiting-plan-approval` | Relay `report.plan` — the builder's latest `builder: started · <plan>` comment — to the operator with the two options, `plan feedback on #N` and `approve the plan on #N`. Do **not** retire — the tab stays alive. The slot frees itself. |
 | `blocked` / `failed` | Relay `reason` verbatim, keep the tab, ask the operator how to proceed: `$MGR prompt N "<answer>"` + wait again, or `$MGR retire N`. Never guess the answer for them. |
 
 `report` is `null` — the builder stopped without reporting, which almost always means it asked a
@@ -381,10 +380,10 @@ that pane exactly as above, and report the mapping to the operator.
 
 - Cap is 3 unless `config`/`MGR_CAP`/`--cap` say otherwise. `awaiting_approval` and `awaiting_plan`
   do **not** count against it; `adopting` does. The cap gates `launch` only — **`adopt` never
-  enforces it** and returns
-  `over_cap: true` instead: a requested adoption (§2) is work already in flight, not a launch you
-  get to hold back. Unmanaged work nobody asked you to adopt is the operator's own by default —
-  there is nothing to rescue by sweeping it in, so the absence of a request costs nothing.
+  enforces it** and returns `over_cap: true` instead: a requested adoption (§2) is work already in
+  flight, not a launch you get to hold back. Unmanaged work nobody asked you to adopt is the
+  operator's own by default — there is nothing to rescue by sweeping it in, so the absence of a
+  request costs nothing.
 - One issue per builder, one builder per issue. Never two agents on the same issue.
 - The primary checkout is touched only through `gh` and `mgr`. You never write there.
 - Never run the project's build, typecheck or tests. That is the builder's self-review.
