@@ -347,49 +347,6 @@ a repo it falls back to the machine-wide median over every repo, and with no his
 `MGR_DEFAULT_TASK_S` (2700 s, 45 min). Both fallbacks are flagged `estimated` and render as `~` —
 durations are a heuristic, and the block says so instead of hiding it.
 
-### Execution record
-
-`schema` is `1`; an unreadable session leaves `session.read` `false` with every other
-`session.*` field `null`.
-
-| field | type | source | unit | nullable |
-|---|---|---|---|---|
-| `repo` | string | mgr (`own_repo`) | — | no |
-| `number` | int | mgr | — | no |
-| `launched_at` | int | launch stamp | ms epoch | **yes** (adoptee with no stamp) |
-| `merged_at` | int | pr (`gh pr view --json mergedAt`), fallback comment `createdAt`, fallback now | ms epoch | no |
-| `duration_s` | int | derived `max(0, round((merged_at-launched_at)/1000))` | s | **yes** (when `launched_at` null) |
-| `schema` | int | constant `1` | — | no |
-| `merged_at_source` | `"pr"` \| `"comment"` | mgr | — | no |
-| `size` | string | `size:` label at retire (`gh issue view <N> --json labels`, jq locally, no `-q`) | — | yes |
-| `pr` | string | report `pr=` | — | yes |
-| `sha` | string | report `sha=` | — | yes |
-| `report.review` | string | report `review=` (`reviewer`\|`sweep`\|`none`) | — | yes |
-| `report.review_verdict` | string | report `review_verdict=` | — | yes |
-| `report.checks` | string[] | report `checks=` comma list split | — | yes (absent → null) |
-| `report.escalations` | int | report `escalations=` via `tonumber?` | count | yes |
-| `report.delegated_planning` | string | report `delegated_planning=` (`sketch`\|`plan`\|`none`) | — | yes |
-| `report.pre_existing_red` | int | report `pre_existing_red=` via `tonumber?` | count | yes |
-| `report.final_size` | string | report `final_size=` | — | yes |
-| `session.read` | bool | session file readable | — | no |
-| `session.turns` | int | count of `.type=="message" and .message.role=="assistant"` | count | yes |
-| `session.tokens.input/output/cache_read/cache_write` | int | sums of `.message.usage.{input,output,cacheRead,cacheWrite}` (`// 0` per message) | tokens | yes |
-| `session.tokens.total` | int | sum of `.message.usage.totalTokens`, per-message fallback `input+output` | tokens | yes |
-| `session.cost_usd` | number | sum of `.message.usage.cost.total`; **null when no message carries one** | USD | yes |
-| `session.active_ms` | int | sum of `.message.duration`; null when none | ms | yes |
-| `session.models` | object{string:int} | histogram of `.message.model` (assistant messages) | count | yes |
-| `session.model_changes` | int | count of `.type=="model_change"` | count | yes |
-| `session.resizes` | int | count of `.type=="title_change" and .trigger=="replan"` | count | yes |
-| `session.stop_reasons` | object{string:int} | histogram of `.message.stopReason` | count | yes |
-| `session.rate_limit_hits` | int | count of `stopReason=="error" and (errorStatus==429 or errorMessage matches /rate.?limit\|429\|too many requests/i)` | count | yes |
-| `session.subagents.count` | int | number of `<stem>/*.jsonl` files with a session_init | count | yes |
-| `session.subagents.agents` | object | histogram of `session_init.agent` | count | yes |
-| `session.subagents.roles` | object | histogram of `session_init.modelRole` | count | yes |
-| `session.subagents.models` | object | histogram of `session_init.resolvedModel` | count | yes |
-
-`session` comes from the builder's own omp session JSONL, resolved through herdr's
-`agent_session`, plus `<stem>/<Agent>.jsonl` subagent transcripts.
-
 From there, per manager: an in-flight issue is due at
 `launched_at + max(median, elapsed + ¼ median)`, so a builder that has already outrun the median is
 not predicted to land this second. The queue is FIFO by issue number over `cap` parallel slots; a
@@ -436,6 +393,49 @@ the simulation runs over — a repo with 200 open issues gets 200 ETAs and shows
 predates this feature has no snapshot yet: restart it (`mgr guard stop`, `mgr guard start`) and
 the next tick fills the backlog in. Nothing in the harness acts on any of it: the cap is still the
 operator's only pace dial.
+
+### Execution record
+
+`schema` is `1`; an unreadable session leaves `session.read` `false` with every other
+`session.*` field `null`.
+
+| field | type | source | unit | nullable |
+|---|---|---|---|---|
+| `repo` | string | mgr (`own_repo`) | — | no |
+| `number` | int | mgr | — | no |
+| `launched_at` | int | launch stamp | ms epoch | **yes** (adoptee with no stamp) |
+| `merged_at` | int | pr (`gh pr view --json mergedAt`), fallback comment `createdAt`, fallback now | ms epoch | no |
+| `duration_s` | int | derived `max(0, round((merged_at-launched_at)/1000))` | s | **yes** (when `launched_at` null) |
+| `schema` | int | constant `1` | — | no |
+| `merged_at_source` | `"pr"` \| `"comment"` | mgr | — | no |
+| `size` | string | `size:` label at retire (`gh issue view <N> --json labels`, jq locally, no `-q`) | — | yes |
+| `pr` | string | report `pr=` | — | yes |
+| `sha` | string | report `sha=` | — | yes |
+| `report.review` | string | report `review=` (`reviewer`\|`sweep`\|`none`) | — | yes |
+| `report.review_verdict` | string | report `review_verdict=` | — | yes |
+| `report.checks` | string[] | report `checks=` comma list split | — | yes (absent → null) |
+| `report.escalations` | int | report `escalations=` via `tonumber?` | count | yes |
+| `report.delegated_planning` | string | report `delegated_planning=` (`sketch`\|`plan`\|`none`) | — | yes |
+| `report.pre_existing_red` | int | report `pre_existing_red=` via `tonumber?` | count | yes |
+| `report.final_size` | string | report `final_size=` | — | yes |
+| `session.read` | bool | session file readable | — | no |
+| `session.turns` | int | count of `.type=="message" and .message.role=="assistant"` | count | yes |
+| `session.tokens.input/output/cache_read/cache_write` | int | sums of `.message.usage.{input,output,cacheRead,cacheWrite}` (`// 0` per message) | tokens | yes |
+| `session.tokens.total` | int | sum of `.message.usage.totalTokens`, per-message fallback `input+output` | tokens | yes |
+| `session.cost_usd` | number | sum of `.message.usage.cost.total`; **null when no message carries one** | USD | yes |
+| `session.active_ms` | int | sum of `.message.duration`; null when none | ms | yes |
+| `session.models` | object{string:int} | histogram of `.message.model` (assistant messages) | count | yes |
+| `session.model_changes` | int | count of `.type=="model_change"` | count | yes |
+| `session.resizes` | int | count of `.type=="title_change" and .trigger=="replan"` | count | yes |
+| `session.stop_reasons` | object{string:int} | histogram of `.message.stopReason` | count | yes |
+| `session.rate_limit_hits` | int | count of `stopReason=="error" and (errorStatus==429 or errorMessage matches /rate.?limit\|429\|too many requests/i)` | count | yes |
+| `session.subagents.count` | int | number of `<stem>/*.jsonl` files with a session_init | count | yes |
+| `session.subagents.agents` | object | histogram of `session_init.agent` | count | yes |
+| `session.subagents.roles` | object | histogram of `session_init.modelRole` | count | yes |
+| `session.subagents.models` | object | histogram of `session_init.resolvedModel` | count | yes |
+
+`session` comes from the builder's own omp session JSONL, resolved through herdr's
+`agent_session`, plus `<stem>/<Agent>.jsonl` subagent transcripts.
 
 ## Status line
 
