@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# mgr-lib.sh — shared library sourced by bin/mgr and reachable by bin/mgr-guard
-# via `$(dirname "$0")/mgr-lib.sh`. Holds the session-metrics jq the two
-# scripts both need (mgr for the retire record, mgr-guard for session facts).
+# mgr-lib.sh — shared library sourced by bin/mgr; bin/mgr-guard reaches it the
+# same way (`$(dirname "$0")/mgr-lib.sh`) whenever it needs these. Holds the
+# session-metrics jq behind the execution record `mgr retire` writes.
 
 declare -F warn >/dev/null 2>&1 || warn() { printf 'mgr: warning: %s\n' "$*" >&2; }
 
