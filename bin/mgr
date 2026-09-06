@@ -1717,8 +1717,8 @@ cmd_bind() {
   gh issue comment "$n" --body "manager: bound · tab $tab · agent issue-$n · cwd $cwd · branch $br_cmt · policy $policy" >/dev/null \
     || warn "gh issue comment #$n failed"
 
-  # the size the issue carries as it is taken — the self-registering session
-  # labels it before binding; no usable label stamps null, never a guess
+  # bind briefs nothing, so the stamp is the label the self-registering session
+  # added before binding; no usable label stamps null, never a guess
   local size
   size=$(size_of "$ij") || size=""
   size_valid "$size" || size=""

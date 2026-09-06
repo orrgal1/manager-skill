@@ -1639,6 +1639,14 @@ check 'no report, no row'       false "$(jq -r '.throughput_appended' <<<"$out")
 check 'the stamp is dropped anyway' '{}' "$(jq -c '.' "$launches")"
 check 'the throughput file is untouched' 1 "$(jq -s 'length' "$thru")"
 
+# a bind on an issue with no usable size: label (issue 8 carries size:xl)
+# stamps the moment and a null size — never a guessed one
+HERDR_PANE_ID=w9:p2 HERDR_TAB_ID=w9:t2 MGR_GUARD_NOW_MS="$pin" \
+  "$MGR" bind 8 >/dev/null 2>&1
+check 'an unusable size: label stamps null' "$pin/null" \
+  "$(jq -r '."8" | "\(.launched_at)/\(.launched_size)"' "$launches")"
+rm -f "$launches"
+
 # a second retire of the same landing (same number and sha) is a no-op
 out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 7 2>/dev/null)
 check 'a second retire appends nothing #7' false "$(jq -r '.throughput_appended' <<<"$out")"
@@ -1678,6 +1686,23 @@ check 'comment-9 header line' \
 assert_jq 'comment-9 fenced json equals the ledger row' \
   "$(sed -n '/^```json$/,/^```$/p' "$comment9" | sed '1d;$d' | jq -Sc .)" \
   ". == $(jq -Sc . <<<"$row9")"
+
+# a stamp written before launched_size existed ({number, launched_at} only)
+# keeps its launched_at and reads launched_size as null: a fresh sha so the
+# ledger's dedupe lets the row through
+sed 's/sha=def/sha=ghi/' "$fix/comments-9.json" >"$fix/comments-9.json.next" \
+  && mv "$fix/comments-9.json.next" "$fix/comments-9.json"
+jq -nc --argjson at "$pin" '{"9":{number:9,launched_at:$at}}' >"$launches"
+out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 9 2>/dev/null)
+check 'retire reports the row #9 (legacy stamp)' true "$(jq -r '.throughput_appended' <<<"$out")"
+row9l=$(jq -sc '.[-1]' "$thru")
+assert_jq 'legacy stamp -> launched_at kept'      "$row9l" ".launched_at == $pin"
+assert_jq 'legacy stamp -> duration_s measured'   "$row9l" '.duration_s == 10800'
+assert_jq 'legacy stamp -> launched_size is null' "$row9l" '.launched_size == null'
+check 'comment-9 header line (legacy stamp)' \
+  'execution: #9 · ?→small · 10800s · ? turns · ? tokens · $? · review none/skipped · merged_at from comment' \
+  "$(sed -n '1p' "$comment9")"
+check 'the legacy stamp was consumed' '{}' "$(jq -c '.' "$launches")"
 
 # ---------------------------- 10b. two builders binding at the same time
 

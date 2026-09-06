@@ -338,7 +338,7 @@ whole queue. The simulation itself always covers every queued issue of every man
 display is capped.
 
 **Where the ETAs come from.** Each repo's task duration is the median of its own history:
-`mgr launch`, `mgr adopt <pane> N` and `mgr bind N` record `launched_at` in
+`mgr launch`, `mgr adopt <pane> N` and `mgr bind N` record `launched_at` and `launched_size` in
 `MGR_STATE_DIR/launches/<owner>__<repo>.json`, and `mgr retire N` on a *merged* report appends
 the **execution record** to `MGR_STATE_DIR/throughput/<owner>__<repo>.jsonl` (the ledger is the
 dataset) and posts the same record as an `execution:` comment on the issue (one human line, then
@@ -411,7 +411,7 @@ operator's only pace dial.
 | `schema` | int | constant `1` | — | no |
 | `merged_at_source` | `"pr"` \| `"comment"` | mgr | — | no |
 | `size` | string | `size:` label at retire (`gh issue view <N> --json labels`, jq locally, no `-q`) | — | yes |
-| `launched_size` | string | launch stamp (the `size:` label as `launch`/`adopt`/`bind` took the issue) | — | **yes** (no stamp, or none carried) |
+| `launched_size` | string | launch stamp: the size the builder was taken with — the `size:` label for `launch` and `bind`; for `adopt`, the briefed size, `medium` when the issue carries no usable label | — | **yes** (no stamp, or `bind` on an issue with no usable label) |
 | `pr` | string | report `pr=` | — | yes |
 | `sha` | string | report `sha=` | — | yes |
 | `report.review` | string | report `review=` (`reviewer`\|`sweep`\|`none`) | — | yes |
