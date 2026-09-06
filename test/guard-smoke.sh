@@ -919,7 +919,9 @@ issues_file "$TMP/issues-l.json" \
   "$(mk_issue 12 twelve '' 'a plain body')" \
   "$(mk_issue 13 thirteen '' "$(printf 'needs the other one\nBlocked by: #12\n')")" \
   "$(mk_issue 14 fourteen '' 'Blocked by: #99')" \
-  "$(mk_issue 15 fifteen mgr:in-flight,mgr:awaiting-approval '')"
+  "$(mk_issue 15 fifteen mgr:in-flight,mgr:awaiting-approval '')" \
+  "$(mk_issue 16 sixteen mgr:awaiting-plan '')" \
+  "$(mk_issue 17 seventeen mgr:in-flight,mgr:awaiting-plan '')"
 export FAKE_ISSUES="$TMP/issues-l.json"
 launches_file "$SD_L" acme/bk "10:$(( T0 - 600000 ))"
 reg "$SD_L" "$T0" ws-wL wL wL:p1 3 2 1 2 acme/bk >/dev/null
@@ -929,7 +931,8 @@ assert_jq "(l) the gh call is the board fetch" "$(jq -Rsc . <"$FAKE_GH_LOG")" \
   'test("issue list -R acme/bk --state open --limit 200 --json number,title,labels,body")'
 assert_jq "(l) backlog shape" "$ST_L" \
   '(.managers["ws-wL"].backlog | keys)
-   == ["awaiting_approval","blocked","cap","counts","in_flight","ready","slots_free"]'
+   == ["awaiting_approval","awaiting_plan","blocked","cap","counts","in_flight","ready",
+       "slots_free"]'
 assert_jq "(l) ready is unlabelled with no OPEN blocker (#14 blocked by a closed one)" "$ST_L" \
   '.managers["ws-wL"].backlog.ready
    == [{number:12, title:"twelve", blocked_by:[]}, {number:14, title:"fourteen", blocked_by:[]}]'
@@ -939,13 +942,20 @@ assert_jq "(l) in flight joins launched_at from the launches file" "$ST_L" \
   '.managers["ws-wL"].backlog.in_flight
    == [{number:10, title:"ten", launched_at:'"$(( T0 - 600000 ))"',
         launch_model:null, model:null},
-       {number:15, title:"fifteen", launched_at:null, launch_model:null, model:null}]'
+       {number:15, title:"fifteen", launched_at:null, launch_model:null, model:null},
+       {number:17, title:"seventeen", launched_at:null, launch_model:null, model:null}]'
 assert_jq "(l) awaiting-approval only when it is not in flight" "$ST_L" \
   '.managers["ws-wL"].backlog.awaiting_approval == [{number:11, title:"eleven"}]'
+assert_jq "(l) awaiting-plan only when it is not in flight" "$ST_L" \
+  '.managers["ws-wL"].backlog.awaiting_plan == [{number:16, title:"sixteen"}]'
+assert_jq "(l) awaiting-plan is excluded from ready and blocked" "$ST_L" \
+  '(.managers["ws-wL"].backlog.ready | map(.number) | index(16)) == null
+   and (.managers["ws-wL"].backlog.blocked | map(.number) | index(16)) == null'
 assert_jq "(l) cap, slots_free and the true counts" "$ST_L" \
   '.managers["ws-wL"].backlog
    | .cap == 3 and .slots_free == 0
-     and .counts == {ready:2, blocked:1, in_flight:2, awaiting_approval:1, open:6}'
+     and .counts == {ready:2, blocked:1, in_flight:3, awaiting_approval:1,
+                     awaiting_plan:1, open:8}'
 assert_jq "(l) the refresh stamps backlog_at and clears backlog_error" "$ST_L" \
   '.managers["ws-wL"] | .backlog_at == '"$T0"' and .backlog_error == null'
 # 60 open issues, all launchable: the ledger keeps the first 50 and the true count
@@ -1057,7 +1067,7 @@ ST_M1="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + 60000 )) "$GUARD" tick)
 assert_eq "(m) inside MGR_GUARD_BACKLOG_INTERVAL_S nothing is fetched" 0 "$(lines_of "$FAKE_GH_LOG")"
 assert_jq "(m) and the snapshot is carried forward untouched" "$ST_M1" \
   '.managers["ws-wL"] | .backlog_at == '"$T0"' and .backlog_error == null
-   and (.backlog.counts.open == 6) and (.backlog.in_flight | length) == 2'
+   and (.backlog.counts.open == 8) and (.backlog.in_flight | length) == 3'
 ST_M2="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + 120001 )) "$GUARD" tick)"
 assert_eq "(m) past the interval it refetches" 1 "$(lines_of "$FAKE_GH_LOG")"
 assert_jq "(m) with a fresh backlog_at" "$ST_M2" \
@@ -1070,7 +1080,8 @@ ST_N="$(MGR_STATE_DIR="$SD_L" MGR_GUARD_NOW_MS=$(( T0 + 300000 )) "$GUARD" tick)
 assert_eq "(n) it did try" 1 "$(lines_of "$FAKE_GH_LOG")"
 assert_jq "(n) the previous backlog and its stamp survive the failure" "$ST_N" \
   '.managers["ws-wL"] | .backlog_at == '"$(( T0 + 120001 ))"'
-   and .backlog.counts == {ready:2, blocked:1, in_flight:2, awaiting_approval:1, open:6}'
+   and .backlog.counts == {ready:2, blocked:1, in_flight:3, awaiting_approval:1,
+                           awaiting_plan:1, open:8}'
 assert_jq "(n) and backlog_error names it" "$ST_N" \
   '.managers["ws-wL"].backlog_error == "gh issue list failed"'
 export FAKE_ISSUES="$TMP/issues-l.json"
@@ -1162,9 +1173,9 @@ assert_jq "(p) the stall window is that limit to its reset" "$OV" \
    == {from:'"$(( T0 + 1800000 ))"', to:'"$(( T0 + 7200000 ))"', limit:"anthropic:5h"}'
 assert_jq "(p) manager row shape" "$OV" \
   '(.backlog.managers[0] | keys)
-   == ["awaiting_approval","backlog_at","backlog_drains_at","backlog_error","blocked","cap",
-       "idle_slots","in_flight","manager_id","provider","ready","repo","stall_window",
-       "starves_at","starving","throughput"]'
+   == ["awaiting_approval","awaiting_plan","backlog_at","backlog_drains_at","backlog_error",
+       "blocked","cap","idle_slots","in_flight","manager_id","provider","ready","repo",
+       "stall_window","starves_at","starving","throughput"]'
 assert_jq "(p) only live managers, sorted by repo" "$OV" \
   '[.backlog.managers[] | .manager_id] == ["ws-a","ws-b"]'
 assert_jq "(p) shown item shape" "$OV" \
@@ -1211,7 +1222,8 @@ assert_jq "(p) the throughput chain travels into the overview" "$OV" \
    and ([.backlog.managers[] | select(.manager_id == "ws-b")] | first | .throughput.median_s) == 900'
 assert_jq "(p) totals are the sums, dead managers excluded" "$OV" \
   '.backlog.totals
-   == {ready:5, blocked:1, in_flight:1, awaiting_approval:0, cap:4, idle_slots:2, open:7}'
+   == {ready:5, blocked:1, in_flight:1, awaiting_approval:0, awaiting_plan:0,
+       cap:4, idle_slots:2, open:7}'
 assert_jq "(p) beyond summarises what the limit hid" "$OV" \
   '.timeline.beyond
    == {count:3, blocked:1, last_eta:'"$(( T0 + 7500000 ))"',
@@ -1237,7 +1249,7 @@ assert_jq "(p) no state.json -> zeros, no window, nothing queued" "$OVE" \
    and .backlog.managers == [] and .timeline.shown == []
    and .timeline.beyond == null and .timeline.drains_at == null
    and .backlog.totals == {ready:0, blocked:0, in_flight:0, awaiting_approval:0,
-                           cap:0, idle_slots:0, open:0}'
+                           awaiting_plan:0, cap:0, idle_slots:0, open:0}'
 
 printf '\n== (q) overview is judicious: 40 ready, 10 shown, the rest summarised ==\n'
 SD_Q="$TMP/s-q"; mkdir -p "$SD_Q"

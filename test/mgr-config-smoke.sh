@@ -60,6 +60,11 @@ EOF
 cat >"$fix/issue-7-twosizes.json" <<'EOF'
 {"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:tiny"},{"name":"size:large"}],"body":""}
 EOF
+# the same issue 7 with mgr:plan-approve added: the launch brief must read
+# `Plan policy: approve.` instead of the default `Plan policy: none.`
+cat >"$fix/issue-7-planapprove.json" <<'EOF'
+{"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:small"},{"name":"mgr:plan-approve"}],"body":""}
+EOF
 
 # the manager itself on w9:p1/w9:t1, one managed builder, and one unmanaged
 # session on w9:p3/w9:t3 that the adopt sections take over
@@ -474,6 +479,7 @@ check 'brief head' true \
 check 'brief keeps the original tail' true \
   "$(contains 'Begin with: gh issue view 7 --comments' "$prompt")"
 check 'brief names the size' true "$(contains 'Size: small.' "$prompt")"
+check 'launch briefs the plan policy' true "$(contains 'Plan policy: none.' "$prompt")"
 check 'brief names the house' true \
   "$(contains 'Size: small. House: anthropic. Rigor: production. Sizing: balanced. Read' "$prompt")"
 check 'brief sends the builder to its workflow file' true \
@@ -489,6 +495,14 @@ check 'brief is brief + blank + 2 extra lines' 4 \
 check 'the worktree exists' true "$(if [ -d "$wt" ]; then printf true; else printf false; fi)"
 check 'the worktree is registered' 1 \
   "$(git -C "$repo" worktree list --porcelain | grep -cxF "worktree $wt" || true)"
+drop_wt
+
+printf '\n# 3a2. mgr:plan-approve labels the brief with the plan policy\n'
+: >"$MGR_TEST_PROMPT"
+MGR_TEST_ISSUE_VARIANT=-planapprove "$MGR" launch 7 >/dev/null; rc=$?
+check 'plan-approve: launch exit' 0 "$rc"
+check 'plan-approve: brief names the plan policy' true \
+  "$(contains 'Plan policy: approve.' "$(cat "$MGR_TEST_PROMPT")")"
 drop_wt
 
 printf '\n# 3b. a brief-extra that is not readable warns and launches anyway\n'
@@ -896,8 +910,33 @@ check 'paths workflows is absolute and ends in /workflows' true \
 check 'paths omp is absolute and ends in /omp' true \
   "$(jq -r '.omp | startswith("/") and endswith("/omp")' <<<"$out")"
 check 'labels' \
-  '{"labels":["mgr:in-flight","mgr:awaiting-approval","mgr:manual-approve","size:tiny","size:small","size:medium","size:large"]}' \
+  '{"labels":["mgr:in-flight","mgr:awaiting-approval","mgr:awaiting-plan","mgr:manual-approve","mgr:plan-approve","size:tiny","size:small","size:medium","size:large"]}' \
   "$("$MGR" labels)"
+
+# ------------------------------------------- 5c. the awaiting-plan bucket
+
+printf '\n# 5c. board: mgr:awaiting-plan is its own bucket, not ready, not a slot, not an orphan\n'
+# #49 keeps its live issue-49 agent and swaps mgr:in-flight for mgr:awaiting-plan:
+# that is exactly a builder parked on plan approval
+cp "$fix/issues.json" "$fix/issues-inflight.json"
+cat >"$fix/issues.json" <<'EOF'
+[{"number":7,"title":"Another thing","labels":[{"name":"size:small"}],"body":""},
+ {"number":49,"title":"Do the thing","labels":[{"name":"mgr:awaiting-plan"},{"name":"size:large"}],"body":""}]
+EOF
+out=$("$MGR" board)
+check 'board awaiting_plan bucket' '[49]' "$(jq -c '[.awaiting_plan[].number]' <<<"$out")"
+check 'board awaiting_plan row carries the size' large \
+  "$(jq -r '.awaiting_plan[0].size' <<<"$out")"
+check 'board awaiting_plan row is an awaiting_approval row' \
+  '["number","title","state","policy","size","agent","agent_status","tab_id","pane_id","worktree","branch","model","launch_model","model_changed"]' \
+  "$(jq -c '.awaiting_plan[0] | keys_unsorted' <<<"$out")"
+check 'awaiting-plan is not ready to launch again' '[7]' \
+  "$(jq -c '[.ready[].number]' <<<"$out")"
+check 'awaiting-plan is not in flight' '[]' "$(jq -c '[.in_flight[].number]' <<<"$out")"
+check 'a builder parked on the plan is not an orphan' '[]' "$(jq -c '.orphans' <<<"$out")"
+check 'awaiting-plan does not eat a slot' true \
+  "$(jq -r '.slots_free == .cap' <<<"$out")"
+cp "$fix/issues-inflight.json" "$fix/issues.json"
 
 # --------------------------------------------------- 6. headless commands
 

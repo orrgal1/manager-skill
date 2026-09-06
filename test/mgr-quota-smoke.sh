@@ -1487,7 +1487,7 @@ check 'exhaust_at of the limit that does not fit' $((pin + 1800000)) \
 check 'a limit that fits never exhausts' null \
   "$(jq -r '.burn.limits[1].exhaust_at' <<<"$ovj")"
 check 'backlog.totals' \
-  '{"ready":10,"blocked":2,"in_flight":1,"awaiting_approval":0,"cap":3,"idle_slots":1,"open":13}' \
+  '{"ready":10,"blocked":2,"in_flight":1,"awaiting_approval":0,"awaiting_plan":0,"cap":3,"idle_slots":1,"open":13}' \
   "$(jq -c '.backlog.totals' <<<"$ovj")"
 # the dead manager is in the ledger and in nothing else
 check 'only live managers participate' \
