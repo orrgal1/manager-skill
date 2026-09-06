@@ -54,6 +54,41 @@ JQ_SUBAGENTS='
   }
 '
 
+# a model string like anthropic/claude-fable-5-1:high stripped of its
+# provider prefix and effort suffix -> claude-fable-5-1; null stays null
+JQ_SHORT_MODEL='def short_model: if . == null then null else (sub("^[^/]*/"; "") | sub(":[^/]*$"; "")) end;'
+
+# raw session-jsonl lines on stdin -> {provider,model}: the last assistant
+# message's own facts (nulls when none). Same shape and tail-window logic as
+# bin/mgr's JQ_SELF_FACTS/self_house.
+JQ_SESSION_FACTS='
+[ inputs | (fromjson? // empty) | select(type == "object")
+  | select((.type == "message") and ((.message | type) == "object")
+           and (.message.role == "assistant")) ]
+| (last // null)
+| if . == null then {provider:null, model:null}
+  else {provider:(.message.provider // null), model:(.message.model // null)} end'
+
+session_facts() { # session_facts <session.jsonl> -> {provider,model} JSON; never fails
+  local f="${1:-}" body size
+  local none='{"provider":null,"model":null}'
+
+  if [ -z "$f" ] || [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    printf '%s\n' "$none"
+    return 0
+  fi
+
+  size=$(wc -c <"$f" 2>/dev/null | tr -d ' ') || size=0
+  case "$size" in ''|*[!0-9]*) size=0;; esac
+  if [ "$size" -gt 65536 ]; then
+    body=$(tail -c 65536 "$f" 2>/dev/null | sed 1d) || body=""
+  else
+    body=$(cat "$f" 2>/dev/null) || body=""
+  fi
+
+  printf '%s\n' "$body" | jq -Rnc "$JQ_SESSION_FACTS" 2>/dev/null || printf '%s\n' "$none"
+}
+
 session_metrics() { # session_metrics <session.jsonl> -> session sub-object; never fails
   local f="${1:-}" null_shape parent dir sub sfile out
   null_shape='{"read":false,"turns":null,"tokens":{"input":null,"output":null,"cache_read":null,"cache_write":null,"total":null},"cost_usd":null,"active_ms":null,"models":null,"model_changes":null,"resizes":null,"stop_reasons":null,"rate_limit_hits":null,"subagents":{"count":null,"agents":null,"roles":null,"models":null}}'

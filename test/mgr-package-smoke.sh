@@ -157,7 +157,8 @@ check 'review is the top rung' openai-codex/gpt-6-astra:high \
 check 'the diff carries the old default' anthropic/claude-opus-5:high \
   "$(jq -r '.changes[] | select(.role == "default") | .from' <<<"$out")"
 check 'apply counts the agent overrides' 6 "$(jq -r '.agent_overrides' <<<"$out")"
-check 'apply counts the fallback chains' 2 "$(jq -r '.fallback_chains' <<<"$out")"
+check 'default model-fallback policy is never' never "$(jq -r '.model_fallback' <<<"$out")"
+check 'apply does not write fallback chains by default' 0 "$(jq -r '.fallback_chains' <<<"$out")"
 check 'apply says a live session needs a restart' true \
   "$(jq -r '.note | test("restart")' <<<"$out")"
 
@@ -177,7 +178,23 @@ check 'the unmanaged setting survived' 1 \
   "$(grep -cx 'emojiAutocomplete: false' "$agent/config.yml" || true)"
 check 'the overrides landed' 1 \
   "$(grep -c '^omp config set task.agentModelOverrides ' "$OMP_FAKE_LOG" || true)"
-check 'the chains landed' 1 \
+check 'the chains do not land by default' 0 \
+  "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
+check 'MGR_MODEL_FALLBACK=ask still does not write chains' 0 \
+  "$(out=$(MGR_MODEL_FALLBACK=ask "$PKG" package openai); jq -r '.fallback_chains' <<<"$out")"
+check 'ask still does not land in the log' 0 \
+  "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
+out=$(MGR_MODEL_FALLBACK=auto "$PKG" package openai)
+check 'MGR_MODEL_FALLBACK=auto reports the policy' auto "$(jq -r '.model_fallback' <<<"$out")"
+check 'MGR_MODEL_FALLBACK=auto writes the chains once' 1 "$(jq -r '.fallback_chains' <<<"$out")"
+check 'the chains landed exactly once, only under auto' 1 \
+  "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
+err=$(MGR_MODEL_FALLBACK=bogus "$PKG" package openai 2>&1 >/dev/null); rc=$?
+check 'a bogus MGR_MODEL_FALLBACK is refused' true \
+  "$(if [ "$rc" -ne 0 ]; then printf true; else printf false; fi)"
+check 'the bogus value is named in the error' true \
+  "$(jq -r '.error.message | test("bogus")' <<<"$err")"
+check 'a bogus MGR_MODEL_FALLBACK changed nothing in the log' 1 \
   "$(grep -c '^omp config set retry.fallbackChains ' "$OMP_FAKE_LOG" || true)"
 check 'the list now reports it as active' openai "$("$PKG" package | jq -r '.active')"
 

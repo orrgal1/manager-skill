@@ -1,0 +1,7 @@
+# model-fallback: ask — a builder may switch models, but only if asked first.
+# The plan reserve raises the switch dialog and waits; nothing changes until
+# somebody answers it. `mgr wait` reports the dialog as model-fallback-prompt.
+retry:
+  modelFallback: true
+  usageAwareFallback: true
+  usageReservePolicy: confirm

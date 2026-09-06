@@ -304,6 +304,7 @@ rate limit. Read `agent_status` before `report`:
 | `agent_status` | Do |
 |---|---|
 | `quota-stalled` | You only ever see this with `stall.guard` = `stopped` — a running guard reignites the pane by itself once the quota renews. Run `$MGR guard start`, then `$MGR wait N` again in the background. Do **not** prompt it, do **not** retire it — the work is intact. Relay the stall (`provider`, `error`, `resets_at`) only if the operator asks. |
+| `model-fallback-prompt` | The harness itself wants to switch the builder off its launch model — a coding-plan reserve dialog, only reachable when `model-fallback` (§6) is `ask`. Relay `from`→`to` and the percentage to the operator verbatim, then wait for their answer. Never answer it yourself: no `$MGR prompt`, no send-keys, no picking Yes or No, and nothing else sent to that pane while the dialog is up. Under the default `never` policy this state cannot occur. |
 
 **`number` is null** — an adoptee idled before binding. Read what it said, answer, wait again:
 
@@ -323,9 +324,10 @@ Otherwise branch on `report.status`:
 
 `report` is `null` — the builder stopped without reporting, which almost always means it asked a
 question. Never prompt one that is quota-stalled (`agent_status: quota-stalled`): that only buys
-another 429, and the guard reignites it once the quota renews. Otherwise, same as
-the unbound case, addressed by issue:
-`herdr agent read issue-N --source recent-unwrapped --lines 60`, relay it, answer with
+another 429, and the guard reignites it once the quota renews. Never prompt one that is
+`agent_status: model-fallback-prompt` either — that is the harness's own dialog, not the builder's
+question; relay it verbatim and wait, as above. Otherwise, same as the unbound case, addressed by
+issue: `herdr agent read issue-N --source recent-unwrapped --lines 60`, relay it, answer with
 `$MGR prompt N "…"`, wait again. `agent_status: blocked` gets the same treatment.
 
 Three builder comments are progress, not reports, and need nothing from you:
@@ -354,6 +356,7 @@ that pane exactly as above, and report the mapping to the operator.
 | set the house to X | `$MGR config set house X` (`anthropic`\|`openai`\|`gemini`), then `$MGR board` — every builder launched after it overlays that house's package |
 | set the rigor to X | `$MGR config set rigor X` (`sprint`\|`production`; default `production`), then `$MGR board` — every builder briefed after it verifies under that rigor (`builder.md §7`); the operator's call, never a builder's |
 | set the sizing to X | `$MGR config set sizing X` (`lean`\|`balanced`\|`careful`; default `balanced`), then `$MGR board` — biases the tie-break for every issue sized and every builder's scope test afterward (§3(b)); the operator's call, never a builder's |
+| set model fallback to X | `$MGR config set model-fallback X` (`never`\|`ask`\|`auto`; default `never`), then `$MGR board` — `never` launches with an omp overlay that disables the coding-plan fallback, so the dialog can't appear; `ask` lets the dialog appear, relayed to you but never answered by the manager (§5); `auto` lets the harness switch models on its own — opt-in only, and only then does `$MGR setup`/`$MGR package` install `retry.fallbackChains` |
 | switch the package | `$MGR package X` — applies `omp/packages/X.yml` to this machine's omp config, so the roles change for every session started afterwards (yours after a restart) |
 | run builders with extra omp args / env / an extra brief directive | `$MGR config add omp-arg <arg>` (repeat; order kept) / `$MGR config add env KEY=VALUE` / `$MGR config set brief-extra /abs/file.md`. `omp-arg` and `env` reach newly launched builders only; `brief-extra` also reaches adopted ones |
 | show the harness config | `$MGR config list` |
@@ -393,6 +396,9 @@ that pane exactly as above, and report the mapping to the operator.
 - Never re-prompt a quota-stalled builder yourself. The guard reignites it, with backoff. Your own
   session runs on the same quota and can stall too; the guard reignites you as well, so a
   `mgr-guard:` prompt in your pane means resume where you stopped.
+- Never change a builder's model yourself — not by answering the harness's fallback dialog, not by
+  send-keys, not by relaunching it on another model. The model a builder was launched on is the
+  model it finishes on, unless the operator says otherwise.
 - **Every manager turn ends with the `$MGR overview` text block, verbatim, after everything else** —
   unconditional: every turn, including the ones that only answered a question and the ones where
   there was nothing to do. Run it last, after the launches and retires of this turn, so the block
@@ -425,9 +431,9 @@ that pane exactly as above, and report the mapping to the operator.
 | `$MGR guard status` | the guard's whole state, machine-wide and unscoped by design — every provider it polled this tick with its limits and burn projection, the registered managers with the board data the guard collects for them (`managers[].backlog`, `backlog_at`, `backlog_error`, `throughput`, `provider`, `house`), the stalled panes with their reignite attempts, and `last_exit_at`/`last_exit_reason` when the daemon is not running. A manager is live while its herdr pane exists — `managers[].pane_alive` is that pane check and is what `live` means; `managers[].seen_at` is only the last time it ran an `mgr` command |
 | `$MGR pause` | this project's launch gate: a persisted cap 0, machine-wide for this repo (`mgr.paused` in the primary checkout's `.git/config`). `board` reports `paused_by_operator`, `launch` refuses; running builders are untouched. Idempotent |
 | `$MGR unpause` (alias `$MGR resume`) | lift the gate: the cap goes back to `--cap`/`MGR_CAP`/config/`3`. Idempotent, exit `0` when the project is not paused |
-| `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`, `house` (`anthropic`\|`openai`\|`gemini` — the package every launch overlays), `rigor` (`sprint`\|`production` — the verification dial every brief names; default `production`), `sizing` (`lean`\|`balanced`\|`careful` — the issue-size classification bias intake and builders apply; default `balanced`). Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
+| `$MGR config <set\|add\|get\|unset\|list> [key] [value]` | the per-repo harness config: `omp-arg` (extra omp argv, repeatable), `env` (`KEY=VALUE` for builder tabs, repeatable), `brief-extra` (path to a markdown file appended to every brief), `cap`, `house` (`anthropic`\|`openai`\|`gemini` — the package every launch overlays), `rigor` (`sprint`\|`production` — the verification dial every brief names; default `production`), `sizing` (`lean`\|`balanced`\|`careful` — the issue-size classification bias intake and builders apply; default `balanced`), `model-fallback` (`never`\|`ask`\|`auto` — the coding-plan model-fallback policy every launch overlays; default `never`). Stored in the primary checkout's `.git/config` under `mgr.*` — shared by every worktree, and it never dirties the tree |
 | `$MGR setup [--force] [--house <house>]` | once per machine: install the eight agents into the omp agent dir (existing files kept unless `--force`) and apply the house's package — `--house`, else `$MGR config get house`, else `anthropic` |
-| `$MGR package [<house>]` | no argument: `{active, available, dir}`. With one: apply `omp/packages/<house>.yml` to this machine's omp config (`modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains`) and print the role changes. Exit `4` on an unknown house |
+| `$MGR package [<house>]` | no argument: `{active, available, dir}`. With one: apply `omp/packages/<house>.yml` to this machine's omp config (`modelRoles`, `task.agentModelOverrides`, and `retry.fallbackChains` only when the effective model-fallback policy is `auto`) and print the role changes. Exit `4` on an unknown house |
 | `$MGR house` | `{provider, model, house}` read off your own session — what a launch falls back to when nothing is configured |
 
 Exit codes: `0` ok · `1` unexpected · `2` usage · `3` refused / invalid state · `4` not found.
@@ -440,10 +446,11 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `paused_by_operator` | `true` while the operator's launch gate is on (`$MGR pause`); `$MGR unpause` clears it |
 | `cap` | the effective cap: `--cap` > `MGR_CAP` > `$MGR config get cap` > `3` — all of them overridden to `0` while `paused_by_operator` is true, `--cap N` included |
 | `slots_free` | `cap − (in_flight + adopting)`, never below `0` — the only thing `launch` gates on |
-| `config` | the effective harness config: `omp-arg`, `env`, `brief-extra`, `cap`, `rigor`, `sizing` |
+| `config` | the effective harness config: `omp-arg`, `env`, `brief-extra`, `cap`, `rigor`, `sizing`, `model-fallback` |
 | `house` | the model package a launch would overlay right now: `$MGR config get house`, else this session's own house; `null` when nothing resolves and `launch` refuses |
 | `rigor` | the effective verification rigor every launch verifies under: `sprint` \| `production`, never `null` — `MGR_RIGOR`, else `$MGR config get rigor`, else `production` (builder.md §7) |
 | `sizing` | the effective sizing bias — every issue is sized under it, and every builder's tie-break resolves under it: `lean` \| `balanced` \| `careful`, never `null` — `MGR_SIZING`, else `$MGR config get sizing`, else `balanced` (§3(b)) |
+| `model_fallback` | the effective model-fallback policy every launch overlays: `never` \| `ask` \| `auto`, never `null` — `MGR_MODEL_FALLBACK`, else `$MGR config get model-fallback`, else `never` |
 | `manager` | `{pane_id,tab_id,agent,cwd}` of the live agent whose tab is labelled `manager`, or `null` — the detection key external tooling uses to find the manager tab |
 | `self` | the calling pane (`HERDR_PANE_ID`), or `null` outside a herdr pane |
 | `quota.guard` | `running` \| `stale` \| `stopped` — nothing is reignited and no projection moves unless it is `running` |
@@ -463,6 +470,9 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `overview.timeline.drains_at` | machine-wide: the ETA of the last queued issue of any manager (`last_eta` is the same number) |
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
 | `in_flight[].size` `ready[].size` `blocked[].size` `awaiting_approval[].size` | that issue's size from its `size:` label — `tiny` \| `small` \| `medium` \| `large`, or `null` when it has none (`launch` refuses on `null`) |
+| `in_flight[].model` `awaiting_approval[].model` | the bare model id from the last assistant message in the builder's session transcript, or `null` before one lands |
+| `in_flight[].launch_model` `awaiting_approval[].launch_model` | the bare model id the house package named at launch (`modelRoles.builder`), or `null` for an adopted builder |
+| `in_flight[].model_changed` `awaiting_approval[].model_changed` | `"<launch_model>→<model>"` when the harness switched the builder off its launch model, else `null` |
 | `unmanaged[].requested` `unmanaged[].requested_at` `unmanaged[].requested_issue` | the pane asked to be adopted via `mgr register` — `true` / ms epoch / the issue number it named, or `null`; cleared once `adopt` runs |
 
 ### Labels
@@ -517,6 +527,7 @@ either.
 | `MGR_BRIEF_EXTRA` | unset | path to a markdown file appended to every brief; overrides git `mgr.brief-extra` |
 | `MGR_RIGOR` | `production` | verification rigor for builders, `sprint`\|`production`; overrides git `mgr.rigor` |
 | `MGR_SIZING` | `balanced` | issue-size classification bias for builders, `lean`\|`balanced`\|`careful`; overrides git `mgr.sizing` |
+| `MGR_MODEL_FALLBACK` | `never` | coding-plan model-fallback policy for builder launches, `never`\|`ask`\|`auto`; overrides git `mgr.model-fallback` |
 | `MGR_STATE_DIR` | `~/.local/state/mgr-guard` | the guard's ledger: pid, log, `state.json`, manager registrations |
 | `MGR_GUARD_BIN` | `mgr-guard` next to `mgr` | the guard executable `mgr` shells out to |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks |
@@ -527,8 +538,8 @@ either.
 | `MGR_GUARD_BACKLOG_INTERVAL_S` | `120` | seconds between the guard's per-repo `gh issue list` refreshes for the overview |
 | `MGR_DEFAULT_TASK_S` | `2700` | task duration assumed when a repo has no throughput history and neither does the machine |
 
-Precedence for `cap`, `omp-arg`, `env`, `brief-extra`, `rigor` and `sizing`: CLI flag (where the
-key has one) > `MGR_*` env > git config (`$MGR config`) > built-in default.
+Precedence for `cap`, `omp-arg`, `env`, `brief-extra`, `rigor`, `sizing` and `model-fallback`: CLI
+flag (where the key has one) > `MGR_*` env > git config (`$MGR config`) > built-in default.
 
 ### Headless
 

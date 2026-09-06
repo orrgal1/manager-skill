@@ -348,6 +348,25 @@ cat >"$fix/stall-49.json" <<'EOF'
  "since":1788520000000,"retry_after_ms":976000}
 EOF
 
+# what omp puts on the builder's pane when the coding plan runs low: the
+# reserve dialog, offering to finish the work on a weaker model. Verbatim from
+# the incident that opened issue #56, box drawing and all. Copied into place as
+# pane-issue-49.txt only by the cases that want the dialog on screen.
+cat >"$fix/dialog-49.txt" <<'EOF'
+  ⎋ Working…
+
+╭─ Coding-plan reserve reached ──────────────────────────────────────────────────────────╮
+│                                                                                        │
+│ anthropic/claude-fable-5-1:high has 7.0% remaining. Switch to anthropic/claude-opus-5:high? Choose No to keep using the current plan. │
+│                                                                                        │
+│  ❯ Yes                                                                                 │
+│    No                                                                                  │
+│                                                                                        │
+│ up/down navigate  enter select  esc cancel                                             │
+│                                                                                        │
+╰────────────────────────────────────────────────────────────────────────────────────────╯
+EOF
+
 # ------------------------------------------------------------------ fakes
 
 cat >"$bin/gh" <<'EOF'
@@ -420,6 +439,12 @@ case "${1:-} ${2:-}" in
           "$MGR_TEST_ON_RESUME"
         fi;;
     esac
+    exit 0;;
+  "agent read")
+    # the builder's pane text, from a fixture named after the target: no
+    # fixture means nothing interesting on screen
+    f="$MGR_TEST_FIX/pane-${3:-}.txt"
+    [ -f "$f" ] && cat "$f"
     exit 0;;
   "agent rename") exit 0;;
   "tab rename") exit 0;;
@@ -876,7 +901,67 @@ check 'agent_status passthrough' blocked "$(jq -r '.agent_status' <<<"$out")"
 check 'no stall key'          false "$(jq -r 'has("stall")' <<<"$out")"
 check 'report'                 null "$(jq -r '.report' <<<"$out")"
 
-printf '\n# 4f. wait usage: exactly one target, flag on either side\n'
+printf '\n# 4f. the reserve dialog, parsed straight off the pane text\n'
+out=$("$MGR" _fallback-prompt <"$fix/dialog-49.txt"); rc=$?
+check '_fallback-prompt exit'      0 "$rc"
+check '_fallback-prompt from' anthropic/claude-fable-5-1:high \
+  "$(jq -r '.from' <<<"$out")"
+check '_fallback-prompt to'   anthropic/claude-opus-5:high \
+  "$(jq -r '.to' <<<"$out")"
+check 'a pane with no dialog is null' null \
+  "$(printf '  \xe2\x8e\x8b Working…\n' | "$MGR" _fallback-prompt)"
+
+printf '\n# 4g. wait on a builder omp is holding on that dialog\n'
+cp "$fix/dialog-49.txt" "$fix/pane-issue-49.txt"
+: >"$MGR_TEST_LOG"
+out=$("$MGR" wait 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'wait agent_status' model-fallback-prompt "$(jq -r '.agent_status' <<<"$out")"
+check 'wait number'              49 "$(jq -r '.number' <<<"$out")"
+check 'wait pane_id'          w9:p2 "$(jq -r '.pane_id' <<<"$out")"
+check 'wait from' anthropic/claude-fable-5-1:high "$(jq -r '.from' <<<"$out")"
+check 'wait to'   anthropic/claude-opus-5:high    "$(jq -r '.to' <<<"$out")"
+check 'wait report'            null "$(jq -r '.report' <<<"$out")"
+check 'no stall key'          false "$(jq -r 'has("stall")' <<<"$out")"
+check 'the pane was read once, unwrapped' 1 \
+  "$(grep -cx 'herdr agent read issue-49 --source recent-unwrapped --lines 60' \
+       "$MGR_TEST_LOG" || true)"
+
+printf '\n# 4h. a builder that reported is never read off the pane\n'
+cat >"$fix/comments-49.json" <<'JSON'
+{"comments":[{"body":"manager-report: status=awaiting-approval pr=https://github.com/owner/name/pull/49",
+  "createdAt":"2026-09-04T14:00:00Z"}]}
+JSON
+: >"$MGR_TEST_LOG"
+out=$("$MGR" wait 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'report wins over the dialog' awaiting-approval \
+  "$(jq -r '.report.status' <<<"$out")"
+check 'agent_status passthrough' blocked "$(jq -r '.agent_status' <<<"$out")"
+check 'the pane was never read'   0 \
+  "$(grep -c 'herdr agent read' "$MGR_TEST_LOG" || true)"
+rm -f "$fix/comments-49.json"
+
+printf '\n# 4i. nor is one that is still working\n'
+cp "$fix/agent-issue-49.json" "$fix/agent-working.json"
+jq '.result.agent.agent_status = "working"' "$fix/agent-working.json" \
+  >"$fix/agent-issue-49.json"
+: >"$MGR_TEST_LOG"
+out=$("$MGR" wait 49); rc=$?
+check 'wait exit'                 0 "$rc"
+check 'agent_status passthrough' working "$(jq -r '.agent_status' <<<"$out")"
+check 'the pane was never read'   0 \
+  "$(grep -c 'herdr agent read' "$MGR_TEST_LOG" || true)"
+mv "$fix/agent-working.json" "$fix/agent-issue-49.json"
+
+printf '\n# 4j. no dialog on the pane: the ordinary wait result is back\n'
+rm -f "$fix/pane-issue-49.txt"
+out=$("$MGR" wait 49)
+check 'agent_status passthrough' blocked "$(jq -r '.agent_status' <<<"$out")"
+check 'no from key'           false "$(jq -r 'has("from")' <<<"$out")"
+check 'report'                 null "$(jq -r '.report' <<<"$out")"
+
+printf '\n# 4k. wait usage: exactly one target, flag on either side\n'
 export MGR_TEST_STALL="$fix/stall-49.json"
 err=$("$MGR" wait 49 50 2>&1 >/dev/null); rc=$?
 check 'two targets exit'          2 "$rc"
@@ -1100,19 +1185,24 @@ check 'board finds the guard next to the real script' running \
 # ------------------------------------- 7b. package / setup / house
 
 printf '\n# 7b. package and setup exec the sibling installer; house reads the session\n'
-# the installer as shipped next to mgr: it echoes its argv and the MGR_ROOT it
-# was handed, which is how it finds omp/ through a symlinked checkout
+# the installer as shipped next to mgr: it echoes its argv, the MGR_ROOT it was
+# handed (which is how it finds omp/ through a symlinked checkout) and the
+# model-fallback policy it is meant to install under
 cat >"$pkg/bin/mgr-package" <<'EOF'
 #!/usr/bin/env bash
-printf '{"argv":"%s","root":"%s"}\n' "$*" "${MGR_ROOT:-}"
+printf '{"argv":"%s","root":"%s","mf":"%s"}\n' "$*" "${MGR_ROOT:-}" "${MGR_MODEL_FALLBACK:-}"
 EOF
 chmod +x "$pkg/bin/mgr-package"
 check 'package execs the installer with the subcommand first' \
-  "$(jq -nc --arg r "$real_pkg" '{argv:"package --list",root:$r}')" \
+  "$(jq -nc --arg r "$real_pkg" '{argv:"package --list",root:$r,mf:"never"}')" \
   "$("$link" package --list)"
 check 'setup execs the same installer' \
-  "$(jq -nc --arg r "$real_pkg" '{argv:"setup",root:$r}')" \
+  "$(jq -nc --arg r "$real_pkg" '{argv:"setup",root:$r,mf:"never"}')" \
   "$("$link" setup)"
+# the policy travels as an env var: the store's value by default, and an
+# explicit MGR_MODEL_FALLBACK straight through
+check 'the installer is handed the configured policy' auto \
+  "$(MGR_MODEL_FALLBACK=auto "$link" setup | jq -r '.mf')"
 err=$("$tmp/nopkg/bin/mgr" package 2>&1 >/dev/null); rc=$?
 check 'package without the installer exits 4' 4 "$rc"
 check 'package without the installer says where it looked' true \
@@ -1557,6 +1647,10 @@ check 'bind exit'                 0 "$rc"
 check 'bind number'              7 "$(jq -r '.number' <<<"$out")"
 check 'the launch stamp landed' "7/$pin/small" \
   "$(jq -r '."7" | "\(.number)/\(.launched_at)/\(.launched_size)"' "$launches")"
+jq --arg lm 'anthropic/claude-fable-5-1:high' '.["7"].launch_model = $lm' "$launches" \
+  >"$launches.next" && mv "$launches.next" "$launches"
+check 'the launch_model was hand-seeded onto the stamp' 'anthropic/claude-fable-5-1:high' \
+  "$(jq -r '."7".launch_model' "$launches")"
 
 # issue 7 is resized after launch: the label at retire reads medium, and the
 # record must keep the small it was launched as beside it
@@ -1591,6 +1685,9 @@ assert_jq 'merged_at came from the pr, not the comment' "$row" '.merged_at_sourc
 assert_jq 'schema is 1'                                 "$row" '.schema == 1'
 assert_jq 'size from the size: label at retire'         "$row" '.size == "medium"'
 assert_jq 'launched_size from the launch stamp'         "$row" '.launched_size == "small"'
+assert_jq 'launch_model carried from the hand-seeded stamp'    "$row" '.launch_model == "anthropic/claude-fable-5-1:high"'
+assert_jq 'models: launch model short form first, then session models' "$row" \
+  '.models == ["claude-fable-5-1","claude-smol"]'
 assert_jq 'pr from the report'                          "$row" '.pr == "https://github.com/owner/name/pull/70"'
 assert_jq 'sha from the report'                         "$row" '.sha == "abc"'
 assert_jq 'report.review'                               "$row" '.report.review == "sweep"'
@@ -1678,6 +1775,8 @@ assert_jq 'the report still comes through for an adoptee'     "$row9" '.report.r
 assert_jq 'unreadable session: read is false'                 "$row9" '.session.read == false'
 assert_jq 'unreadable session: turns is null'                 "$row9" '.session.turns == null'
 assert_jq 'unreadable session: subagent count is null'        "$row9" '.session.subagents.count == null'
+assert_jq 'no launch stamp -> launch_model is null'          "$row9" '.launch_model == null'
+assert_jq 'unreadable session, no stamp -> models is null'   "$row9" '.models == null'
 
 comment9="$MGR_TEST_FIX/comment-9.md"
 check 'comment-9 header line' \
@@ -1692,6 +1791,12 @@ assert_jq 'comment-9 fenced json equals the ledger row' \
 # ledger's dedupe lets the row through
 sed 's/sha=def/sha=ghi/' "$fix/comments-9.json" >"$fix/comments-9.json.next" \
   && mv "$fix/comments-9.json.next" "$fix/comments-9.json"
+# swap issue-9's session pointer to the readable bsess fixture: a legacy
+# stamp (no launch_model) paired with a real session proves launch_model
+# stays null while models still comes from session.models
+jq --arg sess "$bsess" \
+  '(.result.agents[] | select(.name == "issue-9") | .agent_session.value) = $sess' \
+  "$fix/agents.json" >"$fix/agents.json.next" && mv "$fix/agents.json.next" "$fix/agents.json"
 jq -nc --argjson at "$pin" '{"9":{number:9,launched_at:$at}}' >"$launches"
 out=$(MGR_GUARD_NOW_MS="$pin" "$MGR" retire 9 2>/dev/null)
 check 'retire reports the row #9 (legacy stamp)' true "$(jq -r '.throughput_appended' <<<"$out")"
@@ -1699,10 +1804,21 @@ row9l=$(jq -sc '.[-1]' "$thru")
 assert_jq 'legacy stamp -> launched_at kept'      "$row9l" ".launched_at == $pin"
 assert_jq 'legacy stamp -> duration_s measured'   "$row9l" '.duration_s == 10800'
 assert_jq 'legacy stamp -> launched_size is null' "$row9l" '.launched_size == null'
+assert_jq 'legacy stamp -> launch_model is null'  "$row9l" '.launch_model == null'
+assert_jq 'legacy stamp -> models from the now-readable session' "$row9l" \
+  '.models == ["claude-fable-5-1","claude-smol"]'
 check 'comment-9 header line (legacy stamp)' \
-  'execution: #9 · ?→small · 10800s · ? turns · ? tokens · $? · review none/skipped · merged_at from comment' \
+  'execution: #9 · ?→small · 10800s · 3 turns · 678 tokens · $0.6 · review none/skipped · merged_at from comment' \
   "$(sed -n '1p' "$comment9")"
 check 'the legacy stamp was consumed' '{}' "$(jq -c '.' "$launches")"
+
+printf '\n# 10a-unit. session_facts, sourced directly from mgr-lib.sh\n'
+# shellcheck source=bin/mgr-lib.sh
+. "$root/bin/mgr-lib.sh"
+check 'session_facts reads the last assistant message off the tail' \
+  '{"provider":"anthropic","model":"claude-smol"}' "$(session_facts "$bsess")"
+check 'session_facts on a missing file is all null' \
+  '{"provider":null,"model":null}' "$(session_facts "$tmp/no-such-session.jsonl")"
 
 # ---------------------------- 10b. two builders binding at the same time
 

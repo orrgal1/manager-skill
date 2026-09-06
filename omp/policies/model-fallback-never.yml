@@ -1,0 +1,6 @@
+# model-fallback: never — the default a builder launches with.
+# A builder finishes on the model it was briefed with: no automatic switch when
+# the plan reserve runs low, and no prompt either. The session stops instead.
+retry:
+  modelFallback: false
+  usageAwareFallback: false

@@ -1,0 +1,7 @@
+# model-fallback: auto — a builder switches models on its own to keep going.
+# The plan reserve swaps to the next model in the chain without asking, so a
+# build can finish on a weaker model than it was briefed with. Opt-in only.
+retry:
+  modelFallback: true
+  usageAwareFallback: true
+  usageReservePolicy: auto

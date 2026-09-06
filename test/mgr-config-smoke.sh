@@ -19,6 +19,8 @@ ext="$(cd "$here/.." && pwd -P)/extensions/mgr-status.ts"
 wf="$(cd "$here/.." && pwd -P)/workflows"
 # and with the model-role overlay of its house, from omp/packages/
 pkgs="$(cd "$here/.." && pwd -P)/omp/packages"
+# and with the model-fallback policy overlay, from omp/policies/
+pols="$(cd "$here/.." && pwd -P)/omp/policies"
 # the paths `mgr` reports as itself and as the contract (readlink -f of $MGR)
 MGR_REAL="$(cd "$here/.." && pwd -P)/bin/mgr"
 MGR_REAL_BUILDER="$(cd "$here/.." && pwd -P)/builder.md"
@@ -199,7 +201,7 @@ check 'primary is the throwaway repo' "$repo" "$("$MGR" board | jq -r '.primary'
 
 printf '\n# 1. mgr config: git-config backed CRUD\n'
 check 'list on a fresh repo' \
-  '{"omp-arg":[],"env":[],"brief-extra":null,"cap":null,"house":null,"rigor":null,"sizing":null}' \
+  '{"omp-arg":[],"env":[],"brief-extra":null,"cap":null,"house":null,"rigor":null,"sizing":null,"model-fallback":null}' \
   "$("$MGR" config list)"
 check 'get unset multi'   '{"key":"omp-arg","value":[]}'   "$("$MGR" config get omp-arg)"
 check 'get unset single'  '{"key":"cap","value":null}'      "$("$MGR" config get cap)"
@@ -264,6 +266,31 @@ err=$("$MGR" config add sizing x 2>&1 >/dev/null); rc=$?
 check 'add sizing (single-valued) exit' 2 "$rc"
 check 'add sizing (single-valued) message' 'config key sizing is single-valued: use set' \
   "$(jq -r '.error.message' <<<"$err")"
+check 'get model-fallback unset' '{"key":"model-fallback","value":null}' \
+  "$("$MGR" config get model-fallback)"
+check 'set model-fallback ask'   '{"key":"model-fallback","value":"ask"}' \
+  "$("$MGR" config set model-fallback ask)"
+check 'set model-fallback auto'  '{"key":"model-fallback","value":"auto"}' \
+  "$("$MGR" config set model-fallback auto)"
+check 'set model-fallback never' '{"key":"model-fallback","value":"never"}' \
+  "$("$MGR" config set model-fallback never)"
+"$MGR" config set model-fallback ask >/dev/null
+check 'model-fallback is stored under mgr.model-fallback' ask \
+  "$(git -C "$repo" config --local --get-all mgr.model-fallback)"
+check 'the working tree stays clean after set model-fallback' '' \
+  "$(git -C "$repo" status --porcelain)"
+check 'unset model-fallback' '{"key":"model-fallback","value":null}' \
+  "$("$MGR" config unset model-fallback)"
+err=$("$MGR" config set model-fallback bogus 2>&1 >/dev/null); rc=$?
+check 'a bogus model-fallback exit' 2 "$rc"
+check 'a bogus model-fallback message' \
+  'model-fallback must be one of never|ask|auto: bogus' \
+  "$(jq -r '.error.message' <<<"$err")"
+err=$("$MGR" config add model-fallback ask 2>&1 >/dev/null); rc=$?
+check 'add model-fallback (single-valued) exit' 2 "$rc"
+check 'add model-fallback (single-valued) message' \
+  'config key model-fallback is single-valued: use set' \
+  "$(jq -r '.error.message' <<<"$err")"
 
 check 'get omp-arg'  '{"key":"omp-arg","value":["--extension","/abs/ext.ts"]}' \
   "$("$MGR" config get omp-arg)"
@@ -275,7 +302,7 @@ check 'get cap is a number' '{"key":"cap","value":4}' "$("$MGR" config get cap)"
 check 'list' \
   "$(jq -nc --arg be "$fix/extra.md" \
      '{"omp-arg":["--extension","/abs/ext.ts"],env:["LINK=ws://127.0.0.1:1/link"],
-       "brief-extra":$be,cap:4,house:null,rigor:null,sizing:null}')" \
+       "brief-extra":$be,cap:4,house:null,rigor:null,sizing:null,"model-fallback":null}')" \
   "$("$MGR" config list)"
 
 check 'stored in the primary .git/config' "$(printf -- '--extension\n/abs/ext.ts')" \
@@ -294,7 +321,7 @@ check 'set replaces the whole list' '{"key":"omp-arg","value":["x"]}' \
 err=$("$MGR" config get bogus 2>&1 >/dev/null); rc=$?
 check 'unknown key exit' 2 "$rc"
 check 'unknown key message' \
-  'unknown config key: bogus (omp-arg|env|brief-extra|cap|house|rigor|sizing)' \
+  'unknown config key: bogus (omp-arg|env|brief-extra|cap|house|rigor|sizing|model-fallback)' \
   "$(jq -r '.error.message' <<<"$err")"
 err=$("$MGR" config add cap 3 2>&1 >/dev/null); rc=$?
 check 'add on a single-valued key exit' 2 "$rc"
@@ -384,9 +411,41 @@ check 'hand-edited store: config get sizing still echoes the raw value' \
   '{"key":"sizing","value":"bogus"}' "$("$MGR" config get sizing)"
 "$MGR" config unset sizing >/dev/null
 
+# --------------------------------------------------- 2d. model-fallback precedence
+
+printf '\n# 2d. model-fallback: MGR_MODEL_FALLBACK > git config > never, bad values warn to stderr\n'
+"$MGR" config set model-fallback ask >/dev/null
+check 'git config model-fallback'           ask  "$("$MGR" board | jq -r '.model_fallback')"
+check 'MGR_MODEL_FALLBACK beats git config' auto \
+  "$(MGR_MODEL_FALLBACK=auto "$MGR" board | jq -r '.model_fallback')"
+check 'board .config["model-fallback"] tracks a non-default' ask \
+  "$("$MGR" board | jq -r '.config["model-fallback"]')"
+"$MGR" config unset model-fallback >/dev/null
+check 'default model-fallback'              never "$("$MGR" board | jq -r '.model_fallback')"
+
+: >"$tmp/mf.err"
+out=$(MGR_MODEL_FALLBACK=bogus "$MGR" board 2>"$tmp/mf.err")
+check 'bad MGR_MODEL_FALLBACK: board stdout still parses as JSON' true \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && printf true || printf false)"
+check 'bad MGR_MODEL_FALLBACK: falls back to never' never "$(jq -r '.model_fallback' <<<"$out")"
+check 'bad MGR_MODEL_FALLBACK: warns on stderr' true \
+  "$(contains 'mgr: warning: model-fallback must be one of never|ask|auto: bogus — launching as never' \
+     "$(cat "$tmp/mf.err")")"
+check 'bad MGR_MODEL_FALLBACK: warns exactly once' 1 "$(wc -l <"$tmp/mf.err" | tr -d ' ')"
+
+git -C "$repo" config --local mgr.model-fallback bogus
+: >"$tmp/mf2.err"
+out=$("$MGR" board 2>"$tmp/mf2.err")
+check 'hand-edited store: falls back to never' never "$(jq -r '.model_fallback' <<<"$out")"
+check 'hand-edited store: model-fallback warns exactly once' 1 \
+  "$(wc -l <"$tmp/mf2.err" | tr -d ' ')"
+check 'hand-edited store: config get model-fallback still echoes the raw value' \
+  '{"key":"model-fallback","value":"bogus"}' "$("$MGR" config get model-fallback)"
+"$MGR" config unset model-fallback >/dev/null
+
 # --------------------------------------------------- 3. launch wiring
 
-printf '\n# 3. launch: --model @builder + the house overlay, then omp-arg after --, one --env per entry, brief-extra appended\n'
+printf '\n# 3. launch: --model @builder + the house and policy overlays, then omp-arg after --, one --env per entry, brief-extra appended\n'
 "$MGR" config set cap 3 >/dev/null
 "$MGR" config add omp-arg --extension >/dev/null
 "$MGR" config add omp-arg /abs/ext.ts >/dev/null
@@ -403,7 +462,11 @@ check 'launch worktree'  "$wt" "$(jq -r '.worktree' <<<"$out")"
 check 'tab create argv' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env LINK=ws://127.0.0.1:1/link --env OTHER=x --no-focus" "$MGR_TEST_LOG" || true)"
 check 'agent start argv' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --extension /abs/ext.ts" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml --extension /abs/ext.ts" "$MGR_TEST_LOG" || true)"
+# the model the house's package briefs a builder as, stamped so retire can say
+# what the build started on (the stamp itself is record_launch's)
+check 'launches stamp carries the house builder model' anthropic/claude-fable-5-1:high \
+  "$(jq -r '.["7"].launch_model' "$tmp/state/launches/owner__name.json")"
 
 prompt=$(cat "$MGR_TEST_PROMPT")
 check 'brief head' true \
@@ -448,27 +511,53 @@ MGR_OMP_ARGS='--foo bar' MGR_ENV='A=1 B=2' MGR_BRIEF_EXTRA="$fix/other.md" \
   "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
 check 'MGR_OMP_ARGS replaces the git list' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --foo bar" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml --foo bar" "$MGR_TEST_LOG" || true)"
 check 'MGR_ENV replaces the git list' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env A=1 --env B=2 --no-focus" "$MGR_TEST_LOG" || true)"
 check 'MGR_BRIEF_EXTRA replaces the git path' "$(printf '\nOverride rules')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 2)"
 drop_wt
 
-printf '\n# 3d. no config at all: no --env, only the status extension and the model after --\n'
+printf '\n# 3d. no config at all: no --env, only the status extension, the model and the two overlays after --\n'
 "$MGR" config unset omp-arg >/dev/null
 "$MGR" config unset env >/dev/null
 "$MGR" config unset brief-extra >/dev/null
 : >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
 "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
-check 'agent start has only the status extension and the model' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml" "$MGR_TEST_LOG" || true)"
+check 'agent start has only the status extension, the model and the overlays' 1 \
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml" "$MGR_TEST_LOG" || true)"
 check 'tab create has no --env' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --no-focus" "$MGR_TEST_LOG" || true)"
 check 'brief has no extra' 1 \
   "$(printf '%s\n' "$(cat "$MGR_TEST_PROMPT")" | wc -l | tr -d ' ')"
 drop_wt
+
+printf '\n# 3d2. the model-fallback policy picks the overlay; a missing one stops the launch\n'
+: >"$MGR_TEST_LOG"
+MGR_MODEL_FALLBACK=ask "$MGR" launch 7 >/dev/null; rc=$?
+check 'launch exit (model-fallback ask)' 0 "$rc"
+check 'the ask overlay is the second --config' 1 \
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-ask.yml" "$MGR_TEST_LOG" || true)"
+drop_wt
+
+# an overlay omp could not read would fail at `herdr agent start`, with a
+# worktree and a tab already created: a checkout whose omp/policies is empty
+# proves the pre-flight check refuses before anything exists
+broken="$tmp/broken"
+mkdir -p "$broken/bin" "$broken/omp/packages" "$broken/omp/policies"
+cp "$MGR" "$here/../bin/mgr-lib.sh" "$broken/bin/"
+cp "$here/../omp/packages/anthropic.yml" "$broken/omp/packages/"
+: >"$MGR_TEST_LOG"
+err=$("$broken/bin/mgr" launch 7 2>&1 >/dev/null); rc=$?
+check 'missing overlay: exit' 4 "$rc"
+check 'missing overlay: message names the file' \
+  "model-fallback overlay missing: $broken/omp/policies/model-fallback-never.yml" \
+  "$(jq -r '.error.message' <<<"$err")"
+check 'missing overlay: nothing was created' 0 \
+  "$(grep -c 'herdr tab create' "$MGR_TEST_LOG" || true)"
+check 'missing overlay: no worktree' false \
+  "$(if [ -d "$wt" ]; then printf true; else printf false; fi)"
 
 printf '\n# 3e. the size label is a launch precondition\n'
 : >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
@@ -747,7 +836,8 @@ out=$("$MGR" board)
 check 'board .config' \
   "$(jq -nc --arg be "$fix/extra.md" \
      '{"omp-arg":["--extension"],env:["LINK=ws://127.0.0.1:1/link"],
-       "brief-extra":$be,cap:4,rigor:"production",sizing:"balanced"}')" \
+       "brief-extra":$be,cap:4,rigor:"production",sizing:"balanced",
+       "model-fallback":"never"}')" \
   "$(jq -c '.config' <<<"$out")"
 check 'board .config.cap == .cap' true \
   "$(jq -r '.config.cap == .cap' <<<"$out")"
@@ -757,6 +847,9 @@ check 'board .config.rigor == .rigor' true \
 check 'board .config.sizing' balanced "$(jq -r '.config.sizing' <<<"$out")"
 check 'board .config.sizing == .sizing' true \
   "$(jq -r 'if .config.sizing == .sizing then "true" else "false" end' <<<"$out")"
+check 'board .model_fallback' never "$(jq -r '.model_fallback' <<<"$out")"
+check 'board .config["model-fallback"] == .model_fallback' true \
+  "$(jq -r 'if .config["model-fallback"] == .model_fallback then "true" else "false" end' <<<"$out")"
 manager=$(jq -nc --arg cwd "$repo" \
   '{pane_id:"w9:p1",tab_id:"w9:t1",agent:"manager",cwd:$cwd}')
 check 'board .manager' "$manager" "$(jq -c '.manager' <<<"$out")"
@@ -835,9 +928,12 @@ check 'usage mentions rigor in the config clause' true \
   "$(if [ "$("$MGR" --help | grep -c 'rigor' || true)" -ge 1 ]; then printf true; else printf false; fi)"
 check 'usage mentions sizing in the config clause' 1 \
   "$("$MGR" --help | grep -c '(lean|balanced|careful' || true)"
+check 'usage mentions model-fallback in the config clause' 1 \
+  "$("$MGR" --help | grep -c '(never|ask|auto' || true)"
 check 'usage lists mgr register' 1 \
   "$("$MGR" --help | grep -cF -- 'mgr register [N]' || true)"
-for v in MGR_OMP_ARGS MGR_ENV MGR_BRIEF_EXTRA MGR_CAP MGR_RIGOR MGR_SIZING HERDR_WORKSPACE_ID; do
+for v in MGR_OMP_ARGS MGR_ENV MGR_BRIEF_EXTRA MGR_CAP MGR_RIGOR MGR_SIZING \
+         MGR_MODEL_FALLBACK HERDR_WORKSPACE_ID; do
   check "usage lists $v" 1 "$("$MGR" --help | grep -c "$v" || true)"
 done
 

@@ -44,6 +44,10 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   `medium`, `large`, `plan`, `sketch`, `crux`, `sweep`) into the omp agent directory and applies
   `omp/packages/<house>.yml`; `mgr package <house>` switches houses (`anthropic`, `openai`,
   `gemini`) later. One YAML per house maps every role to one rung of that subscription's ladder.
+  Every launch also overlays a `model-fallback` policy (`mgr config set model-fallback`,
+  `MGR_MODEL_FALLBACK`; `never`\|`ask`\|`auto`, default `never`) that gates the coding-plan
+  fallback dialog; `mgr setup`/`mgr package` write `retry.fallbackChains` into the omp config only
+  when that policy is `auto`.
 - **A concurrency cap** (default 3; `mgr config set cap N`, `MGR_CAP` or `--cap N`). New requests
   are slotted: launched now, queued behind the in-flight set, or blocked by `Blocked by: #a, #b`
   in the issue body.
@@ -160,6 +164,7 @@ or `null` when there is none. `omp-arg` and `env` apply to newly launched builde
 | `bin/mgr-guard` | `start` · `stop` · `status` · `overview` · `tick` · `run` · `register` · `touch` · `stall` — the quota daemon |
 | `bin/mgr-package` | `package` · `setup` — installs the size agents and applies a model package into the omp config; reached as `mgr package` / `mgr setup` |
 | `omp/packages/<house>.yml` | One model package per subscription — `anthropic` · `openai` · `gemini`: `modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains` |
+| `omp/policies/model-fallback-{never,ask,auto}.yml` | Per-launch omp `--config` overlays for the coding-plan fallback dialog: `never` disables it, `ask` allows it (relayed to the operator, never answered), `auto` lets the harness switch models on its own |
 | `omp/agents/<name>.md` | The eight agent files `mgr setup` installs: `tiny` · `small` · `medium` · `large` · `plan` · `sketch` · `crux` · `sweep` |
 | `extensions/mgr-status.ts` | omp status-line indicator: rate-limited / guard stopped / project paused, optional burn item |
 | `install.sh` | Symlinks the checkout into `~/.claude/skills/manager`; `--omp-extension` also links the status-line extension into `~/.omp/agent/extensions/`, `--omp` also runs `mgr-package setup` |
@@ -292,7 +297,7 @@ render above filters it. `--limit N` decides how much of this repo's own queue i
 ```
 quota    5-hour 80% used, runs out in ~30m, resets in 2h00 (14:00Z) · weekly 20% used · shared with 1 other project
 work     1 of 2 builders running, 10 ready, 1 blocked · out of work in 6h45 (18:45Z) · queue clear in 7h30 (19:30Z)
-next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30 · #10 in 3h45
+next     #49 running on claude-opus-5 (launched on claude-fable-5-1), 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30 · #10 in 3h45
          #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · #15 in 6h30 · +2 more
 ```
 
@@ -320,7 +325,9 @@ next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2
   is not registered with the guard`; outside a repo entirely it reads `not inside a repo, so there
   is no queue to show`.
 - **`next`** — this repo's issues only: the in-flight ones first with the time left, then the
-  queued ones with the wait. `(needs #7, #9)` marks one or more blockers, `(after the <window>
+  queued ones with the wait. An in-flight entry reads `#N running on <model>, <time left>`, with
+  ` (launched on <launch_model>)` appended when the harness switched the builder off its launch
+  model. `(needs #7, #9)` marks one or more blockers, `(after the <window>
   reset)` marks the first issue that only lands once the exhausting quota window of this manager's
   own provider reopens — never a window on a provider it doesn't draw on — the window's plain
   name, e.g. `5-hour` or `weekly` — and `+N more` is the true remainder of this
@@ -417,6 +424,8 @@ operator's only pace dial.
 | `merged_at_source` | `"pr"` \| `"comment"` | mgr | — | no |
 | `size` | string | `size:` label at retire (`gh issue view <N> --json labels`, jq locally, no `-q`) | — | yes |
 | `launched_size` | string | launch stamp: the size the builder was taken with — the `size:` label for `launch` and `bind`; for `adopt`, the briefed size, `medium` when the issue carries no usable label | — | **yes** (no stamp, or `bind` on an issue with no usable label) |
+| `launch_model` | string | launch stamp: the house package's `modelRoles.builder` at launch (e.g. `anthropic/claude-fable-5-1:high`) | — | **yes** (no stamp, or adopted) |
+| `models` | string[] | short model ids used: `launch_model` (shortened) first, then every key of `session.models`, deduped | — | **yes** (neither known) |
 | `pr` | string | report `pr=` | — | yes |
 | `sha` | string | report `sha=` | — | yes |
 | `report.review` | string | report `review=` (`reviewer`\|`sweep`\|`none`) | — | yes |
@@ -475,7 +484,8 @@ sessions. A session that gets it both ways loads it twice and activates it once.
 ## Configuration
 
 The guard is all environment. The per-repo harness config — extra omp args, builder-tab env, an
-extra brief file, the cap, the rigor, the sizing bias — lives in the repo's `.git/config` under
+extra brief file, the cap, the rigor, the sizing bias, the model-fallback policy — lives in the
+repo's `.git/config` under
 `mgr.*` (`mgr config`), and the `MGR_*` variables below override it. The guard's integer knobs
 silently fall back to their default when the value is not a positive integer; `MGR_CAP` is
 stricter — a non-numeric cap is a usage error (exit `2`).
@@ -500,6 +510,15 @@ either.
 | `balanced` (default) | an unsure call resolves up |
 | `careful` | an unsure call resolves up, and the higher rung is taken whenever it is merely plausible |
 
+`model-fallback` is the coding-plan fallback policy every builder launch overlays (`mgr config
+set model-fallback`, `MGR_MODEL_FALLBACK`); the rule is `SKILL.md §6`.
+
+| `model-fallback` | omp overlay | dialog |
+|---|---|---|
+| `never` (default) | `retry.modelFallback: false`, `usageAwareFallback: false` | can't appear |
+| `ask` | `retry.modelFallback: true`, `usageAwareFallback: true`, `usageReservePolicy: confirm` | appears; relayed to the operator, never answered |
+| `auto` | same, `usageReservePolicy: auto` | the harness switches on its own; `mgr setup`/`mgr package` also write `retry.fallbackChains` |
+
 | Variable | Default | Effect |
 |---|---|---|
 | `MGR_CAP` | `3` | concurrency cap when `--cap N` is not passed; overrides `mgr.cap` |
@@ -508,6 +527,7 @@ either.
 | `MGR_BRIEF_EXTRA` | unset | path to a markdown file appended to every brief; overrides `mgr.brief-extra` |
 | `MGR_RIGOR` | `production` | verification rigor for builders, `sprint`\|`production`; overrides `mgr.rigor` |
 | `MGR_SIZING` | `balanced` | issue-size classification bias for builders, `lean`\|`balanced`\|`careful`; overrides `mgr.sizing` |
+| `MGR_MODEL_FALLBACK` | `never` | coding-plan model-fallback policy for builder launches, `never`\|`ask`\|`auto`; overrides `mgr.model-fallback` |
 | `MGR_GUARD_BIN` | `mgr-guard` next to `bin/mgr` | the guard executable `mgr` shells out to |
 | `MGR_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/mgr-guard` | the guard's ledger directory |
 | `MGR_GUARD_INTERVAL` | `60` | seconds between guard ticks (`mgr-guard start --interval S` wins) |

@@ -62,8 +62,8 @@ sanitize_pane() { printf '%s' "$1" | tr ':' '-' | tr '[:upper:]' '[:lower:]'; }
 # must run as its own simple command: `die` inside $(…) kills only a subshell
 cfg_check_key() { # cfg_check_key <key>
   case "${1:-}" in
-    omp-arg|env|brief-extra|cap|house|rigor|sizing) ;;
-    *) die 2 "unknown config key: ${1:-} (omp-arg|env|brief-extra|cap|house|rigor|sizing)";;
+    omp-arg|env|brief-extra|cap|house|rigor|sizing|model-fallback) ;;
+    *) die 2 "unknown config key: ${1:-} (omp-arg|env|brief-extra|cap|house|rigor|sizing|model-fallback)";;
   esac
 }
 
@@ -87,6 +87,8 @@ cfg_check_value() { # cfg_check_value <key> <value>
     house) house_valid "$2" || die 2 "house must be one of anthropic|openai|gemini: $2";;
     rigor) rigor_valid "$2" || die 2 "rigor must be one of sprint|production: $2";;
     sizing) sizing_valid "$2" || die 2 "sizing must be one of lean|balanced|careful: $2";;
+    model-fallback) model_fallback_valid "$2" \
+      || die 2 "model-fallback must be one of never|ask|auto: $2";;
   esac
 }
 
@@ -176,13 +178,37 @@ eff_sizing() { # eff_sizing -> lean|balanced|careful (never empty)
   printf '%s' "${s:-balanced}"
 }
 
-config_json() { # config_json <cap> <rigor> <sizing> -> the effective config object
+# Whether a builder's model may be swapped mid-session when the plan reserve
+# runs low: never (the default), ask (raise the dialog and wait) or auto (swap
+# and carry on). A builder briefed as one model and finishing as a weaker one
+# silently invalidates every size and rigor call the manager made, so the
+# degrade is opt-in per repo. Same precedence and same never-fail contract as
+# rigor and sizing: a bad value is a warning and `never`.
+MGR_MODEL_FALLBACKS='never ask auto'
+
+model_fallback_valid() { # model_fallback_valid <word>
+  case " $MGR_MODEL_FALLBACKS " in *" $1 "*) return 0;; esac
+  return 1
+}
+
+eff_model_fallback() { # eff_model_fallback -> never|ask|auto (never empty)
+  local m="${MGR_MODEL_FALLBACK:-}"
+  [ -n "$m" ] || m=$(cfg_get_one model-fallback)
+  if [ -n "$m" ] && ! model_fallback_valid "$m"; then
+    warn "model-fallback must be one of never|ask|auto: $m — launching as never"
+    m=""
+  fi
+  printf '%s' "${m:-never}"
+}
+
+config_json() { # config_json <cap> <rigor> <sizing> <model-fallback> -> the effective config
   jq -nc --argjson omp "$(json_lines "$(eff_omp_args)")" \
     --argjson env "$(json_lines "$(eff_env)")" \
     --arg brief "$(eff_brief_extra)" --argjson cap "$1" --arg rigor "$2" --arg sizing "$3" \
+    --arg mf "$4" \
     '{"omp-arg":$omp, env:$env,
       "brief-extra":(if $brief=="" then null else $brief end), cap:$cap, rigor:$rigor,
-      sizing:$sizing}'
+      sizing:$sizing, "model-fallback":$mf}'
 }
 
 # brief-extra is operator prose appended to every builder brief. A path that is
@@ -418,6 +444,18 @@ provider_of_house() { # provider_of_house <house> -> provider ("" when unknown)
   printf '%s' "$p"
 }
 
+# The model a launch on this house actually briefs its builder as: `mgr launch`
+# stamps it, so the execution record can say what a build started on and a
+# mid-session swap becomes visible. Same anchored sed and the same never-fail
+# contract as provider_of_house above.
+builder_model_of_house() { # builder_model_of_house <house> -> provider/model:effort ("" when unknown)
+  local h="${1:-}" m=""
+  [ -n "$h" ] || return 0
+  m=$(sed -n '/^modelRoles:/,/^[^[:space:]#]/{/^  builder:/{s|^  builder:[[:space:]]*||p;q;};}' \
+    "$MGR_OMP_DIR/packages/$h.yml" 2>/dev/null) || m=""
+  printf '%s' "$m"
+}
+
 agent_git() { # agent_git <cwd> -> "<worktree>\t<branch>"  (empty fields when n/a)
   local cwd="$1" wt="" br=""
   if [ -n "$cwd" ] && [ -d "$cwd" ]; then
@@ -617,7 +655,7 @@ launch_unlock() { # launch_unlock <launches-file>
   rmdir "${1%.json}.lock" 2>/dev/null || true
 }
 
-record_launch() { # record_launch <N> [size] — stamp the moment a builder took issue N, and the size it was briefed with
+record_launch() { # record_launch <N> [size] [model] — stamp the moment a builder took issue N, the size it was briefed with, and the model it was launched on
   local rp f cur held=false
   rp=$(own_repo)
   [ -n "$rp" ] || { warn "cannot record launched_at for #$1 (no repo)"; return 0; }
@@ -627,9 +665,10 @@ record_launch() { # record_launch <N> [size] — stamp the moment a builder took
   cur=""
   [ -f "$f" ] && cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
   [ -n "$cur" ] || cur='{}'
-  jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" --arg size "${2:-}" \
+  jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" --arg size "${2:-}" --arg model "${3:-}" \
     '$cur + {($n): {number: ($n | tonumber), launched_at: $at,
-                    launched_size: (if $size == "" then null else $size end)}}' \
+                    launched_size: (if $size == "" then null else $size end),
+                    launch_model: (if $model == "" then null else $model end)}}' \
     | atomic_write "$f" || warn "could not record launched_at for #$1 in $f"
   if $held; then launch_unlock "$f"; fi
 }
@@ -802,6 +841,29 @@ quota_stalled_json() { # quota_stalled_json <N|""> <pane_id> <stall-json>
      report:null}'
 }
 
+# the other `mgr wait` answer that is not a status: omp stopped the builder on
+# the coding-plan reserve dialog, offering to finish the work on a weaker
+# model. That is the operator's call, never the manager's, so the two models
+# are reported verbatim. Pure text matching over the pane — the title pins the
+# dialog, the prompt line carries the models — so a reworded dialog degrades to
+# the ordinary wait result instead of inventing a state.
+fallback_prompt_json() { # fallback_prompt_json <pane text on stdin>
+  local pane pair from to
+  pane=$(cat)
+  case "$pane" in *'Coding-plan reserve reached'*) ;; *) return 0;; esac
+  pair=$(sed -n 's/.*[[:space:]]\([^[:space:]]*\) has [0-9.]*% remaining\. Switch to \([^[:space:]?]*\)?.*/\1 \2/p' <<<"$pane")
+  pair=${pair%%$'\n'*}
+  from="${pair% *}"; to="${pair#* }"
+  [ -n "$pair" ] && [ -n "$from" ] && [ -n "$to" ] || return 0
+  jq -nc --arg from "$from" --arg to "$to" '{from:$from,to:$to}'
+}
+
+cmd_fallback_prompt() {
+  local fp
+  fp=$(fallback_prompt_json)
+  printf '%s\n' "${fp:-null}"
+}
+
 cmd_guard() {
   local sub="${1:-}"
   case "$sub" in
@@ -888,13 +950,14 @@ cfg_list_json() {
     --argjson env "$(json_lines "$(cfg_get_all env)")" \
     --arg brief "$(cfg_get_one brief-extra)" --arg cap "$(cfg_get_one cap)" \
     --arg house "$(cfg_get_one house)" --arg rigor "$(cfg_get_one rigor)" \
-    --arg sizing "$(cfg_get_one sizing)" \
+    --arg sizing "$(cfg_get_one sizing)" --arg mf "$(cfg_get_one model-fallback)" \
     '{"omp-arg":$omp, env:$env,
       "brief-extra":(if $brief=="" then null else $brief end),
       cap:(if $cap=="" then null else ($cap|tonumber) end),
       house:(if $house=="" then null else $house end),
       rigor:(if $rigor=="" then null else $rigor end),
-      sizing:(if $sizing=="" then null else $sizing end)}'
+      sizing:(if $sizing=="" then null else $sizing end),
+      "model-fallback":(if $mf=="" then null else $mf end)}'
 }
 
 # The store, never the effective values: an operator inspecting the config must
@@ -1016,7 +1079,7 @@ cmd_board() {
   # primary is resolved (and cached) here for the same reason: the operator's
   # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
-  local b_manager b_overview b_house b_prov b_rigor b_sizing b_requests board
+  local b_manager b_overview b_house b_prov b_rigor b_sizing b_mf b_requests board
   primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
@@ -1030,7 +1093,8 @@ cmd_board() {
   # operator's pause has collapsed the effective one to 0
   b_rigor=$(eff_rigor)
   b_sizing=$(eff_sizing)
-  b_config=$(config_json "$cap" "$b_rigor" "$b_sizing")
+  b_mf=$(eff_model_fallback)
+  b_config=$(config_json "$cap" "$b_rigor" "$b_sizing" "$b_mf")
   b_manager=$(manager_json "$b_agents")
   # the house a `mgr launch` would pick right now: the flag is the only input
   # the board cannot see. Its package names the provider that house burns, and
@@ -1064,6 +1128,7 @@ cmd_board() {
     --arg prov "$b_prov" \
     --arg rigor "$b_rigor" \
     --arg sizing "$b_sizing" \
+    --arg mf "$b_mf" \
     --arg repo "$b_repo" \
     --arg primary "$b_primary" \
     --arg ws "${HERDR_WORKSPACE_ID:-}" \
@@ -1137,6 +1202,7 @@ cmd_board() {
      house:(if $house=="" then null else $house end),
      rigor:$rigor,
      sizing:$sizing,
+     model_fallback:$mf,
      paused_by_operator:$paused, cap:$cap,
      slots_free:([0, ($cap - ($inflight|length) - ($adopting|length))] | max),
      in_flight:[$inflight[] | .number as $rn
@@ -1523,16 +1589,22 @@ cmd_launch() {
   [ -n "$house" ] \
     || die 3 "cannot determine the model house; run: mgr config set house <anthropic|openai|gemini>"
 
-  local bd sf rigor sizing
+  local bd sf rigor sizing mf pol
   bd=$(cmd_board --cap "$cap")
   sf=$(jq -r '.slots_free' <<<"$bd")
   [ "$sf" -le 0 ] && die 3 "no free slots (cap=$cap)"
-  # the board above already resolved rigor and sizing (and warned on stderr if
-  # either configured value was invalid); reading them back here — board.rigor
-  # and board.sizing are never null — keeps each warning to once per launch
-  # instead of twice.
+  # the board above already resolved rigor, sizing and the model-fallback policy
+  # (and warned on stderr if a configured value was invalid); reading them back
+  # here — none of the three board fields is ever null — keeps each warning to
+  # once per launch instead of twice.
   rigor=$(jq -r '.rigor' <<<"$bd")
   sizing=$(jq -r '.sizing' <<<"$bd")
+  mf=$(jq -r '.model_fallback' <<<"$bd")
+  # An overlay omp cannot read is a hard failure at `herdr agent start`, which
+  # would leave a worktree and a tab behind to clean up: this launch stops here,
+  # before anything exists.
+  pol="$MGR_OMP_DIR/policies/model-fallback-$mf.yml"
+  [ -f "$pol" ] || die 4 "model-fallback overlay missing: $pol"
 
   title=$(jq -r '.title' <<<"$ij")
   policy=$(policy_of "$ij")
@@ -1548,11 +1620,13 @@ cmd_launch() {
 
   # the effective harness config, read before anything is created: one --env per
   # entry for the tab, the omp argv for `herdr agent start … -- …`. The status
-  # extension, the builder role and the house's package overlay come first, then
-  # the operator's omp-args, so `--` is always there. bash 3.2 needs the
-  # `${a[@]+…}` idiom to expand a possibly-empty array under `set -u`.
+  # extension, the builder role, the house's package overlay and the
+  # model-fallback policy come first, then the operator's omp-args, so `--` is
+  # always there and an operator can still override the policy after it. bash
+  # 3.2 needs the `${a[@]+…}` idiom to expand a possibly-empty array under -u.
   local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT" --model "@builder"
-                                 --config "$MGR_OMP_DIR/packages/$house.yml")
+                                 --config "$MGR_OMP_DIR/packages/$house.yml"
+                                 --config "$pol")
   local v
   while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -1606,8 +1680,8 @@ cmd_launch() {
     || { teardown_launch; die 1 "gh issue comment #$n failed"; }
 
   # the builder is live and the issue is labelled: from here on retire can
-  # measure how long it took
-  record_launch "$n" "$size"
+  # measure how long it took, and on which model it started
+  record_launch "$n" "$size" "$(builder_model_of_house "$house")"
 
   jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
     --arg agent "issue-$n" --arg tab "$tab_id" --arg pane "$pane_id" \
@@ -1926,7 +2000,7 @@ cmd_wait() {
 
   # the settle, then the verdict — and by default the verdict may be "the guard
   # is holding it again", which is not an answer for the caller but another lap.
-  local report
+  local report ptext fp
   while :; do
     herdr agent wait "$target" >/dev/null 2>&1 || true
 
@@ -1963,6 +2037,20 @@ cmd_wait() {
           continue
         fi
         quota_stalled_json "$n" "$pane" "$stall"
+        return 0
+      fi
+
+      # (c) settled, no report, no 429 — and one more thing that is not a
+      # status: omp holding it on the coding-plan reserve dialog. The pane is
+      # read exactly here, so a working builder, a builder that reported and a
+      # builder stalled on quota are never touched.
+      ptext=$(herdr agent read "$target" --source recent-unwrapped --lines 60 2>/dev/null || true)
+      fp=$(fallback_prompt_json <<<"$ptext")
+      if [ -n "$fp" ]; then
+        jq -nc --arg n "$n" --arg pane "$pane" --argjson fp "$fp" \
+          '{number:(if $n=="" then null else ($n|tonumber) end), pane_id:$pane,
+            agent_status:"model-fallback-prompt", from:$fp.from, to:$fp.to,
+            report:null}'
         return 0
       fi
     fi
@@ -2059,12 +2147,13 @@ cmd_retire() {
   # human-readable comment on the issue — both posted before the labels go,
   # and never fatal: a retire that races a `gh` outage still records what it
   # can and always reaches the label removal, close and JSON return below.
-  local report stamp launched_at launched_size merged_at merged_at_source size metrics record \
+  local report stamp launched_at launched_size launch_model merged_at merged_at_source size metrics record \
     tp_appended=false execution_recorded=false
   report=$(parse_report "$n" 2>/dev/null || printf 'null')
   stamp=$(take_launch "$n")
   launched_at=$(jq -r '(.launched_at // empty) | tostring' <<<"${stamp:-null}" 2>/dev/null || printf '')
   launched_size=$(jq -r '.launched_size // empty' <<<"${stamp:-null}" 2>/dev/null || printf '')
+  launch_model=$(jq -r '.launch_model // empty' <<<"${stamp:-null}" 2>/dev/null || printf '')
   if [ "$(jq -r '.status // ""' <<<"$report")" = merged ]; then
     local pr; pr=$(jq -r '.pr // ""' <<<"$report")
     merged_at=$(pr_merged_at "$pr")
@@ -2087,9 +2176,12 @@ cmd_retire() {
         || printf '')
       if record=$(jq -nc \
         --arg repo "$rp" --argjson n "$n" --arg a "$launched_at" --argjson b "$merged_at" \
-        --arg src "$merged_at_source" --arg size "$size" --arg ls "$launched_size" \
-        --argjson report "$report" --argjson session "$metrics" '
+        --arg src "$merged_at_source" --arg size "$size" --arg ls "$launched_size" --arg lm "$launch_model" \
+        --argjson report "$report" --argjson session "$metrics" "$JQ_SHORT_MODEL"'
         ($a | tonumber? // null) as $launched |
+        ($lm | if . == "" then null else short_model end) as $lm_short |
+        ([$lm_short] + ($session.models // {} | keys) | map(select(. != null))
+          | reduce .[] as $x ([]; if any(.[]; . == $x) then . else . + [$x] end)) as $models |
         {
           repo: $repo, number: $n, launched_at: $launched, merged_at: $b,
           duration_s: (if $launched == null then null
@@ -2097,6 +2189,8 @@ cmd_retire() {
           schema: 1, merged_at_source: $src,
           size: (if $size == "" then null else $size end),
           launched_size: (if $ls == "" then null else $ls end),
+          launch_model: (if $lm == "" then null else $lm end),
+          models: (if ($models | length) == 0 then null else $models end),
           pr: ($report.pr // null), sha: ($report.sha // null),
           report: {
             review: ($report.review // null),
@@ -2280,7 +2374,11 @@ mgr — manager CLI for herdr-hosted omp builders
                                       every brief names; default production), sizing
                                       (lean|balanced|careful — the issue-size
                                       classification bias intake and builders apply;
-                                      default balanced).
+                                      default balanced), model-fallback
+                                      (never|ask|auto — whether a builder's model may
+                                      be swapped when its plan reserve runs low;
+                                      default never, so a builder finishes on the
+                                      model it was briefed with).
                                       Stored in the primary checkout's .git/config
                                       under mgr.*, shared by every worktree
   mgr package [args...]               the omp agent packages in omp/: list, show and
@@ -2301,6 +2399,8 @@ env: MGR_CAP        default concurrency cap
      MGR_HOUSE      model house for launches (replaces mgr.house)
      MGR_RIGOR      verification rigor for builders, sprint|production (replaces mgr.rigor)
      MGR_SIZING     issue-size classification bias, lean|balanced|careful (replaces mgr.sizing)
+     MGR_MODEL_FALLBACK  builder model fallback, never|ask|auto (replaces
+                         mgr.model-fallback); also read by mgr package/setup
      MGR_GUARD_BIN  mgr-guard executable (default: next to this script)
      MGR_STATE_DIR  guard state dir (default: ~/.local/state/mgr-guard)
      MGR_GUARD_BACKLOG_INTERVAL_S  how often the guard refreshes a manager's
@@ -2349,12 +2449,20 @@ main() {
     config)        cmd_config "$@";;
     package|setup)
       # the installer is a sibling script and owns its own argv; MGR_ROOT is how
-      # it finds omp/ through a symlinked checkout
+      # it finds omp/ through a symlinked checkout, and the model-fallback policy
+      # travels as an env var because the installer writes machine-wide omp
+      # config and cannot read this repo's store itself. Outside a repo there is
+      # no store to read, and the installer's own `never` default applies.
       [ -x "$MGR_PACKAGE_BIN" ] || die 4 "mgr-package not found at $MGR_PACKAGE_BIN"
       export MGR_ROOT
+      if git rev-parse --git-dir >/dev/null 2>&1; then
+        MGR_MODEL_FALLBACK=$(eff_model_fallback)
+        export MGR_MODEL_FALLBACK
+      fi
       exec "$MGR_PACKAGE_BIN" "$sub" "$@";;
     house)         cmd_house "$@";;
     _parse-report) cmd_parse_report "$@";;
+    _fallback-prompt) cmd_fallback_prompt "$@";;
     *) die 2 "unknown subcommand: $sub (try: mgr --help)";;
   esac
 }

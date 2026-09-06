@@ -4,11 +4,15 @@
 # Deps: omp, jq.  All stdout is JSON; errors are JSON on stderr.
 #
 # A package is omp/packages/<house>.yml holding exactly three keys: modelRoles,
-# task.agentModelOverrides, retry.fallbackChains. Applying one replaces those
-# three in the omp config.yml (through `omp config set`, which validates against
-# the settings schema), writes activePackage, and leaves every other setting
-# alone. There are no env vars and no symlinks in the result: a herdr-spawned
-# builder reads the same config.yml as the manager that launched it.
+# task.agentModelOverrides, retry.fallbackChains. Applying one always replaces
+# modelRoles and task.agentModelOverrides in the omp config.yml (through
+# `omp config set`, which validates against the settings schema); it replaces
+# retry.fallbackChains too only when MGR_MODEL_FALLBACK=auto (mgr's dispatch
+# arm exports this from the resolved `model-fallback` config; direct and
+# installer runs default to never). Applying also writes activePackage, and
+# leaves every other setting alone. There are no symlinks in the result: a
+# herdr-spawned builder reads the same config.yml as the manager that
+# launched it.
 #
 # Locations, so this runs from an installed copy or from a repo checkout:
 #   MGR_ROOT          skill checkout        default the dir above this script
@@ -96,7 +100,13 @@ apply() { # apply <name> -> the applied-package JSON on stdout
   local file="$PACKAGES_DIR/$name.yml"
   [ -f "$file" ] || die 4 "unknown package '$name'; available: $(names | paste -sd, - | sed 's/,/, /g')"
 
-  local json roles overrides chains before was backup tmp
+  local policy="${MGR_MODEL_FALLBACK:-never}"
+  case "$policy" in
+    never|ask|auto) ;;
+    *) die 3 "MGR_MODEL_FALLBACK must be one of never|ask|auto: $policy";;
+  esac
+
+  local json roles overrides chains before was backup tmp chains_written
   was=$(active)
   json=$(yaml_json "$file")
   roles=$(slice "$json" modelRoles '.modelRoles' "$file")
@@ -130,8 +140,12 @@ apply() { # apply <name> -> the applied-package JSON on stdout
     || pkg_fail "omp config set modelRoles failed"
   omp config set task.agentModelOverrides "$overrides" >/dev/null \
     || pkg_fail "omp config set task.agentModelOverrides failed"
-  omp config set retry.fallbackChains "$chains" >/dev/null \
-    || pkg_fail "omp config set retry.fallbackChains failed"
+  chains_written=0
+  if [ "$policy" = auto ]; then
+    omp config set retry.fallbackChains "$chains" >/dev/null \
+      || pkg_fail "omp config set retry.fallbackChains failed"
+    chains_written=1
+  fi
 
   # `omp config set` rewrites the file without its comments and without a
   # trailing newline, so activePackage is stamped last and by hand
@@ -146,14 +160,15 @@ apply() { # apply <name> -> the applied-package JSON on stdout
   trap - ERR
 
   jq -nc --arg name "$name" --arg was "$was" --arg cfg "$CONFIG" --arg bk "$backup" \
-    --arg note "$RESTART_NOTE" --argjson a "$before" --argjson b "$roles" \
-    --argjson ov "$overrides" --argjson ch "$chains" \
+    --arg note "$RESTART_NOTE" --arg policy "$policy" --argjson a "$before" --argjson b "$roles" \
+    --argjson ov "$overrides" --argjson cw "$chains_written" \
     '{package:$name, previous:(if $was == "" then null else $was end),
       config:$cfg, backup:(if $bk == "" then null else $bk end),
       changes:[([$a, $b] | map(keys) | add | unique)[] as $k
                | select(($a[$k] // null) != ($b[$k] // null))
                | {role:$k, from:($a[$k] // null), to:($b[$k] // null)}],
-      agent_overrides:($ov | length), fallback_chains:($ch | length), note:$note}'
+      agent_overrides:($ov | length), model_fallback:$policy,
+      fallback_chains:$cw, note:$note}'
 }
 
 # ------------------------------------------------------------------- verbs
@@ -222,6 +237,7 @@ mgr-package — omp agent packages and the size agent files
                                  the ones this checkout ships
   mgr package <house>            apply omp/packages/<house>.yml into the omp
                                  config.yml (modelRoles, task.agentModelOverrides,
+                                 and — only when MGR_MODEL_FALLBACK=auto —
                                  retry.fallbackChains) and stamp activePackage;
                                  prints the role changes
   mgr setup [--force] [--house <house>]
@@ -237,6 +253,9 @@ env: MGR_ROOT             skill checkout (default: the dir above this script)
      OMP_PACKAGES_DIR     package dir (default: $MGR_ROOT/omp/packages)
      OMP_AGENTS_DIR       agent-file source dir (default: $MGR_ROOT/omp/agents)
      PI_CODING_AGENT_DIR  omp agent dir (default: `omp config path`)
+     MGR_MODEL_FALLBACK   never|ask|auto (default: never); mgr's dispatch arm
+                          sets this from the resolved model-fallback config;
+                          retry.fallbackChains is written only when auto
 EOF
 }
 
