@@ -56,11 +56,13 @@ JQ_SUBAGENTS='
 
 # a model string like anthropic/claude-fable-5-1:high stripped of its
 # provider prefix and effort suffix -> claude-fable-5-1; null stays null
+# shellcheck disable=SC2034  # read by bin/mgr, not by this library
 JQ_SHORT_MODEL='def short_model: if . == null then null else (sub("^[^/]*/"; "") | sub(":[^/]*$"; "")) end;'
 
 # raw session-jsonl lines on stdin -> {provider,model}: the last assistant
-# message's own facts (nulls when none). Same shape and tail-window logic as
-# bin/mgr's JQ_SELF_FACTS/self_house.
+# message's own facts (nulls when none). The one implementation of "what
+# answered this session": `mgr house`, every board row and the execution
+# record read it through session_facts below.
 JQ_SESSION_FACTS='
 [ inputs | (fromjson? // empty) | select(type == "object")
   | select((.type == "message") and ((.message | type) == "object")

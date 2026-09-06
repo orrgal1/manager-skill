@@ -236,6 +236,14 @@ SESS_CLEAN="$TMP/clean.jsonl"
               stopReason:"endTurn", content:"all done"}}'
 } >"$SESS_CLEAN"
 
+# a builder the harness moved off its launch model: same pane, another model on the last
+# assistant line, and nothing stalled about it
+SESS_SWAPPED="$TMP/swapped.jsonl"
+jq -nc --arg ts "$(iso_ms $T0)" '
+  {type:"message", timestamp:$ts,
+   message:{role:"assistant", provider:"anthropic", model:"claude-smol",
+            stopReason:"endTurn", content:"carrying on"}}' >"$SESS_SWAPPED"
+
 reg() { # reg <state-dir> <now-ms> <manager_id> <ws> <pane> <cap> <in_flight> <adopting> <ready> [repo] [provider] [house]
   local sd="$1" now="$2" repo="${10:-acme/widgets}" prov="${11:-}" house="${12:-}"
   MGR_STATE_DIR="$sd" MGR_GUARD_NOW_MS="$now" "$GUARD" register "$(jq -nc \
@@ -260,14 +268,17 @@ issues_file() { # issues_file <file> <issue-json...>
   printf '%s\n' "$@" | jq -sc . >"$out"
 }
 
-launches_file() { # launches_file <state-dir> <repo> <"number:launched_at"...>
+launches_file() { # launches_file <state-dir> <repo> <"number:launched_at[:launch_model]"...>
   local sd="$1" repo="$2"; shift 2
-  local slug pair obj='{}'
+  local slug pair n at model obj='{}'
   slug=$(printf '%s' "$repo" | sed 's|/|__|g')
   mkdir -p "$sd/launches"
   for pair in "$@"; do
-    obj=$(jq -c --argjson n "${pair%%:*}" --argjson at "${pair##*:}" \
-      '. + {($n | tostring): {number:$n, launched_at:$at}}' <<<"$obj")
+    # the model keeps its own colons (anthropic/claude-fable-5-1:high), so it is the tail
+    IFS=: read -r n at model <<<"$pair"
+    obj=$(jq -c --argjson n "$n" --argjson at "$at" --arg m "$model" \
+      '. + {($n | tostring): {number:$n, launched_at:$at,
+                              launch_model:(if $m == "" then null else $m end)}}' <<<"$obj")
   done
   printf '%s\n' "$obj" >"$sd/launches/$slug.json"
 }
@@ -926,8 +937,9 @@ assert_jq "(l) blocked keeps the open blocker it parsed off the body" "$ST_L" \
   '.managers["ws-wL"].backlog.blocked == [{number:13, title:"thirteen", blocked_by:[12]}]'
 assert_jq "(l) in flight joins launched_at from the launches file" "$ST_L" \
   '.managers["ws-wL"].backlog.in_flight
-   == [{number:10, title:"ten", launched_at:'"$(( T0 - 600000 ))"'},
-       {number:15, title:"fifteen", launched_at:null}]'
+   == [{number:10, title:"ten", launched_at:'"$(( T0 - 600000 ))"',
+        launch_model:null, model:null},
+       {number:15, title:"fifteen", launched_at:null, launch_model:null, model:null}]'
 assert_jq "(l) awaiting-approval only when it is not in flight" "$ST_L" \
   '.managers["ws-wL"].backlog.awaiting_approval == [{number:11, title:"eleven"}]'
 assert_jq "(l) cap, slots_free and the true counts" "$ST_L" \
@@ -981,6 +993,63 @@ OVL4="$(MGR_STATE_DIR="$SD_L60" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview --limit
 assert_jq "(l) a junk backlog file is ignored, not fatal" "$OVL4" \
   '.timeline.beyond.count == 40'
 rm -f "$BK_L60"
+
+printf '\n== (l2) in flight says what it runs on, and what it launched on ==\n'
+# Two readings meet on the item: the launch stamp names the model the builder was briefed
+# on, verbatim, and the builder pane's own session names the model it is on right now.
+# `overview` calls the pair a change only when both are known and they differ, comparing
+# the short form of the launch model against the bare id the session reports.
+SD_L2="$TMP/s-l2"
+agents_file "$TMP/agents-l2.json" \
+  "$(mk_agent manager wL2:p1 wL2 idle '')" \
+  "$(mk_agent issue-20 wL2:p2 wL2 busy "$SESS_SWAPPED")" \
+  "$(mk_agent issue-21 wL2:p3 wL2 busy "$SESS_CLEAN")" \
+  "$(mk_agent issue-22 wL2:p4 wL2 busy "$SESS_SWAPPED")" \
+  "$(mk_agent issue-23 wOther:p2 wOther busy "$SESS_SWAPPED")"
+export FAKE_AGENTS="$TMP/agents-l2.json" FAKE_USAGE="$TMP/usage-ok.json"
+export FAKE_GH_LOG="$TMP/gh-l2.log"; : >"$FAKE_GH_LOG"
+issues_file "$TMP/issues-l2.json" \
+  "$(mk_issue 20 twenty mgr:in-flight '')" \
+  "$(mk_issue 21 twentyone mgr:in-flight '')" \
+  "$(mk_issue 22 twentytwo mgr:in-flight '')" \
+  "$(mk_issue 23 twentythree mgr:in-flight '')"
+export FAKE_ISSUES="$TMP/issues-l2.json"
+launches_file "$SD_L2" acme/mdl \
+  "20:$(( T0 - 600000 )):anthropic/claude-fable-5-1:high" \
+  "21:$(( T0 - 600000 )):anthropic/claude-fable-5-1:high" \
+  "23:$(( T0 - 600000 )):anthropic/claude-fable-5-1:high"
+reg "$SD_L2" "$T0" ws-wL2 wL2 wL2:p1 4 4 0 0 acme/mdl >/dev/null
+ST_L2="$(MGR_STATE_DIR="$SD_L2" MGR_GUARD_NOW_MS="$T0" "$GUARD" tick)"
+assert_jq "(l2) the ledger joins the stamp and the pane session per issue" "$ST_L2" \
+  '.managers["ws-wL2"].backlog.in_flight
+   == [{number:20, title:"twenty", launched_at:'"$(( T0 - 600000 ))"',
+        launch_model:"anthropic/claude-fable-5-1:high", model:"claude-smol"},
+       {number:21, title:"twentyone", launched_at:'"$(( T0 - 600000 ))"',
+        launch_model:"anthropic/claude-fable-5-1:high", model:"claude-fable-5-1"},
+       {number:22, title:"twentytwo", launched_at:null,
+        launch_model:null, model:"claude-smol"},
+       {number:23, title:"twentythree", launched_at:'"$(( T0 - 600000 ))"',
+        launch_model:"anthropic/claude-fable-5-1:high", model:null}]'
+OV_L2="$(MGR_STATE_DIR="$SD_L2" MGR_GUARD_NOW_MS="$T0" "$GUARD" overview)"
+assert_jq "(l2) a builder moved off its launch model is flagged, both ways round" "$OV_L2" \
+  '[.timeline.shown[] | select(.number == 20)] | first
+   | .model == "claude-smol" and .launch_model == "anthropic/claude-fable-5-1:high"
+     and .model_changed == "claude-fable-5-1→claude-smol"'
+assert_jq "(l2) the same model in both readings is no change" "$OV_L2" \
+  '[.timeline.shown[] | select(.number == 21)] | first
+   | .model == "claude-fable-5-1" and .launch_model == "anthropic/claude-fable-5-1:high"
+     and .model_changed == null'
+assert_jq "(l2) an adopted builder with no stamp is an unknown, not a change" "$OV_L2" \
+  '[.timeline.shown[] | select(.number == 22)] | first
+   | .model == "claude-smol" and .launch_model == null and .model_changed == null'
+# the association is per workspace, exactly like bin/mgr ws_agents: an issue-23 pane in
+# another workspace is another manager's builder and must not fill this one's reading
+assert_jq "(l2) a pane in another workspace is not this manager's builder" "$OV_L2" \
+  '[.timeline.shown[] | select(.number == 23)] | first
+   | .model == null and .launch_model == "anthropic/claude-fable-5-1:high"
+     and .model_changed == null'
+# (m) and (n) go on ticking SD_L: hand the pane list back before they do
+export FAKE_AGENTS="$TMP/agents-l.json"
 
 printf '\n== (m) the refresh is rate-limited, then refetches ==\n'
 export FAKE_ISSUES="$TMP/issues-l.json" FAKE_GH_LOG="$TMP/gh-m.log"; : >"$FAKE_GH_LOG"
@@ -1100,7 +1169,12 @@ assert_jq "(p) only live managers, sorted by repo" "$OV" \
   '[.backlog.managers[] | .manager_id] == ["ws-a","ws-b"]'
 assert_jq "(p) shown item shape" "$OV" \
   '(.timeline.shown[0] | keys)
-   == ["blocked_by","estimated","eta","manager_id","number","repo","state","title"]'
+   == ["blocked_by","estimated","eta","launch_model","manager_id","model","model_changed",
+       "number","repo","state","title"]'
+# a ledger written before the tick collected models (this fixture) still answers all three
+assert_jq "(p) an in-flight item with no model reading reads as unknown" "$OV" \
+  '.timeline.shown[0]
+   | .model == null and .launch_model == null and .model_changed == null'
 # in flight 5 min in with a 10-min median: max(median, elapsed + quarter median) = median
 assert_jq "(p) the in-flight ETA runs off launched_at" "$OV" \
   '.timeline.shown[0]

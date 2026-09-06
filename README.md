@@ -326,8 +326,8 @@ next     #49 running on claude-opus-5 (launched on claude-fable-5-1), 15m left �
   is no queue to show`.
 - **`next`** — this repo's issues only: the in-flight ones first with the time left, then the
   queued ones with the wait. An in-flight entry reads `#N running on <model>, <time left>`, with
-  ` (launched on <launch_model>)` appended when the harness switched the builder off its launch
-  model. `(needs #7, #9)` marks one or more blockers, `(after the <window>
+  ` (launched on <launch model>)` after the model — the bare id — when the harness switched the
+  builder off its launch model. `(needs #7, #9)` marks one or more blockers, `(after the <window>
   reset)` marks the first issue that only lands once the exhausting quota window of this manager's
   own provider reopens — never a window on a provider it doesn't draw on — the window's plain
   name, e.g. `5-hour` or `weekly` — and `+N more` is the true remainder of this

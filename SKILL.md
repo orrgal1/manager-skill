@@ -471,8 +471,8 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
 | `in_flight[].size` `ready[].size` `blocked[].size` `awaiting_approval[].size` | that issue's size from its `size:` label — `tiny` \| `small` \| `medium` \| `large`, or `null` when it has none (`launch` refuses on `null`) |
 | `in_flight[].model` `awaiting_approval[].model` | the bare model id from the last assistant message in the builder's session transcript, or `null` before one lands |
-| `in_flight[].launch_model` `awaiting_approval[].launch_model` | the bare model id the house package named at launch (`modelRoles.builder`), or `null` for an adopted builder |
-| `in_flight[].model_changed` `awaiting_approval[].model_changed` | `"<launch_model>→<model>"` when the harness switched the builder off its launch model, else `null` |
+| `in_flight[].launch_model` `awaiting_approval[].launch_model` | the model the house package named at launch (`modelRoles.builder`), verbatim including provider and effort (e.g. `anthropic/claude-fable-5-1:high`), or `null` for an adopted builder |
+| `in_flight[].model_changed` `awaiting_approval[].model_changed` | `"<launch model>→<model>"`, both shortened to the bare id, when the harness switched the builder off its launch model, else `null` |
 | `unmanaged[].requested` `unmanaged[].requested_at` `unmanaged[].requested_issue` | the pane asked to be adopted via `mgr register` — `true` / ms epoch / the issue number it named, or `null`; cleared once `adopt` runs |
 
 ### Labels

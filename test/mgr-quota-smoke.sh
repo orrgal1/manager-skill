@@ -225,6 +225,18 @@ jq '.managers["ws-w9"].ready = 2
   | .managers["ws-w9"].backlog.counts.open = 4' \
   "$ovstate/state.json" >"$ovsmall/state.json"
 
+# the same machine with #49's model reading in the ledger: the harness moved it off the
+# model it launched on (ovswap), and the same pair unchanged (ovsame) — the two halves of
+# what the `next` line has to say about a running builder
+ovswap="$tmp/ovswap"; mkdir -p "$ovswap"
+jq '.managers["ws-w9"].backlog.in_flight[0] +=
+      {launch_model:"anthropic/claude-fable-5-1:high", model:"claude-opus-5"}' \
+  "$ovstate/state.json" >"$ovswap/state.json"
+ovsame="$tmp/ovsame"; mkdir -p "$ovsame"
+jq '.managers["ws-w9"].backlog.in_flight[0] +=
+      {launch_model:"anthropic/claude-fable-5-1:high", model:"claude-fable-5-1"}' \
+  "$ovstate/state.json" >"$ovsame/state.json"
+
 # and with 34 ready issues, so even `--limit 30` cannot fit the list in three
 # physical lines
 ovmany="$tmp/ovmany"; mkdir -p "$ovmany"
@@ -698,6 +710,102 @@ check 'a held verdict reaches the manager: reason, verbatim' \
   "$(jq -r '.quota.reason' <<<"$hb")"
 check 'a held verdict carries no limits to misread' '[]' \
   "$(jq -c '.quota.limits' <<<"$hb")"
+
+printf '\n# 1f. every builder row says what it runs on, and what it was launched on\n'
+# issue-49 is the in-flight builder of these fixtures; its session file is the
+# transcript the board reads the current model off. The launch stamp is the
+# same side-file `mgr launch` writes and `mgr retire` consumes — the board only
+# ever reads it.
+mlaunches="$tmp/state/launches/owner__name.json"
+mkdir -p "$(dirname "$mlaunches")"
+sess_model() { # sess_model <model> — rewrite issue-49's session with that last answer
+  jq -nc --arg m "$1" '{type:"message",timestamp:"2026-09-04T12:00:00Z",
+    message:{role:"assistant",provider:"anthropic",model:$m,stopReason:"end_turn"}}' >"$sess"
+}
+stamp_49() { # stamp_49 <launch-model-or-empty>
+  jq -nc --argjson at "$pin" --arg lm "$1" \
+    '{"49":{number:49, launched_at:$at, launched_size:"medium",
+            launch_model:(if $lm == "" then null else $lm end)}}' >"$mlaunches"
+}
+
+# the harness switched this builder off its launch model: the board says so,
+# with the launch model shortened to the same shape as the current one
+sess_model claude-smol
+stamp_49 'anthropic/claude-fable-5-1:high'
+out=$("$MGR" board --cap 3)
+r49=$(jq -c '.in_flight[0]' <<<"$out")
+check 'in_flight row keys' \
+  '["number","title","state","policy","size","agent","agent_status","tab_id","pane_id","worktree","branch","model","launch_model","model_changed","quota_stalled"]' \
+  "$(jq -c 'keys_unsorted' <<<"$r49")"
+check 'the model it runs on now' claude-smol "$(jq -r '.model' <<<"$r49")"
+check 'the model it was launched on, verbatim' 'anthropic/claude-fable-5-1:high' \
+  "$(jq -r '.launch_model' <<<"$r49")"
+check 'the switch, short model to short model' 'claude-fable-5-1→claude-smol' \
+  "$(jq -r '.model_changed' <<<"$r49")"
+# the stamp belongs to `mgr retire`: a board that consumed it would cost the
+# execution record its launch model and its duration
+check 'the board left the launch stamp alone' \
+  '{"49":{"number":49,"launched_at":1788523200000,"launched_size":"medium","launch_model":"anthropic/claude-fable-5-1:high"}}' \
+  "$(jq -c '.' "$mlaunches")"
+
+# the awaiting-approval list is the same row: still on its launch model, so
+# nothing to report
+jq '(.[] | select(.number == 49) | .labels) =
+      [{name:"mgr:awaiting-approval"},{name:"size:medium"}]' \
+  "$fix/issues.json" >"$fix/issues.json.next" && mv "$fix/issues.json.next" "$fix/issues.json"
+sess_model claude-fable-5-1
+out=$("$MGR" board --cap 3)
+aw=$(jq -c '.awaiting_approval[0]' <<<"$out")
+check 'awaiting row keys' \
+  '["number","title","state","policy","size","agent","agent_status","tab_id","pane_id","worktree","branch","model","launch_model","model_changed"]' \
+  "$(jq -c 'keys_unsorted' <<<"$aw")"
+check 'awaiting row model' claude-fable-5-1 "$(jq -r '.model' <<<"$aw")"
+check 'launch model and current model agree: no change' null \
+  "$(jq -r '.model_changed' <<<"$aw")"
+jq '(.[] | select(.number == 49) | .labels) =
+      [{name:"mgr:in-flight"},{name:"size:medium"}]' \
+  "$fix/issues.json" >"$fix/issues.json.next" && mv "$fix/issues.json.next" "$fix/issues.json"
+
+# an adopted builder was never stamped with a model: it cannot be reported as
+# switched, whatever it is running on now
+sess_model claude-smol
+stamp_49 ''
+r49=$(jq -c '.in_flight[0]' <<<"$("$MGR" board --cap 3)")
+check 'an adopted builder has no launch model' null "$(jq -r '.launch_model' <<<"$r49")"
+check 'and is never reported as switched' 'claude-smol/null' \
+  "$(jq -r '"\(.model)/\(.model_changed)"' <<<"$r49")"
+rm -f "$mlaunches"
+r49=$(jq -c '.in_flight[0]' <<<"$("$MGR" board --cap 3)")
+check 'no stamp file at all is the same answer' 'claude-smol/null/null' \
+  "$(jq -r '"\(.model)/\(.launch_model)/\(.model_changed)"' <<<"$r49")"
+
+# nothing has answered in this session yet: no current model, so no switch to
+# claim either
+: >"$sess"
+stamp_49 'anthropic/claude-fable-5-1:high'
+r49=$(jq -c '.in_flight[0]' <<<"$("$MGR" board --cap 3)")
+check 'a session with no assistant message has no model' 'null/null' \
+  "$(jq -r '"\(.model)/\(.model_changed)"' <<<"$r49")"
+check 'while the launch model is still reported' 'anthropic/claude-fable-5-1:high' \
+  "$(jq -r '.launch_model' <<<"$r49")"
+
+# a session file that is not there, and a pane herdr reports no session for at
+# all: both read as no model, and neither is a failed board
+cp "$fix/agents.json" "$fix/agents.json.orig"
+jq --arg missing "$tmp/no-such-session.jsonl" \
+  '(.result.agents[] | select(.name == "issue-49") | .agent_session.value) = $missing' \
+  "$fix/agents.json.orig" >"$fix/agents.json"
+r49=$(jq -c '.in_flight[0]' <<<"$("$MGR" board --cap 3)")
+check 'an unreadable session has no model' 'null/null' \
+  "$(jq -r '"\(.model)/\(.model_changed)"' <<<"$r49")"
+jq '(.result.agents[] | select(.name == "issue-49")) |= del(.agent_session)' \
+  "$fix/agents.json.orig" >"$fix/agents.json"
+out=$("$MGR" board --cap 3); rc=$?
+check 'a pane with no session at all: board exit' 0 "$rc"
+check 'and no model' 'null/null' \
+  "$(jq -r '.in_flight[0] | "\(.model)/\(.model_changed)"' <<<"$out")"
+mv "$fix/agents.json.orig" "$fix/agents.json"
+rm -f "$mlaunches"
 
 # ------------------------------------------- 2. the cap is the only dial there is
 
@@ -1399,6 +1507,33 @@ check 'none of the old notation either' 0 \
 check 'the caller sees no other subscription in its quota line' 0 \
   "$(printf '%s\n' "$blk" | sed -n '/^quota/p' \
      | grep -c -e '30% used' -e codex || true)"
+
+printf '\n# 9b1. the running builder names its model, and any switch off it\n'
+# The line the operator reads when the harness moved a builder: the model it runs on now,
+# then the model it was launched on. Everything else about the line — the time left, the
+# reset mark — is unchanged, and the wider entry only pushes the queue along: one more
+# issue lands in the `+N more` tail, and every line still fits its 120 columns.
+blkm=$(ov "$ovswap")
+check 'the changed model is on the in-flight entry' \
+  'next     #49 running on claude-opus-5 (launched on claude-fable-5-1), 15m left · #7 in 2h30 (after the 5-hour reset)' \
+  "$(printf '%s\n' "$blkm" | sed -n '/^next/p')"
+check 'the queue it displaced is counted, not dropped silently' \
+  '#8 in 2h45 · #9 in 3h30 · #10 in 3h45 · #11 in 4h30 · #12 in 4h45 · #13 in 5h30 · #14 in 5h45 · +3 more' \
+  "$(nextlines "$blkm")"
+check 'and no line outgrows the width' 0 \
+  "$(printf '%s\n' "$blkm" | jq -R 'select(length > 120)' | wc -l | tr -d ' ')"
+# the same reading unchanged: the model is named, the launch model is not — there is
+# nothing to report about it
+blks=$(ov "$ovsame")
+check 'an unswitched builder names its model alone' \
+  'next     #49 running on claude-fable-5-1, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30' \
+  "$(printf '%s\n' "$blks" | sed -n '/^next/p')"
+check 'no launch model where nothing changed' 0 \
+  "$(printf '%s\n' "$blks" | grep -c 'launched on' || true)"
+# and with no session reading at all the entry reads exactly as it did before the feature
+check 'a builder with no model reading keeps the plain wording' \
+  'next     #49 running, 15m left · #7 in 2h30 (after the 5-hour reset) · #8 in 2h45 · #9 in 3h30 · #10 in 3h45' \
+  "$(printf '%s\n' "$blk" | sed -n '/^next/p')"
 
 printf '\n# 9b2. the same ledger, read by a manager on the other subscription\n'
 # same machine, same repo, different house: only the limit its own package

@@ -378,6 +378,10 @@ def backoff($n): ([(900000 * pow(2; $n - 1)), 7200000] | min | floor);
 # cmd_board): a `Blocked by:` reference counts only when it names an issue that is still
 # open in this list. Only the scan spelling differs — jaq's `scan` stops at the first hit,
 # so the blocker numbers come out of `match(...; "g")` here.
+# An in-flight issue also carries what its builder runs on: `launch_model` off the same
+# launch stamp `launched_at` comes from, and `model` off the builder pane's own session
+# ($models, keyed by issue number) — the reading is as fresh as this refresh, exactly like
+# launched_at. `overview` turns the pair into `model_changed`.
 JQ_BACKLOG='
 def blockers:
   ((.body // "") | [splits("\n")]
@@ -392,9 +396,12 @@ def lbl($n): (([.labels[]?.name] | index($n)) != null);
                   inflight: lbl("mgr:in-flight"),
                   awaiting: lbl("mgr:awaiting-approval")})) as $I
 | ([$I[] | select(.inflight)
+         | (.number | tostring) as $key
+         | (($launches[$key] // null)) as $stamp
          | {number: .number, title: .title,
-            launched_at: ((($launches[(.number | tostring)] // null))
-                          | if . == null then null else (.launched_at // null) end)}]
+            launched_at: (if $stamp == null then null else ($stamp.launched_at // null) end),
+            launch_model: (if $stamp == null then null else ($stamp.launch_model // null) end),
+            model: ($models[$key] // null)}]
    | sort_by(.number)) as $in_flight
 | ([$I[] | select(.awaiting and (.inflight | not)) | {number: .number, title: .title}]
    | sort_by(.number)) as $awaiting
@@ -516,12 +523,23 @@ def sim($m):
     # carry a number or an array here, and indexing $wins with one aborts the whole program
     | (if (($m.provider | type) != "string") or ($m.provider == "") then $win
        else ($wins[$m.provider] // null) end) as $mwin
+    # what the builder runs on travels with the item: the current model, the model it was
+    # launched on (verbatim, as the stamp has it) and, when the harness moved it off that
+    # model, `"<launch short>→<current>"` — the one string a render needs to say so. Both
+    # sides have to be known: a builder with no session line yet, and an adopted one with
+    # no launch stamp, are unknowns, never a change.
     | ([($b.in_flight // [])[]
         | (.launched_at // null) as $la
+        | (.model // null) as $cm
+        | (.launch_model // null) as $lm
+        | ($lm | short_model) as $lms
         | (if $la == null then ($now + $med)
            else ($la + ([$med, (($now - $la) + (0.25 * $med))] | max)) end) as $raw
         | {repo: $repo, number: .number, title: (.title // ""), state: "in_flight",
            eta: finish($now; $raw - $now; $mwin), estimated: ($est or ($la == null)),
+           model: $cm, launch_model: $lm,
+           model_changed: (if ($cm == null) or ($lms == null) or ($lms == $cm) then null
+                           else ($lms + "→" + $cm) end),
            blocked_by: [], manager_id: $mid}]) as $inflight
     # the ledger lists stop at 50; the tick also files the whole queue under backlog/, and
     # the simulation runs on everything — only the display is capped
@@ -712,15 +730,18 @@ gh_issues() { # gh_issues <repo> <cache-dir> -> open issues JSON, non-zero when 
   printf '%s' "$out"
 }
 
-# collect_extras <managers-json> <prev-state> <now>
+# collect_extras <managers-json> <prev-state> <now> <agent-facts>
 #   -> {"<manager_id>": {backlog, backlog_at, backlog_error, throughput}}
 # One gh call per distinct repo per tick, and only for managers whose snapshot is older than
 # MGR_GUARD_BACKLOG_INTERVAL_S. A refresh that fails keeps the previous snapshot and says so;
 # throughput is a file read, so it is recomputed every tick. Every successful refresh also
 # files the uncapped queue under backlog/, which is what `overview` simulates over.
+# The agent facts are the tick's own scan: the model each `issue-<N>` builder pane is on
+# right now, scoped to the manager's workspace the way bin/mgr's ws_agents scopes it — an
+# `issue-10` in another workspace is another manager's builder, never this one's.
 collect_extras() {
-  local managers="$1" prev="$2" now="$3"
-  local extras='{}' cache tmap m mid repo cap adopting prevrow prev_at due issues raw bl thr err row
+  local managers="$1" prev="$2" now="$3" agents="${4:-[]}"
+  local extras='{}' cache tmap m mid repo ws models cap adopting prevrow prev_at due issues raw bl thr err row
   cache=$(mktemp -d "${TMPDIR:-/tmp}/mgr-guard-backlog.XXXXXX" 2>/dev/null) || cache=""
   tmap=$(throughput_map)
   while IFS= read -r m; do
@@ -728,6 +749,15 @@ collect_extras() {
     mid=$(jq -r '.manager_id // ""' <<<"$m")
     [ -n "$mid" ] || continue
     repo=$(jq -r '.repo // ""' <<<"$m")
+    ws=$(jq -r '.workspace_id // ""' <<<"$m")
+    # the model per in-flight issue number, for JQ_BACKLOG to join onto its in_flight list.
+    # A scan that cannot be read degrades to no reading at all, never to a failed refresh
+    models=$(jq -c --arg ws "$ws" \
+      '[ .[] | select((.workspace_id // "") == $ws)
+             | select(((.name // "") | test("^issue-[0-9]+$")))
+             | {key: ((.name // "") | ltrimstr("issue-")), value: (.model // null)} ]
+       | from_entries' <<<"$agents" 2>/dev/null) || models=""
+    case "$models" in ''|null) models='{}';; esac
     cap=$(jq -r '((.cap // 0) | floor)' <<<"$m")
     adopting=$(jq -r '((.adopting // 0) | floor)' <<<"$m")
     prevrow=$(jq -c --arg id "$mid" '((.managers // {})[$id] // {})
@@ -749,7 +779,8 @@ collect_extras() {
         err="cannot create a tick cache dir"
       elif issues=$(gh_issues "$repo" "$cache"); then
         raw=$(jq -c --argjson launches "$(launches_json "$repo")" --argjson cap "$cap" \
-          --argjson adopting "$adopting" "$JQ_BACKLOG" <<<"$issues" 2>/dev/null) || raw=""
+          --argjson adopting "$adopting" --argjson models "$models" \
+          "$JQ_BACKLOG" <<<"$issues" 2>/dev/null) || raw=""
         if [ -n "$raw" ]; then
           bl=$(jq -c '.ledger' <<<"$raw")
           mkdir -p "$BACKLOGDIR" 2>/dev/null || true
@@ -987,8 +1018,9 @@ cmd_tick() {
 
   samples=$(prune_samples "$(( now - 86400000 ))")
 
-  # the backlog snapshot and throughput stats ride along on the manager rows
-  extras=$(collect_extras "$managers" "$prev" "$now")
+  # the backlog snapshot and throughput stats ride along on the manager rows, and the pane
+  # scan the tick already did says which model each builder is on right now
+  extras=$(collect_extras "$managers" "$prev" "$now" "$facts")
 
   local policy
   policy=$(jq -nc \
@@ -1209,7 +1241,8 @@ cmd_overview() {
   full=$(backlog_map)
   jq -nc --argjson st "$st" --argjson now "$now" --argjson limit "$limit" \
     --argjson full "$full" \
-    --argjson default_s "$DEFAULT_TASK_S" "$JQ_OVERVIEW" || die 1 "overview projection failed"
+    --argjson default_s "$DEFAULT_TASK_S" "$JQ_SHORT_MODEL$JQ_OVERVIEW" \
+    || die 1 "overview projection failed"
 }
 
 # ---------------------------------------------------------------- usage

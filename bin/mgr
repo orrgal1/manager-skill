@@ -362,19 +362,6 @@ agents_raw() {
   printf '%s' "$MGR_AGENTS_CACHE"
 }
 
-# Which model house this manager's own session runs on, read from its omp
-# session file the way bin/mgr-guard's session_facts does: the last assistant
-# message carries the provider and model that answered it. The tail window and
-# the dropped first line are that helper's, so a huge session stays cheap and a
-# half-written line is never parsed.
-JQ_SELF_FACTS='
-[ inputs | (fromjson? // empty) | select(type == "object")
-  | select((.type == "message") and ((.message | type) == "object")
-           and (.message.role == "assistant")) ]
-| (last // null)
-| if . == null then {provider:null, model:null}
-  else {provider:(.message.provider // null), model:(.message.model // null)} end'
-
 # the model houses a package exists for: omp/packages/<house>.yml
 MGR_HOUSES='anthropic openai gemini'
 
@@ -391,24 +378,18 @@ house_of() { # house_of <provider> -> anthropic|openai|gemini ("" when unknown)
   esac
 }
 
+# Which model house this manager's own session runs on: mgr-lib.sh's
+# `session_facts` reads the provider and model of the last assistant message in
+# its omp session file — the same helper the builders' rows and the execution
+# record use, so there is one implementation of "what answered this session".
 self_house() { # self_house -> {provider,model,house}  (nulls when unknown)
-  local pane="${HERDR_PANE_ID:-}" sess="" facts body size
-  local none='{"provider":null,"model":null}'
-  facts="$none"
+  local pane="${HERDR_PANE_ID:-}" sess="" facts
+  facts='{"provider":null,"model":null}'
   if [ -n "$pane" ]; then
     sess=$(agents_raw | jq -r --arg p "$pane" \
       '[.[] | select(.pane_id == $p) | .agent_session.value // ""] | .[0] // ""')
   fi
-  if [ -n "$sess" ] && [ -f "$sess" ]; then
-    size=$(wc -c <"$sess" 2>/dev/null | tr -d ' ') || size=0
-    case "$size" in ''|*[!0-9]*) size=0;; esac
-    if [ "$size" -gt 65536 ]; then
-      body=$(tail -c 65536 "$sess" 2>/dev/null | sed 1d) || body=""
-    else
-      body=$(cat "$sess" 2>/dev/null) || body=""
-    fi
-    facts=$(printf '%s\n' "$body" | jq -Rnc "$JQ_SELF_FACTS") || facts="$none"
-  fi
+  if [ -n "$sess" ]; then facts=$(session_facts "$sess"); fi
   jq -c --arg h "$(house_of "$(jq -r '.provider // ""' <<<"$facts")")" \
     '. + {house:(if $h == "" then null else $h end)}' <<<"$facts"
 }
@@ -465,21 +446,27 @@ agent_git() { # agent_git <cwd> -> "<worktree>\t<branch>"  (empty fields when n/
   printf '%s\t%s' "$wt" "$br"
 }
 
-# every live agent in this workspace, with worktree/branch resolved from its cwd
+# every live agent in this workspace, with worktree/branch resolved from its
+# cwd and the model that last answered it read off its session transcript —
+# one read per pane that has one, so a board can say what a builder runs on.
 ws_agents() {
   [ -n "${MGR_WSAGENTS_CACHE:-}" ] && { printf '%s' "$MGR_WSAGENTS_CACHE"; return; }
-  local ws="${HERDR_WORKSPACE_ID:-}" a cwd wt br
+  local ws="${HERDR_WORKSPACE_ID:-}" a cwd wt br sess model
   local out=""
   while IFS= read -r a; do
     [ -n "$a" ] || continue
     cwd=$(jq -r '.cwd // ""' <<<"$a")
     IFS=$'\t' read -r wt br <<<"$(agent_git "$cwd")"
-    out+=$(jq -c --arg wt "$wt" --arg br "$br" \
+    sess=$(jq -r '.agent_session.value // ""' <<<"$a")
+    model=""
+    if [ -n "$sess" ]; then model=$(session_facts "$sess" | jq -r '.model // ""'); fi
+    out+=$(jq -c --arg wt "$wt" --arg br "$br" --arg model "$model" \
       '{name:(.name//null),pane_id,tab_id,cwd:(.cwd//null),agent_status:(.agent_status//null),
         workspace_id,agent_kind:(.agent//null),
         worktree:(if $wt=="" then null else $wt end),
         branch:(if $br=="" then null else $br end),
-        agent_session:(.agent_session//null)}' <<<"$a")
+        agent_session:(.agent_session//null),
+        model:(if $model=="" then null else $model end)}' <<<"$a")
     out+=$'\n'
   done < <(agents_raw | jq -c --arg ws "$ws" '.[] | select(.workspace_id==$ws)')
   MGR_WSAGENTS_CACHE=$(printf '%s' "$out" | jq -sc .)
@@ -689,6 +676,20 @@ take_launch() { # take_launch <N> -> that stamp as JSON ("" when unknown); drops
   fi
   if $held; then launch_unlock "$f"; fi
   printf '%s' "$stamp"
+}
+
+# The whole stamp map, read and never touched: the board reports what a builder
+# was launched on while it is still running, so — unlike `take_launch` — this
+# neither locks nor drops anything. `{}` covers no repo, no file and a file
+# some other command is mid-write on.
+launches_json() { # launches_json -> {"<N>": {…stamp}} ({} when none)
+  local rp f out
+  rp=$(own_repo)
+  [ -n "$rp" ] || { printf '{}'; return; }
+  f=$(launch_file "$rp")
+  [ -f "$f" ] || { printf '{}'; return; }
+  out=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || out=""
+  [ -n "$out" ] && printf '%s' "$out" || printf '{}'
 }
 
 append_throughput() { # append_throughput <N> <record-json> — record is already compact JSON
@@ -1080,6 +1081,7 @@ cmd_board() {
   # pause lives in its .git/config and `operator_paused` reads it from a $(…).
   local b_repo b_paused b_primary b_issues b_agents b_extra b_guard b_config
   local b_manager b_overview b_house b_prov b_rigor b_sizing b_mf b_requests board
+  local b_launches
   primary >/dev/null
   b_repo=$(repo)
   b_paused=$(operator_paused)
@@ -1087,6 +1089,7 @@ cmd_board() {
   b_issues=$(open_issues)
   b_agents=$(ws_agents)
   b_requests=$(requests_json)
+  b_launches=$(launches_json)
   b_extra=$(tracked_missing_issues "$b_issues" "$b_agents")
   b_guard=$(guard_state)
   # the config reports the store, so it keeps the configured cap even when the
@@ -1118,6 +1121,7 @@ cmd_board() {
     --argjson extra "$b_extra" \
     --argjson ag "$b_agents" \
     --argjson requests "$b_requests" \
+    --argjson launches "$b_launches" \
     --argjson cap "$cap" \
     --argjson paused "$b_paused" \
     --argjson overview "$b_overview" \
@@ -1133,7 +1137,7 @@ cmd_board() {
     --arg primary "$b_primary" \
     --arg ws "${HERDR_WORKSPACE_ID:-}" \
     --arg self "${HERDR_PANE_ID:-}" \
-    "$JQ_BLOCKERS"'
+    "$JQ_BLOCKERS$JQ_SHORT_MODEL"'
     ($issues | map(.number)) as $open |
     ($manager.pane_id // null) as $mgrpane |
     def pol: if ([.labels[].name]|index("mgr:manual-approve")) then "manual-approve" else "auto-merge" end;
@@ -1152,14 +1156,24 @@ cmd_board() {
                        blocked_by: []})) as $IX |
     ($IO + $IX) as $I |
     def agent_for($n): ($ag | map(select(.name == ("issue-" + ($n|tostring)))) | .[0] // null);
+    # the model a builder runs on now, beside the one it was launched on: the
+    # launch stamp is read, never consumed — the builder is still live, and
+    # `mgr retire` is what claims the stamp. An adopted builder has no stamp,
+    # so it can never be reported as switched.
     def row: . as $i | agent_for($i.number) as $a |
+      (if $a then $a.model else null end) as $m |
+      ($launches[$i.number | tostring].launch_model // null) as $lm |
       {number:$i.number, title:$i.title, state:$i.state, policy:$i.policy, size:$i.size,
        agent:(if $a then $a.name else null end),
        agent_status:(if $a then $a.agent_status else null end),
        tab_id:(if $a then $a.tab_id else null end),
        pane_id:(if $a then $a.pane_id else null end),
        worktree:(if $a then $a.worktree else null end),
-       branch:(if $a then $a.branch else null end)};
+       branch:(if $a then $a.branch else null end),
+       model:$m, launch_model:$lm,
+       model_changed:(($lm | short_model) as $s
+         | if $m == null or $s == null or $s == $m then null
+           else $s + "→" + $m end)};
     ([$I[] | select(.inflight) | row] | sort_by(.number)) as $inflight |
     ([$I[] | select(.awaiting and (.inflight|not)) | row] | sort_by(.number)) as $awaiting |
     ([$IO[] | select((.inflight|not) and (.awaiting|not) and (.blocked_by|length)==0)
@@ -1314,7 +1328,9 @@ def limitname($id; $provider):
 # greedy width-aware joiner: always takes the first item even if over-long,
 # joins with " · ", spills onto one continuation line when $allowCont == 1,
 # and reserves 12 columns on the final permitted line for a possible
-# " · +N more" once no further continuation is allowed. Every line is at most
+# " · +N more" once no further continuation is allowed — for the items it had
+# to drop and for an $extra tail it was handed, since both land in that one
+# count. Every line is at most
 # 111 columns of items, which is 120 with the 9-column label. `$skipOver`
 # keeps trying the shorter items behind one that does not fit — right for the
 # quota limits, where each entry stands alone, wrong for a queue whose items
@@ -1335,7 +1351,8 @@ def fititems($items; $allowCont; $showMore; $extra; $skipOver):
                 (.lines[.li] = [$it] | .shown = (.shown + 1))
               else
                 (.lines[.li] + [$it] | join(" · ")) as $cand
-                | (if ($isLastLine and $itemsAfter) then 12 else 0 end) as $reserve
+                | (if ($isLastLine and ($itemsAfter or ($showMore and $extra > 0)))
+                   then 12 else 0 end) as $reserve
                 | (111 - $reserve) as $lim
                 | if ($cand | length) <= $lim then
                     (.lines[.li] = (.lines[.li] + [$it]) | .shown = (.shown + 1))
@@ -1450,10 +1467,19 @@ def stallmark($items; $sw):
   end;
 def nextitemtext($it; $isMark; $sw):
   ( if $it.state == "in_flight" then
-      if ($it.eta // null) == null then "#\($it.number) running"
-      elif $it.eta <= $now then "#\($it.number) running, due now"
-      else "#\($it.number) running, " + D($it.eta - $now; ($it.estimated // false)) + " left"
-      end
+      # what it runs on, and — when the harness moved it off its launch model — what it
+      # started on. `model_changed` is `"<launch short>→<current>"`, so the short launch
+      # model the line names is the half in front of the arrow; a builder with no session
+      # line yet has no model to name and reads exactly as it did before.
+      ( (if ($it.model // null) == null then "" else " on \($it.model)" end)
+        + (if ($it.model_changed // null) == null then ""
+           else " (launched on " + (($it.model_changed | split("→")) | first) + ")" end)
+      ) as $on
+      | if ($it.eta // null) == null then "#\($it.number) running" + $on
+        elif $it.eta <= $now then "#\($it.number) running" + $on + ", due now"
+        else "#\($it.number) running" + $on + ", "
+             + D($it.eta - $now; ($it.estimated // false)) + " left"
+        end
     else
       if ($it.eta // null) == null then "#\($it.number) no ETA yet"
       elif $it.eta <= $now then "#\($it.number) due now"
