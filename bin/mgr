@@ -545,7 +545,7 @@ record_request() { # record_request <pane_id> <tab_id> <agent|""> <N|"">
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
   launch_lock "$f" && held=true
   cur=""
-  [ -f "$f" ] && cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
+  if [ -f "$f" ]; then cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || cur=""; fi
   [ -n "$cur" ] || cur='{}'
   jq -nc --argjson cur "$cur" --arg p "$pane" --arg t "$tab" --arg a "$agent" --arg n "$n" --argjson at "$(now_ms)" \
     '$cur + {($p): {pane_id: $p, tab_id: $t,
@@ -556,21 +556,19 @@ record_request() { # record_request <pane_id> <tab_id> <agent|""> <N|"">
   if $held; then launch_unlock "$f"; fi
 }
 
-take_request() { # take_request <pane_id> -> that request as JSON ("" when unknown); drops the entry
-  local pane="$1" f cur entry="" rest held=false
+take_request() { # take_request <pane_id> — drops that pane's pending request
+  local pane="$1" f cur rest held=false
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || return 0
   f=$(request_file)
   [ -f "$f" ] || return 0
   launch_lock "$f" && held=true
   cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || cur=""
   if [ -n "$cur" ]; then
-    entry=$(jq -c --arg p "$pane" '.[$p] // empty | select(type == "object")' <<<"$cur")
     rest=$(jq -c --arg p "$pane" 'del(.[$p])' <<<"$cur") || rest=""
     [ -n "$rest" ] && { printf '%s' "$rest" | atomic_write "$f" \
       || warn "could not drop the registration request for $pane from $f"; }
   fi
   if $held; then launch_unlock "$f"; fi
-  printf '%s' "$entry"
 }
 
 requests_json() { # requests_json -> the whole per-workspace request map ({} when none)
@@ -578,7 +576,7 @@ requests_json() { # requests_json -> the whole per-workspace request map ({} whe
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || { printf '{}'; return; }
   f=$(request_file)
   [ -f "$f" ] || { printf '{}'; return; }
-  out=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
+  out=$(jq -c 'select(type == "object")' "$f" 2>/dev/null) || out=""
   [ -n "$out" ] && printf '%s' "$out" || printf '{}'
 }
 
@@ -1691,7 +1689,7 @@ cmd_adopt() {
     local slug; slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
 
     herdr_or_die "herdr agent rename $pane issue-$n failed" herdr agent rename "$pane" "issue-$n"
-    take_request "$pane" >/dev/null
+    take_request "$pane"
     herdr tab rename "$tab" "#$n $slug" >/dev/null 2>&1 || warn "herdr tab rename $tab failed"
     gh issue edit "$n" --add-label 'mgr:in-flight' >/dev/null \
       || die 1 "gh issue edit #$n --add-label mgr:in-flight failed"
@@ -1720,7 +1718,7 @@ cmd_adopt() {
     local newname
     newname="adopt-$(sanitize_pane "$pane")"
     herdr_or_die "herdr agent rename $pane $newname failed" herdr agent rename "$pane" "$newname"
-    take_request "$pane" >/dev/null
+    take_request "$pane"
     # no issue yet, so nothing carries a size: the session labels the issue it
     # creates and sizes itself from that label, so the brief names no size
     local brief

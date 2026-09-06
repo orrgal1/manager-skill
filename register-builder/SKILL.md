@@ -24,9 +24,10 @@ to make the request, then stop.
    manager it registered with, and the issue (if any). Report that mapping to the operator in one
    short line.
 
-4. **Stop and wait.** Do not load `builder.md`, do not run any other `mgr` command — `mgr bind`
-   included, the manager's adopt flow triggers that itself — and do not resume whatever work this
-   session was doing. The manager will send a brief; only when it arrives do you start under
+4. **Stop and wait.** Do not load `builder.md`, do not run any other `mgr` command, and do not
+   resume whatever work this session was doing. `mgr bind` in particular is not yours to run yet:
+   it is a step the manager's brief will tell you to take, and only on the branch where no issue
+   exists yet. The manager will send that brief; only when it arrives do you start under
    `builder.md`, at its second or third opener.
 
 5. **A refusal ends this skill too.** Exit `3` means the request was refused — relay the message
