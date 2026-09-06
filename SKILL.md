@@ -50,9 +50,10 @@ already there are kept unless `--force`.
 `$MGR package <house>` switches the machine default afterwards; `$MGR package` with no argument
 prints the active package and the available ones.
 
-Every builder you launch runs on `@builder`, the house's top rung. The size picks the workflow
-file and the agents a builder dispatches to, never the session model. A session that is already
-running keeps the roles it started with — restart it to pick up a new package.
+A `size:large` builder runs on `@builder`, the house's top rung; `medium`, `small` and `tiny`
+run on `@smith`, its work rung. The size picks the session model as well as the workflow file
+and the agents a builder dispatches to. A session that is already running keeps the roles it
+started with — restart it to pick up a new package.
 
 ## 1. First move
 
@@ -204,8 +205,9 @@ builder's own step 1 reads it there and narrows or skips its scouting against it
 
 Then **size it**. Exactly one `size:` label, at create time — add `--label size:<size>` to the
 `gh issue create` above. The label decides which workflow file the builder builds under, and the
-size of the agents it dispatches slices to, so it is not optional. Every builder runs on
-`@builder`, the house's top rung, whatever its size.
+size of the agents it dispatches slices to, so it is not optional. The label picks the rung
+too — `size:large` runs on `@builder`, the house's top rung; `medium`, `small` and `tiny` run
+on `@smith`, its work rung.
 
 `$MGR board` surfaces the repo's effective sizing bias as `config.sizing` (`lean|balanced|careful`;
 default `balanced`) — read it before you judge; it never demotes a decided size, only
@@ -478,7 +480,7 @@ Errors are `{"error":{"code":N,"message":"…"}}` on stderr. Branch on the code.
 | `in_flight[].quota_stalled` | that builder's turn died on a rate limit |
 | `in_flight[].size` `ready[].size` `blocked[].size` `awaiting_approval[].size` `awaiting_plan[].size` | that issue's size from its `size:` label — `tiny` \| `small` \| `medium` \| `large`, or `null` when it has none (`launch` refuses on `null`) |
 | `in_flight[].model` `awaiting_approval[].model` `awaiting_plan[].model` | the bare model id from the last assistant message in the builder's session transcript, or `null` before one lands |
-| `in_flight[].launch_model` `awaiting_approval[].launch_model` `awaiting_plan[].launch_model` | the model the house package named at launch (`modelRoles.builder`), verbatim including provider and effort (e.g. `anthropic/claude-fable-5-1:high`), or `null` for an adopted builder |
+| `in_flight[].launch_model` `awaiting_approval[].launch_model` `awaiting_plan[].launch_model` | the model the house package named at launch for the launched role (`modelRoles.<role>`), verbatim including provider and effort (e.g. `anthropic/claude-fable-5-1:high`), or `null` for an adopted builder |
 | `in_flight[].model_changed` `awaiting_approval[].model_changed` `awaiting_plan[].model_changed` | `"<launch model>→<model>"`, both shortened to the bare id, when the harness switched the builder off its launch model, else `null` |
 | `unmanaged[].requested` `unmanaged[].requested_at` `unmanaged[].requested_issue` | the pane asked to be adopted via `mgr register` — `true` / ms epoch / the issue number it named, or `null`; cleared once `adopt` runs |
 

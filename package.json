@@ -1,6 +1,6 @@
 {
   "name": "@orrgal1/manager-skill",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Manager skill: turn GitHub issues into herdr-hosted builder sessions, each in its own git worktree",
   "license": "MIT",
   "repository": {

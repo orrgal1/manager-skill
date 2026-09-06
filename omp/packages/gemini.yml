@@ -1,18 +1,22 @@
 # Agent package: Google subscription. Apply with: mgr package gemini
 # Rungs: Gemini Pro (top, and the work rung — nothing sits between Pro and
 # Flash) > Gemini Flash (mid) > Gemini Flash Lite (bottom).
-# Top rung: builder (every builder session — `mgr launch` passes `--model @builder`),
-# plan (deep, for large builders), sketch (the same planner contract, narrower —
-# medium builders and small planning triggers; the planner never sits below the
-# builder that consumes its plan), review (the reviewer and security-reviewer agents,
-# for the surfaces builder.md §7 sends to the top rung), and crux (the fumble target:
-# a fresh executor for a step a builder has failed) — Pro, which is the work rung too,
-# so crux is a fresh context on the same model; stated, not worked around;
+# Top rung: builder (`size:large` builder sessions only — `mgr launch` passes `--model
+# @builder` for those); smith is the new work-rung role every smaller builder session
+# runs on — both are gemini-3.1-pro:high on this ladder, so the top/work split collapses
+# onto the same model; tolerated, not worked around. plan (deep, for large builders),
+# sketch (the same planner contract, narrower — medium builders and small planning
+# triggers; the planner never sits below the builder that consumes its plan), review
+# (the reviewer and security-reviewer agents, for the surfaces builder.md §7 sends to
+# the top rung), and crux (the fumble target: a fresh executor for a step a builder has
+# failed) — Pro, which is the top and work rung both, so crux stays a fresh context on
+# the same model whether the failing builder was size:large or smaller; stated, not
+# worked around;
 # sweep (the reviewer for everything §7 sends to the work rung) sits with
-# default/large/medium on the work rung — which on this ladder is Pro too, so sweep
-# collapses onto the same model as review; tolerated, not worked around. small and
-# smol (scouts feed the plan) the mid rung; tiny (omp's own role) and commit the
-# bottom rung at low.
+# default/large/medium/smith on the work rung — which on this ladder is Pro too, so
+# sweep collapses onto the same model as review; tolerated, not worked around. small and
+# smol (scouts feed the plan) the mid rung; tiny (omp's own role) and commit the bottom
+# rung at low.
 # Effort: high for everything that writes or decides code, medium for the roles
 # that decide nothing, low for the bottom rung. Pro exposes only low and high,
 # so high is the ceiling everywhere, never a tier above it.
@@ -30,6 +34,7 @@ modelRoles:
   large: google-antigravity/gemini-3.1-pro:high
   medium: google-antigravity/gemini-3.1-pro:high
   builder: google-antigravity/gemini-3.1-pro:high
+  smith: google-antigravity/gemini-3.1-pro:high
   sketch: google-antigravity/gemini-3.1-pro:high
   sweep: google-antigravity/gemini-3.1-pro:high
   small: google-antigravity/gemini-3.7-flash:high

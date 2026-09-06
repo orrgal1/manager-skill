@@ -268,9 +268,11 @@ MGR_LIB="$MGR_ROOT/bin/mgr-lib.sh"
 
 # ---------------------------------------------------------------- github
 
-# The four sizes, smallest first: a `size:` label per workflow file. Every
-# builder session runs on the fixed `@builder` role whatever its size; the size
-# picks the workflow file, not the model.
+# The four sizes, smallest first: a `size:` label per workflow file. The size
+# also picks the session's rung: `large` runs on the house's top rung
+# (`@builder`); every smaller size runs on its work rung (`@smith`) — so
+# escalating to `crux` is a genuine rung up, and the top-rung planner sits
+# above the rung it plans for.
 MGR_SIZES='tiny small medium large'
 
 size_color() { # size_color <size> -> the label colour
@@ -285,6 +287,13 @@ size_color() { # size_color <size> -> the label colour
 size_valid() { # size_valid <word>
   case " $MGR_SIZES " in *" $1 "*) return 0;; esac
   return 1
+}
+
+builder_rung_of_size() { # builder_rung_of_size <size> -> "<rung> <role>" — the one place the size→rung map lives
+  case "${1:-}" in
+    large) printf 'top builder';;
+    *) printf 'work smith';;
+  esac
 }
 
 ensure_labels() {
@@ -436,14 +445,15 @@ provider_of_house() { # provider_of_house <house> -> provider ("" when unknown)
   printf '%s' "$p"
 }
 
-# The model a launch on this house actually briefs its builder as: `mgr launch`
+# The model a launch on this house actually briefs a role as: `mgr launch`
 # stamps it, so the execution record can say what a build started on and a
 # mid-session swap becomes visible. Same anchored sed and the same never-fail
-# contract as provider_of_house above.
-builder_model_of_house() { # builder_model_of_house <house> -> provider/model:effort ("" when unknown)
-  local h="${1:-}" m=""
-  [ -n "$h" ] || return 0
-  m=$(sed -n '/^modelRoles:/,/^[^[:space:]#]/{/^  builder:/{s|^  builder:[[:space:]]*||p;q;};}' \
+# contract as provider_of_house above, with the role parameterising which
+# modelRoles: entry it reads.
+role_model_of_house() { # role_model_of_house <house> <role> -> provider/model:effort ("" when unknown)
+  local h="${1:-}" role="${2:-}" m=""
+  [ -n "$h" ] && [ -n "$role" ] || return 0
+  m=$(sed -n '/^modelRoles:/,/^[^[:space:]#]/{/^  '"$role"':/{s|^  '"$role"':[[:space:]]*||p;q;};}' \
     "$MGR_OMP_DIR/packages/$h.yml" 2>/dev/null) || m=""
   printf '%s' "$m"
 }
@@ -653,7 +663,7 @@ launch_unlock() { # launch_unlock <launches-file>
   rmdir "${1%.json}.lock" 2>/dev/null || true
 }
 
-record_launch() { # record_launch <N> [size] [model] — stamp the moment a builder took issue N, the size it was briefed with, and the model it was launched on
+record_launch() { # record_launch <N> [size] [model] [role] — stamp the moment a builder took issue N, the size it was briefed with, the model it was launched on, and its rung's role
   local rp f cur held=false
   rp=$(own_repo)
   [ -n "$rp" ] || { warn "cannot record launched_at for #$1 (no repo)"; return 0; }
@@ -663,10 +673,11 @@ record_launch() { # record_launch <N> [size] [model] — stamp the moment a buil
   cur=""
   [ -f "$f" ] && cur=$(jq -c 'select(type == "object")' "$f" 2>/dev/null)
   [ -n "$cur" ] || cur='{}'
-  jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" --arg size "${2:-}" --arg model "${3:-}" \
+  jq -nc --argjson cur "$cur" --arg n "$1" --argjson at "$(now_ms)" --arg size "${2:-}" --arg model "${3:-}" --arg role "${4:-}" \
     '$cur + {($n): {number: ($n | tonumber), launched_at: $at,
                     launched_size: (if $size == "" then null else $size end),
-                    launch_model: (if $model == "" then null else $model end)}}' \
+                    launch_model: (if $model == "" then null else $model end),
+                    launch_role: (if $role == "" then null else $role end)}}' \
     | atomic_write "$f" || warn "could not record launched_at for #$1 in $f"
   if $held; then launch_unlock "$f"; fi
 }
@@ -1607,7 +1618,7 @@ cmd_launch() {
   [ -n "${HERDR_WORKSPACE_ID:-}" ] || die 3 "not running inside herdr (HERDR_WORKSPACE_ID unset)"
   require_agents
 
-  local ij state title policy plan_policy size srsz=0
+  local ij state title policy plan_policy size srsz=0 rung role
   ij=$(issue_json "$n")
   state=$(jq -r '.state' <<<"$ij")
   [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
@@ -1636,6 +1647,11 @@ cmd_launch() {
   house=$(eff_house "$house")
   [ -n "$house" ] \
     || die 3 "cannot determine the model house; run: mgr config set house <anthropic|openai|gemini>"
+
+  # the size also decides which rung of the house this session runs on: a
+  # large builder stays on the top rung, every smaller size runs on the work
+  # rung and escalates to fumbles from there
+  read -r rung role <<<"$(builder_rung_of_size "$size")"
 
   local bd sf rigor sizing mf pol
   bd=$(cmd_board --cap "$cap")
@@ -1669,11 +1685,11 @@ cmd_launch() {
 
   # the effective harness config, read before anything is created: one --env per
   # entry for the tab, the omp argv for `herdr agent start … -- …`. The status
-  # extension, the builder role, the house's package overlay and the
+  # extension, the size's rung role, the house's package overlay and the
   # model-fallback policy come first, then the operator's omp-args, so `--` is
   # always there and an operator can still override the policy after it. bash
   # 3.2 needs the `${a[@]+…}` idiom to expand a possibly-empty array under -u.
-  local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT" --model "@builder"
+  local -a env_args=() omp_args=(--extension "$MGR_STATUS_EXT" --model "@$role"
                                  --config "$MGR_OMP_DIR/packages/$house.yml"
                                  --config "$pol")
   local v
@@ -1718,7 +1734,7 @@ cmd_launch() {
   $started || { teardown_launch; die 1 "herdr agent start issue-$n on $pane_id failed"; }
 
   local brief
-  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Plan policy: $plan_policy. Size: $size. House: $house. Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
+  brief="You are the builder for issue #$n in $rp. Your worktree is $wt on branch $branch; the primary checkout is $pri and is read-only. Policy: $policy. Plan policy: $plan_policy. Size: $size. Rung: $rung (@$role). House: $house. Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Begin with: gh issue view $n --comments"
   brief=$(brief_with_extra "$brief")
   herdr agent prompt "issue-$n" "$brief" >/dev/null 2>&1 \
     || { teardown_launch; die 1 "herdr agent prompt issue-$n failed"; }
@@ -1729,8 +1745,8 @@ cmd_launch() {
     || { teardown_launch; die 1 "gh issue comment #$n failed"; }
 
   # the builder is live and the issue is labelled: from here on retire can
-  # measure how long it took, and on which model it started
-  record_launch "$n" "$size" "$(builder_model_of_house "$house")"
+  # measure how long it took, on which model it started, and which rung it ran on
+  record_launch "$n" "$size" "$(role_model_of_house "$house" "$role")" "$role"
 
   jq -nc --argjson number "$n" --arg title "$title" --arg policy "$policy" \
     --arg agent "issue-$n" --arg tab "$tab_id" --arg pane "$pane_id" \
@@ -1798,7 +1814,7 @@ cmd_adopt() {
   ensure_labels
 
   if [ -n "$n" ]; then
-    local ij state title policy plan_policy size
+    local ij state title policy plan_policy size rung role
     ij=$(issue_json "$n")
     state=$(jq -r '.state' <<<"$ij")
     [ "$state" = OPEN ] || die 3 "issue #$n is not open (state=$state)"
@@ -1810,6 +1826,7 @@ cmd_adopt() {
     # issue is briefed as medium rather than refused
     size=$(size_of "$ij") || size=medium
     size_valid "$size" || size=medium
+    read -r rung role <<<"$(builder_rung_of_size "$size")"
     local slug; slug=$(slugify "$title"); [ -n "$slug" ] || slug="issue"
 
     herdr_or_die "herdr agent rename $pane issue-$n failed" herdr agent rename "$pane" "issue-$n"
@@ -1829,7 +1846,7 @@ cmd_adopt() {
       || warn "gh issue comment #$n failed"
 
     local brief
-    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Plan policy: $plan_policy. Size: $size.$hfrag Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
+    brief="The manager has adopted this session as the builder for issue #$n in $rp. Your working directory is $cwd on branch $br_disp; the primary checkout is $pri and is read-only. Policy: $policy. Plan policy: $plan_policy. Size: $size. Rung: $rung (@$role).$hfrag Rigor: $rigor. Sizing: $sizing. Read $MGR_BUILDER_MD now and follow it exactly; it is your complete contract. Its Build section sends you to $MGR_WORKFLOWS_DIR/$size.md, which is how you build and verify at your size — read it before you touch code. The manager CLI is $MGR_SELF. Keep your current work and finish it under that contract. If $cwd is the primary checkout, follow the Adopted-in-primary section first. Begin with: gh issue view $n --comments"
     brief=$(brief_with_extra "$brief")
     herdr_or_die "herdr agent prompt issue-$n failed" herdr agent prompt "issue-$n" "$brief"
 
@@ -2211,13 +2228,14 @@ cmd_retire() {
   # human-readable comment on the issue — both posted before the labels go,
   # and never fatal: a retire that races a `gh` outage still records what it
   # can and always reaches the label removal, close and JSON return below.
-  local report stamp launched_at launched_size launch_model merged_at merged_at_source size metrics record \
+  local report stamp launched_at launched_size launch_model launch_role merged_at merged_at_source size metrics record \
     tp_appended=false execution_recorded=false
   report=$(parse_report "$n" 2>/dev/null || printf 'null')
   stamp=$(take_launch "$n")
   launched_at=$(jq -r '(.launched_at // empty) | tostring' <<<"${stamp:-null}" 2>/dev/null || printf '')
   launched_size=$(jq -r '.launched_size // empty' <<<"${stamp:-null}" 2>/dev/null || printf '')
   launch_model=$(jq -r '.launch_model // empty' <<<"${stamp:-null}" 2>/dev/null || printf '')
+  launch_role=$(jq -r '.launch_role // empty' <<<"${stamp:-null}" 2>/dev/null || printf '')
   if [ "$(jq -r '.status // ""' <<<"$report")" = merged ]; then
     local pr; pr=$(jq -r '.pr // ""' <<<"$report")
     merged_at=$(pr_merged_at "$pr")
@@ -2241,6 +2259,7 @@ cmd_retire() {
       if record=$(jq -nc \
         --arg repo "$rp" --argjson n "$n" --arg a "$launched_at" --argjson b "$merged_at" \
         --arg src "$merged_at_source" --arg size "$size" --arg ls "$launched_size" --arg lm "$launch_model" \
+        --arg lr "$launch_role" \
         --argjson report "$report" --argjson session "$metrics" "$JQ_SHORT_MODEL"'
         ($a | tonumber? // null) as $launched |
         ($lm | if . == "" then null else short_model end) as $lm_short |
@@ -2257,6 +2276,7 @@ cmd_retire() {
           size: (if $size == "" then null else $size end),
           launched_size: (if $ls == "" then null else $ls end),
           launch_model: (if $lm == "" then null else $lm end),
+          launch_role: (if $lr == "" then null else $lr end),
           models: (if ($models | length) == 0 then null else $models end),
           pr: ($report.pr // null), sha: ($report.sha // null),
           report: {
@@ -2407,14 +2427,16 @@ mgr — manager CLI for herdr-hosted omp builders
                                       shown, default 10)
   mgr launch <N> [--cap N] [--house <anthropic|openai|gemini>]
                                       worktree + tab + omp builder for issue N; issue N
-                                      must carry exactly one size: label, which picks
-                                      the workflows/<size>.md the brief sends it to;
-                                      the session runs on --model @builder with the
-                                      house's omp/packages/<house>.yml overlay and
-                                      loads extensions/mgr-status.ts (status line:
-                                      rate-limited / guard stopped / paused). The house
-                                      is --house, else MGR_HOUSE, else mgr config
-                                      house, else this manager's own session
+                                      must carry exactly one size: label, which picks the
+                                      workflows/<size>.md the brief sends it to. A
+                                      size:large issue runs on --model @builder (its
+                                      house's top rung); every smaller size runs on
+                                      @smith (its work rung). Either way it loads
+                                      extensions/mgr-status.ts (status line: rate-limited
+                                      / guard stopped / paused) and the house's
+                                      omp/packages/<house>.yml overlay. The house is
+                                      --house, else MGR_HOUSE, else mgr config house,
+                                      else this manager's own session
   mgr adopt <pane_id|tab_id> [N]      adopt a live session as a builder (N binds it;
                                       without N it self-registers via `mgr bind`)
   mgr bind <N>                        run BY a builder in its own pane to bind to issue N

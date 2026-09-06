@@ -25,8 +25,10 @@ Works from any repo with a GitHub remote. Open a tab in the project, say
   operator named the files, the manager dispatches one read-only `scout` before it labels — it
   does not read the repo itself — and leaves that map in the issue's `## Notes` under
   `### Intake map`, which the builder's own step 1 then narrows or skips its scouting against.
-  Every session runs on `--model @builder`, the house's top rung, with `omp/packages/<house>.yml`
-  overlaid, so the size picks the workflow and the agents slices go to, never the model. A builder
+  A `size:large` session runs on `--model @builder`, the house's top rung; a `medium`, `small`
+  or `tiny` session runs on `--model @smith`, its work rung — both with
+  `omp/packages/<house>.yml` overlaid. The size picks the workflow and the agents slices go to,
+  as well as the model. A builder
   that outgrows its size resizes upward itself. The builder's own context is for orchestration and
   integration — its scouts and its size's planner (`sketch` at `medium`, `plan` at `large`; `small`
   plans in-session, `tiny` does neither) do the reading and the deciding and return compressed,
@@ -426,7 +428,8 @@ operator's only pace dial.
 | `merged_at_source` | `"pr"` \| `"comment"` | mgr | — | no |
 | `size` | string | `size:` label at retire (`gh issue view <N> --json labels`, jq locally, no `-q`) | — | yes |
 | `launched_size` | string | launch stamp: the size the builder was taken with — the `size:` label for `launch` and `bind`; for `adopt`, the briefed size, `medium` when the issue carries no usable label | — | **yes** (no stamp, or `bind` on an issue with no usable label) |
-| `launch_model` | string | launch stamp: the house package's `modelRoles.builder` at launch (e.g. `anthropic/claude-fable-5-1:high`) | — | **yes** (no stamp, or adopted) |
+| `launch_model` | string | launch stamp: the house package's `modelRoles.<role>` at launch, for the launched role (e.g. `anthropic/claude-fable-5-1:high`) | — | **yes** (no stamp, or adopted) |
+| `launch_role` | string | launch stamp: the role the session was launched as — `builder` or `smith`, from the `size:` label's rung map | — | **yes** (no stamp, or `adopt`/`bind`) |
 | `models` | string[] | short model ids used: `launch_model` (shortened) first, then every key of `session.models`, deduped | — | **yes** (neither known) |
 | `pr` | string | report `pr=` | — | yes |
 | `sha` | string | report `sha=` | — | yes |

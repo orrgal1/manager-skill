@@ -60,6 +60,14 @@ EOF
 cat >"$fix/issue-7-twosizes.json" <<'EOF'
 {"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:tiny"},{"name":"size:large"}],"body":""}
 EOF
+# the same issue 7 sized large: `mgr launch` picks the top rung and @builder
+cat >"$fix/issue-7-large.json" <<'EOF'
+{"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:large"}],"body":""}
+EOF
+# the same issue 7 sized medium: `mgr launch` picks the work rung and @smith
+cat >"$fix/issue-7-medium.json" <<'EOF'
+{"number":7,"title":"Another thing","state":"OPEN","labels":[{"name":"size:medium"}],"body":""}
+EOF
 # the same issue 7 with mgr:plan-approve added: the launch brief must read
 # `Plan policy: approve.` instead of the default `Plan policy: none.`
 cat >"$fix/issue-7-planapprove.json" <<'EOF'
@@ -455,7 +463,7 @@ check 'hand-edited store: config get model-fallback still echoes the raw value' 
 
 # --------------------------------------------------- 3. launch wiring
 
-printf '\n# 3. launch: --model @builder + the house and policy overlays, then omp-arg after --, one --env per entry, brief-extra appended\n'
+printf '\n# 3. launch: --model @smith (the work rung) + the house and policy overlays, then omp-arg after --, one --env per entry, brief-extra appended\n'
 "$MGR" config set cap 3 >/dev/null
 "$MGR" config add omp-arg --extension >/dev/null
 "$MGR" config add omp-arg /abs/ext.ts >/dev/null
@@ -472,11 +480,13 @@ check 'launch worktree'  "$wt" "$(jq -r '.worktree' <<<"$out")"
 check 'tab create argv' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env LINK=ws://127.0.0.1:1/link --env OTHER=x --no-focus" "$MGR_TEST_LOG" || true)"
 check 'agent start argv' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml --extension /abs/ext.ts" "$MGR_TEST_LOG" || true)"
-# the model the house's package briefs a builder as, stamped so retire can say
-# what the build started on (the stamp itself is record_launch's)
-check 'launches stamp carries the house builder model' anthropic/claude-fable-5-1:high \
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @smith --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml --extension /abs/ext.ts" "$MGR_TEST_LOG" || true)"
+# the model and role the house's package briefs a builder as, stamped so retire
+# can say what the build started on (the stamp itself is record_launch's)
+check 'launches stamp carries the house smith model' anthropic/claude-opus-5:high \
   "$(jq -r '.["7"].launch_model' "$tmp/state/launches/owner__name.json")"
+check 'launches stamp carries the smith role' smith \
+  "$(jq -r '.["7"].launch_role' "$tmp/state/launches/owner__name.json")"
 
 prompt=$(cat "$MGR_TEST_PROMPT")
 check 'brief head' true \
@@ -484,9 +494,10 @@ check 'brief head' true \
 check 'brief keeps the original tail' true \
   "$(contains 'Begin with: gh issue view 7 --comments' "$prompt")"
 check 'brief names the size' true "$(contains 'Size: small.' "$prompt")"
+check 'brief names the rung' true "$(contains 'Rung: work (@smith).' "$prompt")"
 check 'launch briefs the plan policy' true "$(contains 'Plan policy: none.' "$prompt")"
 check 'brief names the house' true \
-  "$(contains 'Size: small. House: anthropic. Rigor: production. Sizing: balanced. Read' "$prompt")"
+  "$(contains 'Size: small. Rung: work (@smith). House: anthropic. Rigor: production. Sizing: balanced. Read' "$prompt")"
 check 'brief sends the builder to its workflow file' true \
   "$(contains "Its Build section sends you to $wf/small.md, which is how you build and verify at your size — read it before you touch code." "$prompt")"
 check 'brief drops the old proportionate-verification sentence' false \
@@ -500,6 +511,25 @@ check 'brief is brief + blank + 2 extra lines' 4 \
 check 'the worktree exists' true "$(if [ -d "$wt" ]; then printf true; else printf false; fi)"
 check 'the worktree is registered' 1 \
   "$(git -C "$repo" worktree list --porcelain | grep -cxF "worktree $wt" || true)"
+drop_wt
+
+printf '\n# 3a1. size:large and size:medium pick their rungs\n'
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
+MGR_TEST_ISSUE_VARIANT=-large "$MGR" launch 7 >/dev/null; rc=$?
+check 'launch (size:large): exit' 0 "$rc"
+check 'launch: a size:large issue gets the top rung' 1 \
+  "$(grep -cF -- "--model @builder" "$MGR_TEST_LOG" || true)"
+check 'launch: a size:large issue brief names the rung' true \
+  "$(contains 'Rung: top (@builder).' "$(cat "$MGR_TEST_PROMPT")")"
+drop_wt
+
+: >"$MGR_TEST_LOG"; : >"$MGR_TEST_PROMPT"
+MGR_TEST_ISSUE_VARIANT=-medium "$MGR" launch 7 >/dev/null; rc=$?
+check 'launch (size:medium): exit' 0 "$rc"
+check 'launch: a size:medium issue gets the work rung' 1 \
+  "$(grep -cF -- "--model @smith" "$MGR_TEST_LOG" || true)"
+check 'launch: a size:medium issue brief names the rung' true \
+  "$(contains 'Rung: work (@smith).' "$(cat "$MGR_TEST_PROMPT")")"
 drop_wt
 
 printf '\n# 3a2. mgr:plan-approve labels the brief with the plan policy\n'
@@ -530,7 +560,7 @@ MGR_OMP_ARGS='--foo bar' MGR_ENV='A=1 B=2' MGR_BRIEF_EXTRA="$fix/other.md" \
   "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
 check 'MGR_OMP_ARGS replaces the git list' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml --foo bar" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @smith --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml --foo bar" "$MGR_TEST_LOG" || true)"
 check 'MGR_ENV replaces the git list' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --env A=1 --env B=2 --no-focus" "$MGR_TEST_LOG" || true)"
 check 'MGR_BRIEF_EXTRA replaces the git path' "$(printf '\nOverride rules')" \
@@ -545,7 +575,7 @@ printf '\n# 3d. no config at all: no --env, only the status extension, the model
 "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit' 0 "$rc"
 check 'agent start has only the status extension, the model and the overlays' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @smith --config $pkgs/anthropic.yml --config $pols/model-fallback-never.yml" "$MGR_TEST_LOG" || true)"
 check 'tab create has no --env' 1 \
   "$(grep -cxF "herdr tab create --workspace w9 --cwd $wt --label #7 another-thing --no-focus" "$MGR_TEST_LOG" || true)"
 check 'brief has no extra' 1 \
@@ -557,12 +587,12 @@ printf '\n# 3d2. the model-fallback policy picks the overlay; a missing one stop
 MGR_MODEL_FALLBACK=ask "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit (model-fallback ask)' 0 "$rc"
 check 'the ask overlay is the second --config' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-ask.yml" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @smith --config $pkgs/anthropic.yml --config $pols/model-fallback-ask.yml" "$MGR_TEST_LOG" || true)"
 drop_wt
 MGR_MODEL_FALLBACK=auto "$MGR" launch 7 >/dev/null; rc=$?
 check 'launch exit (model-fallback auto)' 0 "$rc"
 check 'the auto overlay is the second --config' 1 \
-  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @builder --config $pkgs/anthropic.yml --config $pols/model-fallback-auto.yml" "$MGR_TEST_LOG" || true)"
+  "$(grep -cxF "herdr agent start issue-7 --kind omp --pane w9:p7 --timeout 120000 -- --extension $ext --model @smith --config $pkgs/anthropic.yml --config $pols/model-fallback-auto.yml" "$MGR_TEST_LOG" || true)"
 drop_wt
 
 # an overlay omp could not read would fail at `herdr agent start`, with a
@@ -720,7 +750,7 @@ check 'adopt (bound) brief-extra appended' \
   "$(printf '\nExtra house rules:\n- keep it boring')" \
   "$(printf '%s' "$(cat "$MGR_TEST_PROMPT")" | tail -n 3)"
 check 'adopt (bound) brief carries the labelled size, the house and its workflow' true \
-  "$(contains "Policy: auto-merge. Plan policy: none. Size: small. House: anthropic. Rigor: production. Sizing: balanced. Read $MGR_REAL_BUILDER now and follow it exactly; it is your complete contract. Its Build section sends you to $wf/small.md," \
+  "$(contains "Policy: auto-merge. Plan policy: none. Size: small. Rung: work (@smith). House: anthropic. Rigor: production. Sizing: balanced. Read $MGR_REAL_BUILDER now and follow it exactly; it is your complete contract. Its Build section sends you to $wf/small.md," \
      "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (bound) starts no agent' 0 \
   "$(grep -c 'herdr agent start' "$MGR_TEST_LOG" || true)"
@@ -747,7 +777,7 @@ check 'adopt (bound, ambiguous) is briefed as medium' true \
 "$MGR" adopt w9:p3 7 >/dev/null; rc=$?
 check 'adopt (bound, no house) exit' 0 "$rc"
 check 'adopt (bound, no house) omits House' true \
-  "$(contains 'Size: small. Rigor: production. Sizing: balanced. Read ' "$(cat "$MGR_TEST_PROMPT")")"
+  "$(contains 'Size: small. Rung: work (@smith). Rigor: production. Sizing: balanced. Read ' "$(cat "$MGR_TEST_PROMPT")")"
 check 'adopt (bound, no house) says House nowhere' false \
   "$(contains 'House: ' "$(cat "$MGR_TEST_PROMPT")")"
 "$MGR" config set house anthropic >/dev/null

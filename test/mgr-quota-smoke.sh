@@ -1844,10 +1844,12 @@ check 'bind exit'                 0 "$rc"
 check 'bind number'              7 "$(jq -r '.number' <<<"$out")"
 check 'the launch stamp landed' "7/$pin/small" \
   "$(jq -r '."7" | "\(.number)/\(.launched_at)/\(.launched_size)"' "$launches")"
-jq --arg lm 'anthropic/claude-fable-5-1:high' '.["7"].launch_model = $lm' "$launches" \
+jq --arg lm 'anthropic/claude-fable-5-1:high' --arg lr smith \
+  '.["7"] += {launch_model:$lm, launch_role:$lr}' "$launches" \
   >"$launches.next" && mv "$launches.next" "$launches"
-check 'the launch_model was hand-seeded onto the stamp' 'anthropic/claude-fable-5-1:high' \
-  "$(jq -r '."7".launch_model' "$launches")"
+check 'the launch model and role were hand-seeded onto the stamp' \
+  'anthropic/claude-fable-5-1:high/smith' \
+  "$(jq -r '."7" | "\(.launch_model)/\(.launch_role)"' "$launches")"
 
 # issue 7 is resized after launch: the label at retire reads medium, and the
 # record must keep the small it was launched as beside it
@@ -1883,6 +1885,7 @@ assert_jq 'schema is 1'                                 "$row" '.schema == 1'
 assert_jq 'size from the size: label at retire'         "$row" '.size == "medium"'
 assert_jq 'launched_size from the launch stamp'         "$row" '.launched_size == "small"'
 assert_jq 'launch_model carried from the hand-seeded stamp'    "$row" '.launch_model == "anthropic/claude-fable-5-1:high"'
+assert_jq 'launch_role carried from the hand-seeded stamp'     "$row" '.launch_role == "smith"'
 assert_jq 'models: launch model short form first, then session models' "$row" \
   '.models == ["claude-fable-5-1","claude-smol"]'
 assert_jq 'pr from the report'                          "$row" '.pr == "https://github.com/owner/name/pull/70"'
@@ -1974,6 +1977,7 @@ assert_jq 'unreadable session: read is false'                 "$row9" '.session.
 assert_jq 'unreadable session: turns is null'                 "$row9" '.session.turns == null'
 assert_jq 'unreadable session: subagent count is null'        "$row9" '.session.subagents.count == null'
 assert_jq 'no launch stamp -> launch_model is null'          "$row9" '.launch_model == null'
+assert_jq 'no launch stamp -> launch_role is null'           "$row9" '.launch_role == null'
 assert_jq 'unreadable session, no stamp -> models is null'   "$row9" '.models == null'
 
 comment9="$MGR_TEST_FIX/comment-9.md"
@@ -2003,6 +2007,7 @@ assert_jq 'legacy stamp -> launched_at kept'      "$row9l" ".launched_at == $pin
 assert_jq 'legacy stamp -> duration_s measured'   "$row9l" '.duration_s == 10800'
 assert_jq 'legacy stamp -> launched_size is null' "$row9l" '.launched_size == null'
 assert_jq 'legacy stamp -> launch_model is null'  "$row9l" '.launch_model == null'
+assert_jq 'legacy stamp -> launch_role is null'      "$row9l" '.launch_role == null'
 assert_jq 'legacy stamp -> models from the now-readable session' "$row9l" \
   '.models == ["claude-fable-5-1","claude-smol"]'
 check 'comment-9 header line (legacy stamp)' \
